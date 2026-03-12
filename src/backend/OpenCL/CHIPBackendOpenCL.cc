@@ -22,6 +22,7 @@
 
 #include "CHIPBackendOpenCL.hh"
 #include "Utils.hh"
+#include "spirv_to_vulkan.hh"
 
 #include <cstring>
 #include <sstream>
@@ -1251,9 +1252,30 @@ void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
       // compile+link. This avoids clLinkProgram which can trigger Intel
       // driver issues with certain in-tree SPIR-V backend structures.
       logInfo("No rtdevlib imports, building directly");
+      std::string ClspvOpts;
+      if (ChipCtxOcl->getAllocStrategy() == AllocationStrategy::BufferDevAddr)
+        ClspvOpts = "-physical-storage-buffers";
+
+      std::vector<uint8_t> SrcBytes(SrcBin.begin(), SrcBin.end());
+      std::string VkErr;
+      auto VkSpv = openclToVulkanSpirv(SrcBytes, ClspvOpts, &VkErr);
+
+      const void *ILData;
+      size_t ILSize;
+      if (!VkSpv.empty()) {
+        logInfo("Pre-compiled OpenCL SPIR-V to Vulkan SPIR-V ({} words)", VkSpv.size());
+        ILData = VkSpv.data();
+        ILSize = VkSpv.size() * sizeof(uint32_t);
+      } else {
+        logWarn("OpenCL→Vulkan SPIR-V pre-compilation failed ({}), "
+                "falling back to clvk compilation pipeline", VkErr);
+        ILData = SrcBin.data();
+        ILSize = SrcBin.size();
+      }
+
       cl_int CreateErr;
       Program_ = cl::Program(clCreateProgramWithIL(
-          ChipCtxOcl->get()->get(), SrcBin.data(), SrcBin.size(), &CreateErr));
+          ChipCtxOcl->get()->get(), ILData, ILSize, &CreateErr));
       CHIPERR_CHECK_LOG_AND_THROW_TABLE(clCreateProgramWithIL);
       cl_device_id DevId = ChipDevOcl->get()->get();
       auto Flags = ChipEnvVars.hasJitOverride()
