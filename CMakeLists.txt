@@ -810,6 +810,8 @@ endif()
 # Defaults to clspv from the clvk build tree; override with -DCHIP_CLSPV_BIN=.
 if(NOT DEFINED CHIP_CLSPV_BIN)
   set(CHIP_CLSPV_BIN "" CACHE FILEPATH "Path to clspv binary for OpenCL->Vulkan SPIR-V conversion")
+endif()
+
 configure_file(chipStarConfig.hh.in include/chipStarConfig.hh @ONLY)
 
 # PROJECT CONFIGURATION HEADER
