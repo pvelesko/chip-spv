@@ -1252,6 +1252,9 @@ void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
       // compile+link. This avoids clLinkProgram which can trigger Intel
       // driver issues with certain in-tree SPIR-V backend structures.
       logInfo("No rtdevlib imports, building directly");
+
+      // Pre-compile OpenCL SPIR-V → Vulkan SPIR-V before passing to clvk.
+      // clvk detects GLCompute and skips its own llvm-spirv+clspv pipeline.
       std::string ClspvOpts;
       if (ChipCtxOcl->getAllocStrategy() == AllocationStrategy::BufferDevAddr)
         ClspvOpts = "-physical-storage-buffers";
@@ -1264,6 +1267,11 @@ void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
       size_t ILSize;
       if (!VkSpv.empty()) {
         logInfo("Pre-compiled OpenCL SPIR-V to Vulkan SPIR-V ({} words)", VkSpv.size());
+        // Debug: dump Vulkan SPIR-V to /tmp if CHIP_DUMP_VK_SPV is set
+        if (const char* dump_path = std::getenv("CHIP_DUMP_VK_SPV")) {
+          FILE* f = std::fopen(dump_path, "wb");
+          if (f) { std::fwrite(VkSpv.data(), 4, VkSpv.size(), f); std::fclose(f); }
+        }
         ILData = VkSpv.data();
         ILSize = VkSpv.size() * sizeof(uint32_t);
       } else {
