@@ -189,6 +189,7 @@ endif()
 set(CHIP_SRC
   src/spirv.cc
   src/spirv_hiprtc.cc
+  src/spirv_to_vulkan.cpp
   src/CHIPDriver.cc
   src/CHIPBackend.cc
   src/SPVRegister.cc
@@ -804,6 +805,11 @@ set(CHIP_DEBUG_BUILD 0)
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   set(CHIP_DEBUG_BUILD 1)
 endif()
+
+# Path to clspv binary used for OpenCL→Vulkan SPIR-V conversion.
+# Defaults to clspv from the clvk build tree; override with -DCHIP_CLSPV_BIN=.
+if(NOT DEFINED CHIP_CLSPV_BIN)
+  set(CHIP_CLSPV_BIN "" CACHE FILEPATH "Path to clspv binary for OpenCL->Vulkan SPIR-V conversion")
 configure_file(chipStarConfig.hh.in include/chipStarConfig.hh @ONLY)
 
 # PROJECT CONFIGURATION HEADER
