@@ -30,9 +30,7 @@ SOFTWARE.
 
 #include <algorithm>
 #include <cassert>
-#include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <functional>
 #include <map>
 #include <queue>
@@ -97,8 +95,10 @@ namespace Op {
   static const uint32_t Branch                  = 249;
   static const uint32_t BranchConditional       = 250;
   static const uint32_t Switch                  = 251;
+  static const uint32_t CompositeConstruct        = 80;
   static const uint32_t CompositeExtract         = 81;
   static const uint32_t UConvert                 = 113;
+  static const uint32_t INotEqual               = 171;
   static const uint32_t ControlBarrier           = 224;
   static const uint32_t MemoryBarrier            = 225;
   static const uint32_t Return                  = 253;
@@ -385,6 +385,7 @@ struct ModuleInfo {
   uint32_t uint32_type_id = 0;
   uint32_t uint64_type_id = 0;
   uint32_t uint8_type_id  = 0;
+  uint32_t bool_type_id   = 0; // OpTypeBool — cannot be stored in push constants
 
   // Set when the module has CrossWorkgroup globals that are not chip_vars.
   // These cannot be transformed to PSB Vulkan SPIR-V; the caller should fall
@@ -588,6 +589,11 @@ static bool collectModuleInfo(const Words& spv, ModuleInfo& info, std::string& e
     // Other type declarations not explicitly handled above (e.g. TypeBool, TypeRuntimeArray, etc.)
     // Must be added to original_types so they're emitted in the output.
     case 20: // OpTypeBool
+      if (instr.wc() >= 2 && !in_function) {
+        info.bool_type_id = instr.word(1);
+        info.original_types.push_back(instr);
+      }
+      break;
     case 25: // OpTypeRuntimeArray
     case 26: // OpTypeImage
     case 27: // OpTypeSampler
@@ -721,6 +727,10 @@ static bool collectModuleInfo(const Words& spv, ModuleInfo& info, std::string& e
           param.is_crossworkgroup_ptr = true;
         if (pit->second.storage_class == SC::Generic)
           param.is_generic_ptr = true;
+        if (pit->second.storage_class == SC::WorkgroupLocal)
+          // Dynamic shared memory param — cannot be expressed as push constant or
+          // StorageBuffer.  Fall back to clvk's internal clspv pipeline.
+          info.has_unsupported_globals = true;
       }
     }
   }
@@ -939,9 +949,12 @@ static std::vector<ArgLayout> computeKernelPCLayout(const FunctionInfo& impl_fn,
       align    = typeAlign(type_id, info);
       al.is_byval = true;
     } else {
-      type_id  = param.type_id;
-      sz       = typeSize(type_id, info);
-      align    = typeAlign(type_id, info);
+      type_id = param.type_id;
+      // bool cannot be stored in push constants: use uint32 as the storage type.
+      if (type_id == info.bool_type_id)
+        type_id = info.uint32_type_id;
+      sz    = typeSize(type_id, info);
+      align = typeAlign(type_id, info);
     }
     if (align < 1) align = 1;
     offset = (offset + align - 1) & ~(align - 1);
@@ -1196,9 +1209,16 @@ static std::vector<Instr> structurizeFunctionBody(const std::vector<Instr>& body
   };
 
   // Reconstruct body with merge instructions injected before terminators.
-  // Track which blocks already have merge instructions (from the original).
+  // Track which blocks are already declared as merge blocks so we can avoid
+  // declaring a block as the merge target for two different headers — SPIR-V
+  // requires each block to be a merge block for at most one header.
   std::vector<Instr> result;
   std::vector<uint32_t> synthetic_merges; // IDs of synthetic unreachable merge blocks
+  // fwd_merges[fwd_id] = original_merge_id: synthetic forwarding blocks that
+  // branch to original_merge_id (inserted when original_merge_id is already used).
+  std::vector<std::pair<uint32_t,uint32_t>> fwd_merges;
+  std::unordered_set<uint32_t> used_merge_set; // blocks already declared as merge targets
+
   for (auto& blk : blocks) {
     bool is_loop_hdr = loop_header_labels.count(blk.label_id) > 0;
 
@@ -1220,6 +1240,7 @@ static std::vector<Instr> structurizeFunctionBody(const std::vector<Instr>& body
               loop_continue[blk.label_id],
               0 // loop control = None
             }));
+            used_merge_set.insert(loop_merge_label[blk.label_id]);
           } else if (ins.opcode == Op::BranchConditional && ins.wc() >= 4) {
             uint32_t t1 = ins.word(2), t2 = ins.word(3);
             // Use empty stop set: BFS must be able to cross loop headers to find the
@@ -1234,7 +1255,26 @@ static std::vector<Instr> structurizeFunctionBody(const std::vector<Instr>& body
               synthetic_merges.push_back(merge);
             }
             if (merge != 0) {
+              // If the merge block is already used by another header, insert a
+              // synthetic forwarding block M' → merge instead of using merge directly.
+              // SPIR-V requires: a block can be a merge block for at most one header.
+              if (used_merge_set.count(merge) && next_id) {
+                uint32_t fwd = (*next_id)++;
+                fwd_merges.push_back({fwd, merge});
+                // Modify the BranchConditional to replace 'merge' with 'fwd'.
+                // We'll emit a modified instruction below.
+                result.push_back(makeSynthInstr(Op::SelectionMerge, {fwd, 0}));
+                // Build modified BranchConditional: replace merge → fwd in targets.
+                Instr mod = ins;
+                if (mod.words.size() > 2 && mod.words[2] == merge) mod.words[2] = fwd;
+                if (mod.words.size() > 3 && mod.words[3] == merge) mod.words[3] = fwd;
+                // Recompute header word (wc unchanged)
+                result.push_back(mod);
+                used_merge_set.insert(fwd);
+                continue; // skip the default 'result.push_back(ins)' below
+              }
               result.push_back(makeSynthInstr(Op::SelectionMerge, {merge, 0}));
+              used_merge_set.insert(merge);
             }
           } else if (ins.opcode == Op::Switch && ins.wc() >= 3) {
             // Find merge for switch: first block reachable from all targets.
@@ -1253,8 +1293,20 @@ static std::vector<Instr> structurizeFunctionBody(const std::vector<Instr>& body
                 merge = (*next_id)++;
                 synthetic_merges.push_back(merge);
               }
-              if (merge != 0)
-                result.push_back(makeSynthInstr(Op::SelectionMerge, {merge, 0}));
+              if (merge != 0) {
+                if (used_merge_set.count(merge) && next_id) {
+                  uint32_t fwd = (*next_id)++;
+                  fwd_merges.push_back({fwd, merge});
+                  result.push_back(makeSynthInstr(Op::SelectionMerge, {fwd, 0}));
+                  used_merge_set.insert(fwd);
+                  // Modify switch targets — only default matters for structured merge
+                  // (case labels are emitted as-is; they'll exit the construct correctly).
+                  // This is a best-effort fix for the common case.
+                } else {
+                  result.push_back(makeSynthInstr(Op::SelectionMerge, {merge, 0}));
+                  used_merge_set.insert(merge);
+                }
+              }
             }
           }
         }
@@ -1268,6 +1320,11 @@ static std::vector<Instr> structurizeFunctionBody(const std::vector<Instr>& body
   for (uint32_t mid : synthetic_merges) {
     result.push_back(makeSynthInstr(Op::Label, {mid}));
     result.push_back(makeSynthInstr(Op::Unreachable, {}));
+  }
+  // Append forwarding merge blocks: fwd_id → original_merge_id.
+  for (auto& [fwd, orig] : fwd_merges) {
+    result.push_back(makeSynthInstr(Op::Label, {fwd}));
+    result.push_back(makeSynthInstr(Op::Branch, {orig}));
   }
 
   // Append FunctionEnd if present.
@@ -1285,6 +1342,130 @@ struct IdAllocator {
   explicit IdAllocator(uint32_t base) : next_id(base) {}
   uint32_t alloc() { return next_id++; }
 };
+
+// ---------------------------------------------------------------------------
+// Post-processing: fix OpStore/OpLoad alignment for PSB pointers.
+// VUID-StandaloneSpirv-PhysicalStorageBuffer64-06314: the Aligned operand
+// must be >= the ABI alignment of the largest scalar type in the pointee.
+// We copy alignments verbatim from the OpenCL SPIR-V where the PSB rule
+// doesn't apply; this pass corrects them in the Vulkan output.
+// ---------------------------------------------------------------------------
+
+static void fixPSBAlignments(Words& spv, const ModuleInfo& info) {
+  // Step 0: collect all PhysicalStorageBuffer pointer type IDs and their base
+  // types from the binary. We cannot rely solely on info.ptr_types because new
+  // PSB types allocated by idAlloc during emitVulkanSpirv are not in info.ptr_types.
+  std::unordered_set<uint32_t> psb_ptr_type_ids;
+  std::unordered_map<uint32_t, uint32_t> psb_ptr_base; // psb_ptr_type_id → base_type_id
+  {
+    // Seed from info.ptr_types (original OCL types, in case any remain)
+    for (auto& [tid, pti] : info.ptr_types) {
+      if (pti.storage_class == SC::PhysicalStorageBuffer) {
+        psb_ptr_type_ids.insert(tid);
+        psb_ptr_base[tid] = pti.base_type;
+      }
+    }
+    // Scan the binary for OpTypePointer PhysicalStorageBuffer
+    size_t pos = 5, n = spv.size();
+    while (pos < n) {
+      uint32_t wc = spv[pos] >> 16;
+      uint32_t op = spv[pos] & 0xFFFF;
+      if (wc == 0 || pos + wc > n) break;
+      if (op == 32 /*OpTypePointer*/ && wc >= 4) {
+        if (spv[pos+2] == SC::PhysicalStorageBuffer) {
+          psb_ptr_type_ids.insert(spv[pos+1]);
+          psb_ptr_base[spv[pos+1]] = spv[pos+3]; // base_type_id
+        }
+      }
+      pos += wc;
+    }
+  }
+
+  // Step 1: scan SPIR-V to build result_id → ptr_type_id for all instructions
+  // that produce a PhysicalStorageBuffer pointer.
+  std::unordered_map<uint32_t, uint32_t> id_psb_type; // result_id → psb ptr type
+  {
+    size_t pos = 5, n = spv.size();
+    while (pos < n) {
+      uint32_t wc = spv[pos] >> 16;
+      uint32_t op = spv[pos] & 0xFFFF;
+      if (wc == 0 || pos + wc > n) break;
+      // Instructions that produce a typed result with result at word[2]:
+      // FunctionParameter(55), ConvertUToPtr(70), Bitcast(124),
+      // AccessChain(65), InBoundsAccessChain(66),
+      // PtrAccessChain(77), InBoundsPtrAccessChain(78), Load(61)
+      if (wc >= 3) {
+        uint32_t type_id   = spv[pos+1];
+        uint32_t result_id = spv[pos+2];
+        // FunctionParameter (55): wc = 3
+        if (op == 55 /*FunctionParameter*/) {
+          if (psb_ptr_type_ids.count(type_id))
+            id_psb_type[result_id] = type_id;
+        }
+        // Other typed result instructions: wc >= 4
+        // Opcodes: Load=61, AccessChain=65, InBoundsAccessChain=66,
+        //          PtrAccessChain=67, InBoundsPtrAccessChain=70,
+        //          ConvertUToPtr=120, Bitcast=124
+        if (wc >= 4) {
+          static const uint32_t typed_result_ops[] = {
+            61 /*Load*/, 65 /*AccessChain*/, 66 /*InBoundsAccessChain*/,
+            67 /*PtrAccessChain*/, 70 /*InBoundsPtrAccessChain*/,
+            120 /*ConvertUToPtr*/, 124 /*Bitcast*/
+          };
+          for (uint32_t tracked_op : typed_result_ops) {
+            if (op == tracked_op) {
+              if (psb_ptr_type_ids.count(type_id))
+                id_psb_type[result_id] = type_id;
+              break;
+            }
+          }
+        }
+      }
+      pos += wc;
+    }
+  }
+  if (id_psb_type.empty()) return; // nothing to fix
+
+  // Step 2: scan for OpStore/OpLoad with Aligned and fix if pointer is PSB.
+  size_t pos = 5, n = spv.size();
+  while (pos < n) {
+    uint32_t wc = spv[pos] >> 16;
+    uint32_t op = spv[pos] & 0xFFFF;
+    if (wc == 0 || pos + wc > n) break;
+
+    // OpStore: ptr=word[1], val=word[2], [mem_mask=word[3], align=word[4]]
+    if (op == Op::Store && wc >= 5) {
+      uint32_t ptr_id  = spv[pos+1];
+      uint32_t mem_mask = spv[pos+3];
+      if (mem_mask & 0x2u) { // Aligned bit
+        auto it = id_psb_type.find(ptr_id);
+        if (it != id_psb_type.end()) {
+          auto bit = psb_ptr_base.find(it->second);
+          if (bit != psb_ptr_base.end()) {
+            uint32_t req = typeAlign(bit->second, info);
+            if (req > spv[pos+4]) spv[pos+4] = req;
+          }
+        }
+      }
+    }
+    // OpLoad: type=word[1], result=word[2], ptr=word[3], [mem_mask=word[4], align=word[5]]
+    if (op == Op::Load && wc >= 6) {
+      uint32_t ptr_id   = spv[pos+3];
+      uint32_t mem_mask = spv[pos+4];
+      if (mem_mask & 0x2u) { // Aligned bit
+        auto it = id_psb_type.find(ptr_id);
+        if (it != id_psb_type.end()) {
+          auto bit = psb_ptr_base.find(it->second);
+          if (bit != psb_ptr_base.end()) {
+            uint32_t req = typeAlign(bit->second, info);
+            if (req > spv[pos+5]) spv[pos+5] = req;
+          }
+        }
+      }
+    }
+    pos += wc;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Pass 2: emit Vulkan PSB SPIR-V
@@ -1557,7 +1738,16 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
 
   // Dedup new fn types: map from (ret_type, param_type...) → new type ID
   // to avoid emitting duplicate OpTypeFunction declarations.
+  // Pre-populate with existing function types so we reuse them instead of
+  // emitting duplicates (duplicate non-aggregate types are forbidden in SPIR-V).
   std::map<std::vector<uint32_t>, uint32_t> new_fn_type_by_sig;
+  for (auto& [fid, ret] : info.fn_types) {
+    std::vector<uint32_t> sig = {ret};
+    auto pit = info.fn_type_params.find(fid);
+    if (pit != info.fn_type_params.end())
+      for (uint32_t p : pit->second) sig.push_back(p);
+    new_fn_type_by_sig.emplace(sig, fid); // only insert if not already present
+  }
 
   for (uint32_t fn_id : info.impl_fn_ids) {
     auto fit = info.functions.find(fn_id);
@@ -1879,10 +2069,28 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     auto kpc_it = kernel_pc_info.find(ep.fn_id);
     if (kpc_it != kernel_pc_info.end())
       ops.push_back(kpc_it->second.pc_var_id);
+    // Add all Workgroup-class global variables: shared memory vars are not in the
+    // original interface list (OpenCL doesn't require it) but Vulkan SPIR-V 1.4+
+    // requires all statically-used global vars to be listed.
+    for (auto& orig_instr : info.original_types) {
+      if (orig_instr.opcode == Op::Variable && orig_instr.wc() >= 4 &&
+          orig_instr.word(3) == SC::WorkgroupLocal) {
+        uint32_t var_id = orig_instr.word(2);
+        ops.push_back(var_id);
+      }
+    }
     emitInstr(out, Op::EntryPoint, ops);
   }
 
-  // WorkgroupSize is specified via BuiltIn WorkgroupSize on the SpecConstantComposite (clspv style).
+  // Emit OpExecutionModeId LocalSizeId for each entry point.
+  // This is required for GLCompute kernels with spec-constant workgroup size.
+  // LocalSizeId (38) uses OpExecutionModeId (331) with spec constant IDs as operands.
+  static const uint32_t kLocalSizeId = 38;
+  for (auto& ep : info.entry_points) {
+    emitInstr(out, Op::ExecutionModeId, {ep.fn_id, kLocalSizeId, wgs_x_id, wgs_y_id, wgs_z_id});
+  }
+
+  // WorkgroupSize is also specified via BuiltIn WorkgroupSize on the SpecConstantComposite (clspv style).
 
   // --- OpSource ---
   // Emit a simple source annotation
@@ -1890,6 +2098,63 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     (uint32_t)spv::SourceLanguageOpenCL_C,
     120 // version 1.2
   });
+
+  // Pre-scan: collect phantom result IDs — result IDs that are remapped to
+  // another ID during function body transforms without being emitted as an
+  // instruction result. These must be excluded from OpName to avoid
+  // "forward referenced IDs" validation errors.
+  std::unordered_set<uint32_t> phantom_result_ids;
+  for (auto& [fn_id, fn] : info.functions) {
+    for (auto& instr : fn.body) {
+      // PtrCastToGeneric / GenericCastToPtr: always remapped, never emitted
+      if ((instr.opcode == Op::PtrCastToGeneric || instr.opcode == Op::GenericCastToPtr)
+          && instr.wc() >= 3) {
+        phantom_result_ids.insert(instr.word(2));
+        continue;
+      }
+      // InBoundsPtrAccessChain with zero elem index (non-CW/Generic type):
+      // remapped to base ptr, no instruction emitted for result_id.
+      if (instr.opcode == Op::InBoundsPtrAccessChain && instr.wc() >= 5) {
+        uint32_t result_type = instr.word(1);
+        uint32_t result_id   = instr.word(2);
+        // CW/Generic types get PSB treatment → result IS emitted (as PtrAccessChain)
+        if (cw_type_remap.count(result_type)) continue;
+        uint32_t elem_idx_id = instr.word(4);
+        bool has_extra_indices = (instr.wc() >= 6);
+        auto cit = info.constants.find(elem_idx_id);
+        if (cit != info.constants.end() && cit->second.value == 0 && !has_extra_indices)
+          phantom_result_ids.insert(result_id);
+        continue;
+      }
+      // Load from WorkgroupSize var: result is phantom when NOT v3ulong (which
+      // would trigger an emitted UConvert); non-v3ulong case uses remap[]=.
+      if (instr.opcode == Op::Load && instr.wc() >= 4 &&
+          instr.word(3) == info.workgroup_size_var_id) {
+        uint32_t result_type = instr.word(1);
+        uint32_t result_id   = instr.word(2);
+        auto vit = info.vec_types.find(result_type);
+        bool is_v3ulong = (vit != info.vec_types.end() &&
+                           vit->second.first == info.uint64_type_id &&
+                           vit->second.second == 3);
+        if (!is_v3ulong)
+          phantom_result_ids.insert(result_id);
+        continue;
+      }
+      // ConvertPtrToU for a CW pod_kind param in an impl fn: result remapped to
+      // the param itself (stays as ulong), no instruction emitted.
+      if (instr.opcode == Op::ConvertPtrToU && instr.wc() >= 4 &&
+          info.impl_fn_ids.count(fn_id)) {
+        uint32_t result_id = instr.word(2);
+        uint32_t src_id    = instr.word(3);
+        for (auto& p : fn.params) {
+          if (p.is_crossworkgroup_ptr && p.id == src_id && !p.is_pointer_kind) {
+            phantom_result_ids.insert(result_id);
+            break;
+          }
+        }
+      }
+    }
+  }
 
   // --- Debug section ---
   // SPIR-V layout requires: OpString → OpName/OpMemberName (in that order).
@@ -1926,6 +2191,8 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     for (auto& p : it->second.params)
       removed_ids.insert(p.id);
   }
+  // Phantom result IDs: remapped away during function body transform, never defined
+  removed_ids.insert(phantom_result_ids.begin(), phantom_result_ids.end());
 
   // Pass 2: emit all OpName / OpMemberName instructions from original module,
   // skipping those that reference IDs not present in the output.
@@ -2074,8 +2341,10 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
   emitInstr(out, Op::Decorate, {wgs_y_id, Deco::SpecId, 1});
   emitInstr(out, Op::Decorate, {wgs_z_id, Deco::SpecId, 2});
 
-  // BuiltIn WorkgroupSize on the SpecConstantComposite (clspv style)
-  emitInstr(out, Op::Decorate, {wgs_composite_id, Deco::BuiltIn, Builtin::WorkgroupSize});
+  // Note: Do NOT decorate wgs_composite_id with BuiltIn WorkgroupSize.
+  // Per SPIR-V spec, BuiltIn WorkgroupSize supersedes LocalSizeId execution mode.
+  // We use OpExecutionModeId LocalSizeId exclusively (emitted above with OpEntryPoint).
+  // Keeping both would cause the BuiltIn decoration to override LocalSizeId.
 
   // ArrayStride for PSB pointer types used in OpPtrAccessChain.
   // SPIR-V requires ArrayStride on any PSB pointer type that is the Base of OpPtrAccessChain.
@@ -2146,12 +2415,16 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     if (pti.storage_class == SC::CrossWorkgroup || pti.storage_class == SC::Generic)
       skip_types.insert(tid);
   }
-  // Mark impl fn type IDs to skip (we'll emit new ones)
+  // Mark impl fn type IDs to skip (we'll emit new ones, or reuse existing ones).
+  // Skip the original type whenever a new type is assigned (even if the new type
+  // is an existing type from the module) — the original type may reference CW
+  // pointer types that are being skipped, and is no longer needed.
   for (auto& [fn_id, new_type_id] : impl_fn_new_type_ids) {
     auto fit = info.functions.find(fn_id);
     if (fit == info.functions.end()) continue;
-    if (new_type_id != fit->second.fn_type)
-      skip_types.insert(fit->second.fn_type);
+    uint32_t orig_type = fit->second.fn_type;
+    if (new_type_id != orig_type)
+      skip_types.insert(orig_type);
   }
   // Mark helper fn type IDs to skip (we'll emit new ones with PSB ptr params)
   for (auto& [fn_id, new_type_id] : helper_fn_new_type_ids) {
@@ -2181,7 +2454,20 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
       uint32_t const_id = instr.word(2);
       uint32_t value    = instr.word(3);
       bool is_uint32 = (info.int_widths.count(type_id) && info.int_widths.at(type_id) == 32);
-      if (is_uint32 && (value & 0x10u) && (value & 0xFC0u)) {
+      // Valid memory-semantics values only use SPIR-V MemorySemanticsMask bits:
+      //   0x002 Acquire, 0x004 Release, 0x008 AcquireRelease,
+      //   0x010 SequentiallyConsistent,
+      //   0x040 UniformMemory, 0x080 SubgroupMemory, 0x100 WorkgroupMemory,
+      //   0x200 CrossWorkgroupMemory, 0x400 AtomicCounterMemory, 0x800 ImageMemory
+      // Bits 0 (0x001) and 5 (0x020) are NOT valid MemorySemantics bits.
+      // Additionally, the memory-order bits (Acquire/Release/AcqRel/SeqCst) are
+      // mutually exclusive, so a valid value has EXACTLY ONE order bit set.
+      // This rejects integer constants like 123 (0x7B, multiple order bits) and
+      // 222 (0xDE, all order bits) that happen to have bit 0x10 set by coincidence.
+      static const uint32_t kValidMemSemBits = 0xFDEu;
+      uint32_t order_bits = value & 0x1Eu; // bits 1-4: order flags
+      bool has_one_order_bit = (order_bits != 0) && ((order_bits & (order_bits - 1)) == 0);
+      if (is_uint32 && !(value & ~kValidMemSemBits) && (value & 0x10u) && (value & 0xFC0u) && has_one_order_bit) {
         // Replace SequentiallyConsistent (0x10) with AcquireRelease (0x8)
         uint32_t fixed = (value & ~0x10u) | 0x8u;
         emitInstr(out, Op::Constant, {type_id, const_id, fixed});
@@ -2305,6 +2591,7 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     if (fit == info.functions.end()) continue;
     if (new_type_id == fit->second.fn_type) continue; // unchanged
     if (emitted_fn_types.count(new_type_id)) continue; // already emitted
+    if (info.fn_types.count(new_type_id)) continue; // reusing existing type — already in original_types
     emitted_fn_types.insert(new_type_id);
     FunctionInfo& fn = fit->second;
     auto& np = impl_fn_new_params[fn_id];
@@ -2317,6 +2604,7 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
   // New: helper fn type IDs (non-stub, non-impl fns with CW/Generic ptr params → PSB ptr)
   for (auto& [fn_id, new_type_id] : helper_fn_new_type_ids) {
     if (emitted_fn_types.count(new_type_id)) continue;
+    if (info.fn_types.count(new_type_id)) continue; // reusing existing type
     emitted_fn_types.insert(new_type_id);
     auto fit = info.functions.find(fn_id);
     if (fit == info.functions.end()) continue;
@@ -2399,6 +2687,28 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     return it != remap.end() ? it->second : id;
   };
 
+  // Map from global variable ID → storage class (for detecting Workgroup bases
+  // in InBoundsPtrAccessChain transforms).
+  std::unordered_map<uint32_t, uint32_t> global_var_sc;
+  for (auto& orig_instr : info.original_types) {
+    if (orig_instr.opcode == Op::Variable && orig_instr.wc() >= 4) {
+      global_var_sc[orig_instr.word(2)] = orig_instr.word(3);
+    }
+  }
+  // Also include chip_var (CrossWorkgroup) and other special vars
+  for (auto& cv : info.chip_vars) {
+    global_var_sc[cv.id] = SC::CrossWorkgroup;
+  }
+
+  // Helper: find Workgroup pointer type for a given base type, returns 0 if not found.
+  auto findWorkgroupPtrType = [&](uint32_t base_type) -> uint32_t {
+    for (auto& [tid, pi] : info.ptr_types) {
+      if (pi.base_type == base_type && pi.storage_class == SC::WorkgroupLocal)
+        return tid;
+    }
+    return 0;
+  };
+
   // For each function in order:
   for (uint32_t fn_id : info.function_order) {
     auto fit = info.functions.find(fn_id);
@@ -2476,7 +2786,16 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
           emitInstr(out, Op::Store, {local_var, load_id, 0x2, alignment});
           call_args.push_back(local_var);
         } else {
-          call_args.push_back(load_id);
+          // If impl param is bool but we loaded uint32, convert: bool = (uint32 != 0)
+          uint32_t arg_id = load_id;
+          if (i < impl_fn.params.size() &&
+              impl_fn.params[i].type_id == info.bool_type_id &&
+              al.type_id == info.uint32_type_id) {
+            uint32_t bool_id = idAlloc.alloc();
+            emitInstr(out, Op::INotEqual, {info.bool_type_id, bool_id, load_id, const_uint32_0_id});
+            arg_id = bool_id;
+          }
+          call_args.push_back(arg_id);
         }
       }
 
@@ -2674,6 +2993,32 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
               (pit->second.storage_class == SC::Generic ||
                pit->second.storage_class == SC::CrossWorkgroup)) {
             uint32_t base_type = pit->second.base_type;
+            // If the base (after remap) is a Workgroup variable, we cannot produce a
+            // PSB pointer — use Workgroup AccessChain semantics instead.
+            auto base_sc_it = global_var_sc.find(base);
+            if (base_sc_it != global_var_sc.end() &&
+                base_sc_it->second == SC::WorkgroupLocal) {
+              // Base is a Workgroup variable: use OpAccessChain with Workgroup ptr type.
+              uint32_t wg_ptr_type = findWorkgroupPtrType(base_type);
+              if (wg_ptr_type != 0) {
+                bool ez = (instr.wc() >= 5 &&
+                           [&]{ auto cit = info.constants.find(instr.word(4));
+                                return cit != info.constants.end() && cit->second.value == 0; }());
+                if (ez && instr.wc() >= 6) {
+                  // elem_idx=0 + extra indices → AccessChain with extra indices
+                  Words ops = {wg_ptr_type, result_id, base};
+                  for (uint32_t i = 5; i < instr.wc(); ++i)
+                    ops.push_back(remapId(instr.word(i), remap));
+                  emitInstr(out, Op::AccessChain, ops);
+                } else {
+                  Words ops = {wg_ptr_type, result_id, base};
+                  for (uint32_t i = 4; i < instr.wc(); ++i)
+                    ops.push_back(remapId(instr.word(i), remap));
+                  emitInstr(out, Op::PtrAccessChain, ops);
+                }
+                continue;
+              }
+            }
             auto psb_it = psb_ptr_type_map.find(base_type);
             if (psb_it != psb_ptr_type_map.end()) {
               Words ops = {psb_it->second, result_id, base};
@@ -2689,8 +3034,9 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
           uint32_t elem_idx_id = instr.word(4);
           auto cit = info.constants.find(elem_idx_id);
           bool elem_is_zero = (cit != info.constants.end() && cit->second.value == 0);
-          if (elem_is_zero) {
-            // zero offset: result == base pointer
+          bool has_extra_indices = (instr.wc() >= 6);
+          if (elem_is_zero && !has_extra_indices) {
+            // zero offset, no sub-indices: result == base pointer
             remap[result_id] = base;
           } else {
             // Only Workgroup SC is valid for PtrAccessChain in Vulkan.
@@ -2699,11 +3045,21 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
                 pit->second.storage_class != SC::WorkgroupLocal) {
               return {}; // silent fallback to clspv subprocess
             }
-            uint32_t elem_idx = remapId(elem_idx_id, remap);
-            Words ops = {result_type, result_id, base, elem_idx};
-            for (uint32_t i = 5; i < instr.wc(); ++i)
-              ops.push_back(remapId(instr.word(i), remap));
-            emitInstr(out, Op::PtrAccessChain, ops);
+            if (elem_is_zero && has_extra_indices) {
+              // elem_idx=0 is a no-op step; additional indices navigate into the
+              // composite object. Use OpAccessChain (composite navigation) rather
+              // than OpPtrAccessChain (pointer arithmetic with stride of base type).
+              Words ops = {result_type, result_id, base};
+              for (uint32_t i = 5; i < instr.wc(); ++i)
+                ops.push_back(remapId(instr.word(i), remap));
+              emitInstr(out, Op::AccessChain, ops);
+            } else {
+              uint32_t elem_idx = remapId(elem_idx_id, remap);
+              Words ops = {result_type, result_id, base, elem_idx};
+              for (uint32_t i = 5; i < instr.wc(); ++i)
+                ops.push_back(remapId(instr.word(i), remap));
+              emitInstr(out, Op::PtrAccessChain, ops);
+            }
           }
           continue;
         }
@@ -2721,8 +3077,18 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
             auto vit = info.vec_types.find(result_type);
             if (vit != info.vec_types.end() &&
                 vit->second.first == info.uint64_type_id && vit->second.second == 3) {
-              // wgs_composite_id is v3uint; UConvert to v3ulong
-              emitInstr(out, Op::UConvert, {result_type, result_id, wgs_composite_id});
+              // wgs_composite_id is v3uint SpecConstantComposite.
+              // Avoid OpUConvert of a SpecConstantComposite (driver portability issue):
+              // extract each component and scalar-convert to ulong, then reconstruct.
+              uint32_t cx = idAlloc.alloc(), cy = idAlloc.alloc(), cz = idAlloc.alloc();
+              uint32_t lx = idAlloc.alloc(), ly = idAlloc.alloc(), lz = idAlloc.alloc();
+              emitInstr(out, Op::CompositeExtract, {info.uint32_type_id, cx, wgs_composite_id, 0});
+              emitInstr(out, Op::CompositeExtract, {info.uint32_type_id, cy, wgs_composite_id, 1});
+              emitInstr(out, Op::CompositeExtract, {info.uint32_type_id, cz, wgs_composite_id, 2});
+              emitInstr(out, Op::UConvert, {info.uint64_type_id, lx, cx});
+              emitInstr(out, Op::UConvert, {info.uint64_type_id, ly, cy});
+              emitInstr(out, Op::UConvert, {info.uint64_type_id, lz, cz});
+              emitInstr(out, Op::CompositeConstruct, {result_type, result_id, lx, ly, lz});
             } else {
               // Assume v3uint result (or already matching) — use composite directly
               remap[result_id] = wgs_composite_id;
@@ -2739,8 +3105,17 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
               // Load as v3uint (no memory operands — Aligned is OpenCL-specific)
               uint32_t tmp_id = idAlloc.alloc();
               emitInstr(out, Op::Load, {v3uint_type_id, tmp_id, ptr_id});
-              // UConvert tmp (v3uint) → result_id (v3ulong)
-              emitInstr(out, Op::UConvert, {result_type, result_id, tmp_id});
+              // UConvert tmp (v3uint) → result_id (v3ulong) component-wise to avoid
+              // driver issues with vector UConvert.
+              uint32_t cx = idAlloc.alloc(), cy = idAlloc.alloc(), cz = idAlloc.alloc();
+              uint32_t lx = idAlloc.alloc(), ly = idAlloc.alloc(), lz = idAlloc.alloc();
+              emitInstr(out, Op::CompositeExtract, {info.uint32_type_id, cx, tmp_id, 0});
+              emitInstr(out, Op::CompositeExtract, {info.uint32_type_id, cy, tmp_id, 1});
+              emitInstr(out, Op::CompositeExtract, {info.uint32_type_id, cz, tmp_id, 2});
+              emitInstr(out, Op::UConvert, {info.uint64_type_id, lx, cx});
+              emitInstr(out, Op::UConvert, {info.uint64_type_id, ly, cy});
+              emitInstr(out, Op::UConvert, {info.uint64_type_id, lz, cz});
+              emitInstr(out, Op::CompositeConstruct, {result_type, result_id, lx, ly, lz});
               continue;
             }
           }
@@ -2858,7 +3233,8 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
           uint32_t elem_idx_id = instr.word(4);
           auto cit = info.constants.find(elem_idx_id);
           bool elem_is_zero = (cit != info.constants.end() && cit->second.value == 0);
-          if (elem_is_zero) {
+          bool has_extra_indices = (instr.wc() >= 6);
+          if (elem_is_zero && !has_extra_indices) {
             remap[result_id] = base;
           } else {
             // PtrAccessChain is only valid for PSB, Workgroup, StorageBuffer SC.
@@ -2871,11 +3247,19 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
                 return {}; // silent fallback to clspv subprocess
               }
             }
-            uint32_t elem_idx = remapId(elem_idx_id, remap);
-            Words ops = {result_type, result_id, base, elem_idx};
-            for (uint32_t i = 5; i < instr.wc(); ++i)
-              ops.push_back(remapId(instr.word(i), remap));
-            emitInstr(out, Op::PtrAccessChain, ops);
+            if (elem_is_zero && has_extra_indices && !was_remapped) {
+              // elem_idx=0 is a no-op step; extra indices navigate into the composite.
+              Words ops = {result_type, result_id, base};
+              for (uint32_t i = 5; i < instr.wc(); ++i)
+                ops.push_back(remapId(instr.word(i), remap));
+              emitInstr(out, Op::AccessChain, ops);
+            } else {
+              uint32_t elem_idx = remapId(elem_idx_id, remap);
+              Words ops = {result_type, result_id, base, elem_idx};
+              for (uint32_t i = 5; i < instr.wc(); ++i)
+                ops.push_back(remapId(instr.word(i), remap));
+              emitInstr(out, Op::PtrAccessChain, ops);
+            }
           }
           continue;
         }
@@ -3006,7 +3390,15 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
             auto vit = info.vec_types.find(result_type);
             if (vit != info.vec_types.end() &&
                 vit->second.first == info.uint64_type_id && vit->second.second == 3) {
-              emitInstr(out, Op::UConvert, {result_type, result_id, wgs_composite_id});
+              uint32_t cx = idAlloc.alloc(), cy = idAlloc.alloc(), cz = idAlloc.alloc();
+              uint32_t lx = idAlloc.alloc(), ly = idAlloc.alloc(), lz = idAlloc.alloc();
+              emitInstr(out, Op::CompositeExtract, {info.uint32_type_id, cx, wgs_composite_id, 0});
+              emitInstr(out, Op::CompositeExtract, {info.uint32_type_id, cy, wgs_composite_id, 1});
+              emitInstr(out, Op::CompositeExtract, {info.uint32_type_id, cz, wgs_composite_id, 2});
+              emitInstr(out, Op::UConvert, {info.uint64_type_id, lx, cx});
+              emitInstr(out, Op::UConvert, {info.uint64_type_id, ly, cy});
+              emitInstr(out, Op::UConvert, {info.uint64_type_id, lz, cz});
+              emitInstr(out, Op::CompositeConstruct, {result_type, result_id, lx, ly, lz});
             } else {
               remap[result_id] = wgs_composite_id;
             }
@@ -3020,7 +3412,15 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
                 vit->second.first == info.uint64_type_id && vit->second.second == 3) {
               uint32_t tmp_id = idAlloc.alloc();
               emitInstr(out, Op::Load, {v3uint_type_id, tmp_id, ptr_id});
-              emitInstr(out, Op::UConvert, {result_type, result_id, tmp_id});
+              uint32_t cx = idAlloc.alloc(), cy = idAlloc.alloc(), cz = idAlloc.alloc();
+              uint32_t lx = idAlloc.alloc(), ly = idAlloc.alloc(), lz = idAlloc.alloc();
+              emitInstr(out, Op::CompositeExtract, {info.uint32_type_id, cx, tmp_id, 0});
+              emitInstr(out, Op::CompositeExtract, {info.uint32_type_id, cy, tmp_id, 1});
+              emitInstr(out, Op::CompositeExtract, {info.uint32_type_id, cz, tmp_id, 2});
+              emitInstr(out, Op::UConvert, {info.uint64_type_id, lx, cx});
+              emitInstr(out, Op::UConvert, {info.uint64_type_id, ly, cy});
+              emitInstr(out, Op::UConvert, {info.uint64_type_id, lz, cz});
+              emitInstr(out, Op::CompositeConstruct, {result_type, result_id, lx, ly, lz});
               continue;
             }
           }
@@ -3223,6 +3623,9 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
   // Update bound in header (word index 3)
   out[3] = idAlloc.next_id;
 
+  // Fix OpStore/OpLoad alignments for PSB pointers (VUID-06314).
+  fixPSBAlignments(out, info);
+
   return out;
 }
 
@@ -3283,19 +3686,6 @@ std::vector<uint32_t> openclToVulkanSpirv(const std::vector<uint8_t>& opencl_spv
   }
 
   logDebug("openclToVulkanSpirv: produced {} words of Vulkan PSB SPIR-V", result.size());
-
-  // Debug dump: write to /tmp/spirv_to_vulkan_debug.spv if CHIP_DUMP_VK_SPIRV is set
-  if (getenv("CHIP_DUMP_VK_SPIRV")) {
-    std::string path(getenv("CHIP_DUMP_VK_SPIRV"));
-    std::ofstream f(path, std::ios::binary);
-    f.write(reinterpret_cast<const char*>(result.data()), result.size() * 4);
-    logInfo("openclToVulkanSpirv: dumped {} words to {}", result.size(), path);
-  }
-  if (getenv("CHIP_DUMP_OCL_SPIRV")) {
-    std::string path(getenv("CHIP_DUMP_OCL_SPIRV"));
-    std::ofstream f(path, std::ios::binary);
-    f.write(reinterpret_cast<const char*>(spv.data()), spv.size() * 4);
-  }
 
   return result;
 }
