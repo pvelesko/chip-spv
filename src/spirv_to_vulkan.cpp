@@ -762,63 +762,96 @@ static bool collectModuleInfo(const Words& spv, ModuleInfo& info, std::string& e
 
   // For impl functions: classify each CrossWorkgroup param as Pod or Pointer
   // by scanning the function body for uses
-  for (auto& fn_id : info.impl_fn_ids) {
-    auto it = info.functions.find(fn_id);
-    if (it == info.functions.end()) continue;
-    FunctionInfo& fn = it->second;
-
-    // Build set of CrossWorkgroup param ids
+  auto classifyImplParams = [](FunctionInfo& fn) {
     std::unordered_set<uint32_t> cw_params;
-    for (auto& p : fn.params) {
+    for (auto& p : fn.params)
       if (p.is_crossworkgroup_ptr) cw_params.insert(p.id);
-    }
-    if (cw_params.empty()) continue;
+    if (cw_params.empty()) return;
 
-    // Track which params are used in ConvertPtrToU (pod) vs as pointer base (pointer kind)
     std::unordered_set<uint32_t> pod_params;
     std::unordered_set<uint32_t> ptr_params;
-
     for (auto& instr : fn.body) {
       if (instr.opcode == Op::ConvertPtrToU && instr.wc() >= 4) {
         uint32_t src = instr.word(3);
         if (cw_params.count(src)) pod_params.insert(src);
       }
-      // Check if param used directly as pointer in load/store/access chain
       if ((instr.opcode == Op::Load || instr.opcode == Op::Store ||
            instr.opcode == Op::AccessChain || instr.opcode == Op::InBoundsAccessChain ||
            instr.opcode == Op::PtrAccessChain || instr.opcode == Op::InBoundsPtrAccessChain) &&
           instr.wc() >= 3) {
-        // Base pointer is typically word(3) for load/store and word(3) for access chains
         uint32_t base_idx = (instr.opcode == Op::Store) ? 1 : 3;
         if (base_idx < instr.wc()) {
           uint32_t base = instr.word(base_idx);
           if (cw_params.count(base)) ptr_params.insert(base);
         }
       }
-      // CW ptr passed as argument to a FunctionCall is also a pointer use:
-      // the callee receives it as a CW/PSB ptr, not a raw integer address.
       if (instr.opcode == Op::FunctionCall && instr.wc() >= 4) {
-        for (uint32_t ai = 3; ai < instr.wc(); ++ai) {
-          if (cw_params.count(instr.word(ai)))
-            ptr_params.insert(instr.word(ai));
-        }
+        for (uint32_t ai = 3; ai < instr.wc(); ++ai)
+          if (cw_params.count(instr.word(ai))) ptr_params.insert(instr.word(ai));
       }
     }
-
-    // If a param is only in pod_params (not ptr_params), it's pod kind
-    // Otherwise pointer kind
     for (auto& p : fn.params) {
       if (!p.is_crossworkgroup_ptr) continue;
       bool pod_use = pod_params.count(p.id) > 0;
       bool ptr_use = ptr_params.count(p.id) > 0;
-      if (!pod_use && !ptr_use) {
-        // No use found — treat as pod (conservative)
-        p.is_pod_kind = true;
-      } else if (ptr_use) {
-        p.is_pointer_kind = true;
-      } else {
-        p.is_pod_kind = true;
-      }
+      if (!pod_use && !ptr_use) p.is_pod_kind = true;
+      else if (ptr_use) p.is_pointer_kind = true;
+      else p.is_pod_kind = true;
+    }
+  };
+
+  for (auto& fn_id : info.impl_fn_ids) {
+    auto it = info.functions.find(fn_id);
+    if (it == info.functions.end()) continue;
+    classifyImplParams(it->second);
+  }
+
+  // Synthesize stub-impl pairs for inline kernels (entry-point functions whose
+  // bodies are not just a single FunctionCall to an impl). Without this, the
+  // entry-point function keeps its OpenCL kernel parameters, but Vulkan SPIR-V
+  // requires entry points to have zero parameters (VUID-StandaloneSpirv-None-04633).
+  // We synthesize a fresh impl id, move the body+params there, and let the stub
+  // emit branch later rebuild a zero-parameter wrapper that loads args from
+  // push constants and calls the new impl.
+  //
+  // Note: new impl ids must not collide with the SPIR-V Bound. We use ids
+  // starting at info.bound and bump info.bound accordingly so subsequent
+  // idAlloc uses see the right base.
+  {
+    std::unordered_set<uint32_t> ep_fn_ids;
+    for (auto& ep : info.entry_points) ep_fn_ids.insert(ep.fn_id);
+    std::vector<uint32_t> inline_kernel_ids;
+    for (uint32_t ep_id : ep_fn_ids) {
+      if (info.stub_fn_ids.count(ep_id)) continue;
+      auto fit = info.functions.find(ep_id);
+      if (fit == info.functions.end()) continue;
+      // Skip if the entry point has no parameters (already Vulkan-compatible).
+      if (fit->second.params.empty()) continue;
+      inline_kernel_ids.push_back(ep_id);
+    }
+    for (uint32_t orig_id : inline_kernel_ids) {
+      uint32_t new_impl_id = info.bound++;
+      // Take a value copy first; the unordered_map insert below may rehash and
+      // invalidate references obtained from operator[].
+      FunctionInfo new_impl = info.functions[orig_id];
+      info.functions.emplace(new_impl_id, std::move(new_impl));
+      FunctionInfo& orig = info.functions[orig_id];
+      orig.is_kernel_stub = true;
+      orig.impl_call_target = new_impl_id;
+      orig.body.clear();
+      orig.params.clear();
+      info.stub_fn_ids.insert(orig_id);
+      info.impl_fn_ids.insert(new_impl_id);
+      // Insert the new impl in function_order right after the original entry
+      // point so the SPIR-V module structure stays well-defined (impl follows
+      // its caller stub in the binary).
+      auto fo_it = std::find(info.function_order.begin(),
+                             info.function_order.end(), orig_id);
+      if (fo_it == info.function_order.end())
+        info.function_order.push_back(new_impl_id);
+      else
+        info.function_order.insert(fo_it + 1, new_impl_id);
+      classifyImplParams(info.functions[new_impl_id]);
     }
   }
 
@@ -3467,6 +3500,50 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
           Words ops = {type, result, ptr};
           for (uint32_t i = 4; i < instr.wc(); ++i) ops.push_back(instr.word(i));
           emitInstr(out, Op::Load, ops);
+          continue;
+        }
+
+        // InBoundsPtrAccessChain is invalid in Vulkan (requires Addresses cap).
+        // Convert to PtrAccessChain whenever the result type maps (or already is)
+        // a Vulkan-valid SC (PSB, Workgroup, StorageBuffer). This branch covers
+        // entry-point kernels that aren't a stub-impl pair (e.g. inline kernels).
+        if (instr.opcode == Op::InBoundsPtrAccessChain && instr.wc() >= 5) {
+          uint32_t orig_type   = instr.word(1);
+          uint32_t result_type = orig_type;
+          uint32_t result_id   = instr.word(2);
+          uint32_t base        = remapId(instr.word(3), remap);
+          auto cwit = cw_type_remap.find(result_type);
+          bool was_remapped = (cwit != cw_type_remap.end());
+          if (was_remapped) result_type = cwit->second;
+          uint32_t elem_idx_id = instr.word(4);
+          auto cit = info.constants.find(elem_idx_id);
+          bool elem_is_zero = (cit != info.constants.end() && cit->second.value == 0);
+          bool has_extra_indices = (instr.wc() >= 6);
+          if (elem_is_zero && !has_extra_indices) {
+            remap[result_id] = base;
+          } else {
+            if (!was_remapped) {
+              auto orig_pit = info.ptr_types.find(orig_type);
+              if (orig_pit == info.ptr_types.end() ||
+                  (orig_pit->second.storage_class != SC::WorkgroupLocal &&
+                   orig_pit->second.storage_class != SC::StorageBuffer &&
+                   orig_pit->second.storage_class != SC::PhysicalStorageBuffer)) {
+                return {}; // silent fallback to clvk pipeline
+              }
+            }
+            if (elem_is_zero && has_extra_indices && !was_remapped) {
+              Words ops = {result_type, result_id, base};
+              for (uint32_t i = 5; i < instr.wc(); ++i)
+                ops.push_back(remapId(instr.word(i), remap));
+              emitInstr(out, Op::AccessChain, ops);
+            } else {
+              uint32_t elem_idx = remapId(elem_idx_id, remap);
+              Words ops = {result_type, result_id, base, elem_idx};
+              for (uint32_t i = 5; i < instr.wc(); ++i)
+                ops.push_back(remapId(instr.word(i), remap));
+              emitInstr(out, Op::PtrAccessChain, ops);
+            }
+          }
           continue;
         }
 
