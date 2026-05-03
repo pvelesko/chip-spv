@@ -981,6 +981,15 @@ struct ArgLayout {
   uint32_t pc_size     = 0;
   bool     is_byval    = false;
   bool     is_ulong    = false; // was a CW pointer, now a ulong in PC
+  // For byval struct types that are also used as Function-scope variable base
+  // types: SPIR-V VUID-Offset-04547 forbids Offset decorations on structs used
+  // in Function/Private storage class, but our PushConstant Block-decorated
+  // struct needs Offsets on its members (recursively). Resolution: clone the
+  // struct type. clone_type_id is the new id used in PC layout (Block context);
+  // the original (type_id) stays for the Function-scope local variable. The
+  // stub emits a member-by-member CompositeExtract+CompositeConstruct to
+  // convert from clone-typed to original-typed value before the local Store.
+  uint32_t clone_type_id = 0;
 };
 
 static std::vector<ArgLayout> computeKernelPCLayout(const FunctionInfo& impl_fn,
@@ -1576,15 +1585,10 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
           return {};
         }
         // If the byval struct type is also used as a Function-scope pointer
-        // base type, we would need to add Offset decorations to make it
-        // Block-compatible — but VUID-10684 forbids Offset on structs used as
-        // Function-scope variables.  Fall back to clspv subprocess silently.
-        for (auto& [tid, pti] : info.ptr_types) {
-          if (pti.base_type == param.byval_type_id && pti.storage_class == SC::Function) {
-            err = "ByVal struct type used as Function-scope variable (VUID-10684)";
-            return {};
-          }
-        }
+        // base type, we'd hit VUID-Offset-04547 (Offset decorations forbidden
+        // on Function-scope-used structs). Resolved via type cloning later in
+        // emitVulkanSpirv: a clone struct id is allocated for PC use; the
+        // original stays for the Function-scope local. No bail needed.
       }
     }
   }
@@ -1782,6 +1786,49 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
 
     kernel_pc_info[stub_id] = kpc;
   }
+
+  // For each ByVal struct param whose struct type is also used as the base
+  // type of a Function-scope pointer in the original module: allocate a
+  // CLONE struct id. The clone goes into the PushConstant Block (where its
+  // members get Offset decorations); the original stays for the Function-scope
+  // local variable in the stub. Conversion clone→original happens in the
+  // stub via OpCompositeExtract/Construct.
+  for (auto& [stub_id, kpc] : kernel_pc_info) {
+    for (auto& al : kpc.layout) {
+      if (!al.is_byval) continue;
+      uint32_t orig = al.type_id;
+      bool used_in_function_scope = false;
+      for (auto& [tid, pti] : info.ptr_types) {
+        if (pti.base_type == orig && pti.storage_class == SC::Function) {
+          used_in_function_scope = true;
+          break;
+        }
+      }
+      if (!used_in_function_scope) continue;
+      // Allocate clone id and register it as a struct with the same members.
+      // Subsequent code (PC type emission, decoration cascade, etc.) will
+      // treat the clone like any other struct — but the PC layout entry now
+      // points at it instead of the original.
+      uint32_t clone_id = idAlloc.alloc();
+      al.clone_type_id = clone_id;
+      auto sit = info.struct_members.find(orig);
+      if (sit != info.struct_members.end()) {
+        info.struct_members[clone_id] = sit->second;
+      }
+      auto omit = info.member_offsets.find(orig);
+      if (omit != info.member_offsets.end()) {
+        info.member_offsets[clone_id] = omit->second;
+      }
+    }
+  }
+
+  // Helper: get the type id to use in PushConstant Block context for an
+  // ArgLayout. For ByVal struct args that needed cloning (because the
+  // original is also Function-scope-used), this returns the clone id;
+  // otherwise the original type id.
+  auto pcLayoutType = [](const ArgLayout& al) -> uint32_t {
+    return al.clone_type_id != 0 ? al.clone_type_id : al.type_id;
+  };
 
   // New function types needed: void() for each kernel stub
   // (impl fn types stay the same but with modified param types — need new IDs)
@@ -2627,8 +2674,12 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     // Start from each layout member type (not kpc.pc_struct_type_id which is new)
     for (auto& [stub_id, kpc] : kernel_pc_info) {
       for (auto& al : kpc.layout) {
-        if (info.struct_members.count(al.type_id))
-          ensureStructOffsets(al.type_id);
+        // Decorate the PC-side type (clone for ByVal-conflict cases). This
+        // keeps Offset decorations off the original Function-scope-used
+        // struct id, satisfying VUID-Offset-04547.
+        uint32_t pc_t = pcLayoutType(al);
+        if (info.struct_members.count(pc_t))
+          ensureStructOffsets(pc_t);
       }
     }
     // Also ensure PSB pointer target structs have Offset decorations.
@@ -2873,19 +2924,35 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
 
   // New: PC struct types and ptr PC types
   for (auto& [stub_id, kpc] : kernel_pc_info) {
-    // PC struct: one member per arg
+    // First emit any clone struct types that this kpc references, so the PC
+    // struct's TypeStruct can name them. Members of the clone are identical
+    // to the original (we just need a fresh struct id we can decorate).
+    for (auto& al : kpc.layout) {
+      if (al.clone_type_id != 0) {
+        auto sit = info.struct_members.find(al.clone_type_id);
+        if (sit != info.struct_members.end()) {
+          Words clone_words = {al.clone_type_id};
+          for (uint32_t mt : sit->second) clone_words.push_back(mt);
+          emitInstr(out, Op::TypeStruct, clone_words);
+        }
+      }
+    }
+
+    // PC struct: one member per arg (uses clone for ByVal-conflict cases).
     Words pc_struct_words = {kpc.pc_struct_type_id};
     for (auto& al : kpc.layout) {
-      pc_struct_words.push_back(al.type_id);
+      pc_struct_words.push_back(pcLayoutType(al));
     }
     emitInstr(out, Op::TypeStruct, pc_struct_words);
 
     // ptr PushConstant to PC struct
     emitInstr(out, Op::TypePointer, {kpc.ptr_pc_type_id, SC::PushConstant, kpc.pc_struct_type_id});
 
-    // ptr PushConstant to each member type (for OpAccessChain)
+    // ptr PushConstant to each member type (for OpAccessChain). Uses the
+    // PC-side type (clone for ByVal-conflict cases) so AccessChain into PC
+    // hands back a pointer with Block-decorated layout semantics.
     for (size_t i = 0; i < kpc.layout.size(); ++i) {
-      emitInstr(out, Op::TypePointer, {kpc.member_ptr_type_ids[i], SC::PushConstant, kpc.layout[i].type_id});
+      emitInstr(out, Op::TypePointer, {kpc.member_ptr_type_ids[i], SC::PushConstant, pcLayoutType(kpc.layout[i])});
     }
   }
 
@@ -3105,17 +3172,44 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
         uint32_t chain_id = idAlloc.alloc();
         emitInstr(out, Op::AccessChain, {kpc.member_ptr_type_ids[i], chain_id, kpc.pc_var_id, idx_const_id});
 
-        // Load
+        // Load. For ByVal-conflict cases, the PC member type is the CLONE
+        // struct, so the load result type must also be the clone. For all
+        // other cases (including non-byval), use the original type.
+        uint32_t load_type = (al.is_byval && al.clone_type_id != 0)
+                               ? al.clone_type_id : al.type_id;
         uint32_t load_id = idAlloc.alloc();
         uint32_t alignment = typeAlign(al.type_id, info);
         if (alignment == 0) alignment = 4;
         // OpLoad with alignment memory operand: Aligned = 0x2
-        emitInstr(out, Op::Load, {al.type_id, load_id, chain_id, 0x2, alignment});
+        emitInstr(out, Op::Load, {load_type, load_id, chain_id, 0x2, alignment});
 
         if (al.is_byval) {
+          // For byval-conflict cases, the loaded value has clone struct type
+          // but the local Function-scope variable holds the original struct
+          // type. Convert via member-by-member CompositeExtract +
+          // CompositeConstruct (clone and original have identical members,
+          // just different ids).
+          uint32_t store_val = load_id;
+          if (al.clone_type_id != 0) {
+            auto sit = info.struct_members.find(al.type_id);
+            if (sit != info.struct_members.end()) {
+              std::vector<uint32_t> members;
+              for (size_t j = 0; j < sit->second.size(); ++j) {
+                uint32_t mt = sit->second[j];
+                uint32_t mid = idAlloc.alloc();
+                emitInstr(out, Op::CompositeExtract, {mt, mid, load_id, (uint32_t)j});
+                members.push_back(mid);
+              }
+              uint32_t orig_val = idAlloc.alloc();
+              Words ops = {al.type_id, orig_val};
+              for (uint32_t m : members) ops.push_back(m);
+              emitInstr(out, Op::CompositeConstruct, ops);
+              store_val = orig_val;
+            }
+          }
           // Store to local var
           uint32_t local_var = local_struct_var_ids[i];
-          emitInstr(out, Op::Store, {local_var, load_id, 0x2, alignment});
+          emitInstr(out, Op::Store, {local_var, store_val, 0x2, alignment});
           call_args.push_back(local_var);
         } else {
           // If impl param is bool but we loaded uint32, convert: bool = (uint32 != 0)
