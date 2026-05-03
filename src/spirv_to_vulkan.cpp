@@ -2428,6 +2428,30 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Atomic scope pre-pass: VUID-StandaloneSpirv-None-04638.
+  // Vulkan only allows OpAtomic* memory scope ∈ {Device(1), QueueFamily(5),
+  // Workgroup(2), ShaderCallKHR(6), Subgroup(3), Invocation(4)}. OpenCL
+  // routinely emits CrossDevice(0), which is invalid. Substitute the scope
+  // operand id with const_uint32_1_id (Device=1) whenever its constant value
+  // is 0. Per SPIR-V spec the scope operand is at:
+  //   - word[4] for OpAtomic* opcodes 227, 229..242 (result-producing)
+  //   - word[2] for OpAtomicStore (228, no result)
+  // Same const id 0 is used elsewhere as a legitimate AccessChain index, so
+  // we rewrite per-operand at known positions, NOT per-constant module-wide.
+  // -------------------------------------------------------------------------
+  for (auto& [fn_id, fn] : info.functions) {
+    for (auto& instr : fn.body) {
+      if (instr.opcode < 227 || instr.opcode > 242) continue;
+      size_t scope_idx = (instr.opcode == 228) ? 2 : 4;
+      if (scope_idx >= instr.wc()) continue;
+      uint32_t scope_id = instr.word(scope_idx);
+      auto sit = info.constants.find(scope_id);
+      if (sit == info.constants.end() || sit->second.value != 0) continue;
+      instr.words[scope_idx] = const_uint32_1_id;
+    }
+  }
+
   // Pre-allocate all reflection constants
   getReflConst(0); getReflConst(1); getReflConst(2); // specid constants
   for (auto& ep : info.entry_points) {
@@ -2995,6 +3019,20 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
           emitInstr(out, Op::Constant, {type_id, const_id, fixed});
           continue;
         }
+      }
+      // VUID-StandaloneSpirv-MemorySemantics-10871: when memory semantics
+      // carry a Vulkan storage-class bit (UniformMemory|WorkgroupMemory|
+      // ImageMemory|OutputMemory) it must also carry an order bit
+      // (Acquire/Release/AcqRel/SeqCst). OpenCL atomics commonly emit
+      // "relaxed-with-storage-class" constants like 0x300 (Workgroup |
+      // CrossWorkgroup). Rewrite those: CrossWorkgroup→Uniform, then add
+      // Acquire(0x2) so the Vulkan validator is satisfied.
+      if (is_uint32 && !(value & ~kValidMemSemBits) && (value & 0xFC0u) && order_bits == 0) {
+        uint32_t fixed = value;
+        if (fixed & 0x200u) fixed = (fixed & ~0x200u) | 0x040u;
+        fixed |= 0x002u; // Acquire
+        emitInstr(out, Op::Constant, {type_id, const_id, fixed});
+        continue;
       }
     }
     emit(out, instr.words);
