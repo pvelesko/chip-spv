@@ -1621,6 +1621,69 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
   IdAllocator idAlloc(info.bound + 1);
 
   // -------------------------------------------------------------------------
+  // Drop chipStar runtime helper entry points before emit. These functions
+  // (__chip_var_init_*, __chip_var_bind_*, __chip_var_info_*,
+  // __chip_reset_non_symbols) exist for the OpenCL/Level0 path where the
+  // chipStar runtime calls them to initialize device-side helpers. In the
+  // vulkanize path the runtime uses SSBO descriptors directly, so these
+  // helpers are never invoked. Their bodies do pointer arithmetic on
+  // chip_vars that's hard to translate (treats chip_var as a 1-element ptr
+  // table). Drop them so we don't emit invalid SPV trying to translate.
+  // -------------------------------------------------------------------------
+  std::unordered_set<uint32_t> dropped_helper_ids;
+  {
+    std::unordered_set<uint32_t> drop_fn_ids;
+    auto isHelperName = [](const std::string& n) -> bool {
+      return n.compare(0, 16, "__chip_var_init_") == 0 ||
+             n.compare(0, 16, "__chip_var_bind_") == 0 ||
+             n.compare(0, 16, "__chip_var_info_") == 0 ||
+             n == "__chip_reset_non_symbols";
+    };
+    // Identify entry points by name.
+    for (auto& ep : info.entry_points) {
+      if (isHelperName(ep.name))
+        drop_fn_ids.insert(ep.fn_id);
+    }
+    if (!drop_fn_ids.empty()) {
+      // Collect all IDs referenced inside the dropped function bodies so we
+      // can filter their OpName / OpDecorate references later. Includes the
+      // function id itself, label ids, parameter ids and instruction result
+      // ids. Done BEFORE erasing the function info.
+      for (uint32_t id : drop_fn_ids) {
+        dropped_helper_ids.insert(id);
+        auto fit = info.functions.find(id);
+        if (fit == info.functions.end()) continue;
+        for (auto& p : fit->second.params) dropped_helper_ids.insert(p.id);
+        for (auto& instr : fit->second.body) {
+          // Result id is at word(2) for any instruction with both result type
+          // and result id. Conservative: collect EVERY operand that looks
+          // like an id (skip word 0 = opcode|wc and skip OpExtInst literal
+          // opcodes). Worst case we mark a few extra ids; OpName filter is
+          // an allow-list-of-references, so over-marking only suppresses some
+          // optional debug names from the output.
+          for (uint32_t i = 1; i < instr.wc(); ++i)
+            dropped_helper_ids.insert(instr.word(i));
+        }
+      }
+      // Strip from entry_points.
+      info.entry_points.erase(
+          std::remove_if(info.entry_points.begin(), info.entry_points.end(),
+              [&](const auto& ep){ return drop_fn_ids.count(ep.fn_id) > 0; }),
+          info.entry_points.end());
+      // Strip from function_order, functions, stub/impl id sets.
+      info.function_order.erase(
+          std::remove_if(info.function_order.begin(), info.function_order.end(),
+              [&](uint32_t id){ return drop_fn_ids.count(id) > 0; }),
+          info.function_order.end());
+      for (uint32_t id : drop_fn_ids) {
+        info.functions.erase(id);
+        info.stub_fn_ids.erase(id);
+        info.impl_fn_ids.erase(id);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Allocate IDs for new constructs
   // -------------------------------------------------------------------------
 
@@ -2533,6 +2596,9 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     removed_ids.insert(id);
   for (auto& [id, _] : info.init_var_constants)
     removed_ids.insert(id);
+  // chipStar runtime helper functions and their internal IDs were dropped
+  // earlier; their OpName / OpDecorate references must also be skipped.
+  removed_ids.insert(dropped_helper_ids.begin(), dropped_helper_ids.end());
   // WorkgroupSize variable is removed (replaced by spec constant composite)
   if (info.workgroup_size_var_id != 0)
     removed_ids.insert(info.workgroup_size_var_id);
@@ -2737,6 +2803,7 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     for (auto& [id, deco_list] : info.decorations) {
       if (info.chip_var_by_id.count(id)) continue; // chip_var IDs — replaced
       if (id == info.workgroup_size_var_id) continue; // removed variable
+      if (dropped_helper_ids.count(id)) continue;     // helper-fn ids dropped
 
       for (auto& deco : deco_list) {
         if (deco.empty()) continue;
@@ -3396,7 +3463,7 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
           }
 
           // Cannot represent CopyMemorySized in Vulkan SPIR-V (requires Addresses cap).
-          err = "in-body unsupported pattern (clspv-fallback comment)"; return {};
+          err = "in-body CopyMemorySized in entry-point body (no Addresses cap in Vulkan)"; return {};
         }
 
         // Transform: OpInBoundsPtrAccessChain → OpPtrAccessChain with PSB type
@@ -3444,9 +3511,10 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
               continue;
             }
           }
-          // Function/Private/Workgroup local SC: InBoundsPtrAccessChain is invalid
-          // in Vulkan (requires Addresses cap). Convert to PtrAccessChain (Workgroup
-          // only) or bail out to clspv fallback (Function/Private SC).
+          // Non-Generic/CW result type: convert to PtrAccessChain when the SC
+          // is one Vulkan accepts (WorkgroupLocal, StorageBuffer, or
+          // PhysicalStorageBuffer). Bail for Function/Private (Vulkan can't
+          // express pointer arithmetic on those).
           uint32_t elem_idx_id = instr.word(4);
           auto cit = info.constants.find(elem_idx_id);
           bool elem_is_zero = (cit != info.constants.end() && cit->second.value == 0);
@@ -3455,11 +3523,11 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
             // zero offset, no sub-indices: result == base pointer
             remap[result_id] = base;
           } else {
-            // Only Workgroup SC is valid for PtrAccessChain in Vulkan.
-            // Function/Private SC pointer arithmetic cannot be expressed — bail out.
             if (pit == info.ptr_types.end() ||
-                pit->second.storage_class != SC::WorkgroupLocal) {
-              err = "in-body unsupported pattern (subprocess fallback)"; return {};
+                (pit->second.storage_class != SC::WorkgroupLocal &&
+                 pit->second.storage_class != SC::StorageBuffer &&
+                 pit->second.storage_class != SC::PhysicalStorageBuffer)) {
+              err = "in-body InBoundsPtrAccessChain in entry-point: non-WorkgroupLocal/SSBO/PSB SC"; return {};
             }
             if (elem_is_zero && has_extra_indices) {
               // elem_idx=0 is a no-op step; additional indices navigate into the
@@ -3546,7 +3614,7 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
                                    ? ptr_sb_type_map[cv.base_type_id] : 0;
             if (sb_ptr_type == 0) {
               // Pre-scan missed this type — indicates a bug in collectModuleInfo.
-              err = "in-body unsupported pattern (clspv-fallback comment)"; return {};
+              err = "in-body chip_var Load: PSB ptr type missing (collectModuleInfo bug?)"; return {};
             }
             emitInstr(out, Op::AccessChain, {sb_ptr_type, chain_id, cv.ssbo_var_id, const_uint32_0_id});
             // Load from chain
@@ -3704,7 +3772,7 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
               if (orig_pit == info.ptr_types.end() ||
                   (orig_pit->second.storage_class != SC::WorkgroupLocal &&
                    orig_pit->second.storage_class != SC::StorageBuffer)) {
-                err = "in-body unsupported pattern (subprocess fallback)"; return {};
+                err = "in-body InBoundsPtrAccessChain in impl-fn: non-WorkgroupLocal/SSBO SC"; return {};
               }
             }
             if (elem_is_zero && has_extra_indices && !was_remapped) {
@@ -3830,7 +3898,7 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
           }
 
           // Cannot represent CopyMemorySized in Vulkan SPIR-V (requires Addresses cap).
-          err = "in-body unsupported pattern (clspv-fallback comment)"; return {};
+          err = "in-body CopyMemorySized in impl-fn body (no Addresses cap in Vulkan)"; return {};
         }
 
         // Transform: chip_var Load
@@ -3967,7 +4035,7 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
                   (orig_pit->second.storage_class != SC::WorkgroupLocal &&
                    orig_pit->second.storage_class != SC::StorageBuffer &&
                    orig_pit->second.storage_class != SC::PhysicalStorageBuffer)) {
-                err = "in-body unsupported pattern (clvk pipeline)"; return {};
+                err = "in-body InBoundsPtrAccessChain in non-stub-non-impl: non-WG/SSBO/PSB SC"; return {};
               }
             }
             if (elem_is_zero && has_extra_indices && !was_remapped) {
