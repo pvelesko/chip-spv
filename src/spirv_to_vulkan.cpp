@@ -2851,11 +2851,6 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
         }
       }
 
-      // Track result types emitted in this function body, used when handling
-      // CopyMemorySized where we need to know the PSB pointee type.
-      // Maps result_id → PSB ptr type id (for ConvertUToPtr results).
-      std::unordered_map<uint32_t, uint32_t> body_psb_result_type;
-
       // Emit body instructions (transformed)
       // First, structurize the function body (add OpSelectionMerge/OpLoopMerge).
       const std::vector<Instr> structured_body = structurizeFunctionBody(fn.body, &idAlloc.next_id);
@@ -2926,7 +2921,6 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
             auto psb_it = psb_ptr_type_map.find(base_type);
             if (psb_it != psb_ptr_type_map.end()) {
               emitInstr(out, Op::ConvertUToPtr, {psb_it->second, result_id, src});
-              body_psb_result_type[result_id] = psb_it->second; // track PSB type for later
               continue;
             }
           }
@@ -2975,12 +2969,8 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
             continue;
           }
 
-          // Fallback: emit as-is (will likely fail validation)
-          Words words = instr.words;
-          for (uint32_t i = 1; i < words.size(); ++i)
-            words[i] = remapId(words[i], remap);
-          emit(out, words);
-          continue;
+          // Cannot represent CopyMemorySized in Vulkan SPIR-V (requires Addresses cap).
+          return {}; // silent fallback to clspv pipeline
         }
 
         // Transform: OpInBoundsPtrAccessChain → OpPtrAccessChain with PSB type
@@ -3129,10 +3119,8 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
             uint32_t sb_ptr_type = ptr_sb_type_map.count(cv.base_type_id)
                                    ? ptr_sb_type_map[cv.base_type_id] : 0;
             if (sb_ptr_type == 0) {
-              // Create it on the fly (shouldn't happen if pre-scan was complete)
-              sb_ptr_type = idAlloc.alloc();
-              ptr_sb_type_map[cv.base_type_id] = sb_ptr_type;
-              // Can't emit type here in function body... fall through
+              // Pre-scan missed this type — indicates a bug in collectModuleInfo.
+              return {}; // silent fallback to clspv pipeline
             }
             emitInstr(out, Op::AccessChain, {sb_ptr_type, chain_id, cv.ssbo_var_id, const_uint32_0_id});
             // Load from chain
@@ -3304,7 +3292,6 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
       }
       // Empty remap (no parameter remapping for these functions)
       std::unordered_map<uint32_t, uint32_t> remap;
-      std::unordered_map<uint32_t, uint32_t> body_psb_result_type;
 
       const std::vector<Instr> structured_body2 = structurizeFunctionBody(fn.body, &idAlloc.next_id);
       for (auto& instr : structured_body2) {
@@ -3326,7 +3313,6 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
             auto psb_it = psb_ptr_type_map.find(base_type);
             if (psb_it != psb_ptr_type_map.end()) {
               emitInstr(out, Op::ConvertUToPtr, {psb_it->second, result_id, src});
-              body_psb_result_type[result_id] = psb_it->second;
               continue;
             }
           }
@@ -3371,12 +3357,8 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
             continue;
           }
 
-          // Fallback: emit as-is (will likely fail validation)
-          Words words = instr.words;
-          for (uint32_t i = 1; i < words.size(); ++i)
-            words[i] = remapId(words[i], remap);
-          emit(out, words);
-          continue;
+          // Cannot represent CopyMemorySized in Vulkan SPIR-V (requires Addresses cap).
+          return {}; // silent fallback to clspv pipeline
         }
 
         // Transform: chip_var Load

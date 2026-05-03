@@ -27,14 +27,13 @@ SOFTWARE.
 #include <string>
 #include <vector>
 
-/// Convert OpenCL SPIR-V (Physical64, Kernel execution model, as produced by
-/// llvm-spirv + chipStar passes) into Vulkan SPIR-V (Logical GLSL450,
-/// GLCompute execution model, StorageBuffer descriptors, push constants, and
-/// embedded NonSemantic.ClspvReflection metadata).
-///
-/// Uses llvm-spirv and clspv as subprocesses to do the conversion.  The result
-/// is ready to be passed directly to clCreateProgramWithIL; clvk detects the
-/// GLCompute execution model and bypasses its own clspv compilation pipeline.
+/// Convert OpenCL SPIR-V (Physical64 addressing, Kernel execution model) into
+/// Vulkan SPIR-V (Logical GLSL450, GLCompute execution model, StorageBuffer
+/// descriptors, push constants, and embedded NonSemantic.ClspvReflection
+/// metadata).  The transform is performed entirely in memory without invoking
+/// any external tools.  The result is ready to be passed directly to
+/// clCreateProgramWithIL; clvk detects the GLCompute execution model and
+/// bypasses its own clspv compilation pipeline.
 ///
 /// @param opencl_spv     Raw bytes of the OpenCL SPIR-V module.
 /// @param clspv_options  Extra options forwarded to clspv (e.g.
