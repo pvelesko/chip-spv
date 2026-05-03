@@ -611,7 +611,20 @@ static bool collectModuleInfo(const Words& spv, ModuleInfo& info, std::string& e
           auto it = info.names.find(id);
           if (it != info.names.end()) {
             const std::string& n = it->second;
-            if (n.substr(0, 11) == "__chip_var_" || n == "__chip_module_has_no_IGBAs") {
+            // Recognize chipStar-internal CrossWorkgroup globals as SSBO-backed
+            // shared variables. Includes:
+            //   __chip_var_*                — wrapped __device__ symbols
+            //   __chip_module_has_no_IGBAs  — IGBA marker
+            //   __chipspv_*                 — runtime helpers (device_heap, etc.)
+            //   __chip_clk_counter (any mangling) — clock() intrinsic counter
+            //   _ZL... __chip_*             — file-static chip helpers (mangled)
+            bool is_chip_global =
+                n.substr(0, 11) == "__chip_var_" ||
+                n == "__chip_module_has_no_IGBAs" ||
+                n.substr(0, 9) == "__chipspv" ||
+                n.find("__chip_clk_counter") != std::string::npos ||
+                n.find("__chip_") != std::string::npos;
+            if (is_chip_global) {
               ChipVarInfo cv;
               cv.id           = id;
               cv.name         = n;
@@ -625,10 +638,8 @@ static bool collectModuleInfo(const Words& spv, ModuleInfo& info, std::string& e
               break;
             }
           }
-          // CrossWorkgroup global that is not a recognized chip_var
-          // (e.g. _ZL18__chip_clk_counter, __chipspv_device_heap).
-          // We cannot transform these to PSB Vulkan SPIR-V; signal
-          // that the caller should fall back to clvk's clspv pipeline.
+          // CrossWorkgroup global with an unrecognized name. Fall back to
+          // clvk's clspv pipeline.
           info.has_unsupported_globals = true;
           break;
         }
