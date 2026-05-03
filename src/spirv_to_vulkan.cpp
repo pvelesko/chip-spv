@@ -149,15 +149,17 @@ namespace Cap {
 
 // Decorations
 namespace Deco {
-  static const uint32_t SpecId          = 1;
-  static const uint32_t Block           = 2;
-  static const uint32_t BuiltIn         = 11;
-  static const uint32_t Binding         = 33;
-  static const uint32_t DescriptorSet   = 34;
-  static const uint32_t Offset          = 35;
-  static const uint32_t FuncParamAttr   = 38;
-  static const uint32_t Alignment       = 44;
-  static const uint32_t ArrayStride     = 6;
+  static const uint32_t SpecId            = 1;
+  static const uint32_t Block             = 2;
+  static const uint32_t BuiltIn           = 11;
+  static const uint32_t Binding           = 33;
+  static const uint32_t DescriptorSet     = 34;
+  static const uint32_t Offset            = 35;
+  static const uint32_t FuncParamAttr     = 38;
+  static const uint32_t Alignment         = 44;
+  static const uint32_t ArrayStride       = 6;
+  static const uint32_t Constant          = 22; // OpenCL-only: read-only marker
+  static const uint32_t LinkageAttributes = 41; // OpenCL-only: cross-module linkage
 }
 
 // BuiltIns
@@ -608,39 +610,30 @@ static bool collectModuleInfo(const Words& spv, ModuleInfo& info, std::string& e
         uint32_t id       = instr.word(2);
         uint32_t sc       = instr.word(3);
         if (sc == SC::CrossWorkgroup) {
-          auto it = info.names.find(id);
-          if (it != info.names.end()) {
-            const std::string& n = it->second;
-            // Recognize chipStar-internal CrossWorkgroup globals as SSBO-backed
-            // shared variables. Includes:
-            //   __chip_var_*                — wrapped __device__ symbols
-            //   __chip_module_has_no_IGBAs  — IGBA marker
-            //   __chipspv_*                 — runtime helpers (device_heap, etc.)
-            //   __chip_clk_counter (any mangling) — clock() intrinsic counter
-            //   _ZL... __chip_*             — file-static chip helpers (mangled)
-            bool is_chip_global =
-                n.substr(0, 11) == "__chip_var_" ||
-                n == "__chip_module_has_no_IGBAs" ||
-                n.substr(0, 9) == "__chipspv" ||
-                n.find("__chip_clk_counter") != std::string::npos ||
-                n.find("__chip_") != std::string::npos;
-            if (is_chip_global) {
-              ChipVarInfo cv;
-              cv.id           = id;
-              cv.name         = n;
-              cv.ptr_type_id  = ptr_type;
-              auto pit = info.ptr_types.find(ptr_type);
-              if (pit != info.ptr_types.end())
-                cv.base_type_id = pit->second.base_type;
-              info.chip_var_by_id[id] = info.chip_vars.size();
-              info.chip_vars.push_back(cv);
-              // Don't add to original_types — we'll replace with SSBO
-              break;
-            }
-          }
-          // CrossWorkgroup global with an unrecognized name. Fall back to
-          // clvk's clspv pipeline.
-          info.has_unsupported_globals = true;
+          // Treat every CrossWorkgroup global as an SSBO-backed shared
+          // variable. The chip_var pipeline replaces it with an
+          // SSBO descriptor + struct wrapper. This handles:
+          //   __chip_var_*                — wrapped __device__ symbols
+          //   __chip_module_has_no_IGBAs  — IGBA marker
+          //   __chipspv_*                 — runtime helpers (device_heap, etc.)
+          //   __chip_clk_counter          — clock() intrinsic counter
+          //   user __device__ constants   — exported via LinkageAttributes
+          // For export-only constants the chipStar runtime won't bind a
+          // buffer, but that's fine if no kernel actually reads them; the
+          // init/bind helpers just write to an unbound SSBO and the SPIR-V
+          // remains valid.
+          ChipVarInfo cv;
+          cv.id           = id;
+          auto nit = info.names.find(id);
+          cv.name         = (nit != info.names.end())
+                              ? nit->second
+                              : ("__chip_anon_" + std::to_string(id));
+          cv.ptr_type_id  = ptr_type;
+          auto pit = info.ptr_types.find(ptr_type);
+          if (pit != info.ptr_types.end())
+            cv.base_type_id = pit->second.base_type;
+          info.chip_var_by_id[id] = info.chip_vars.size();
+          info.chip_vars.push_back(cv);
           break;
         }
         // Track UniformConstant __chip_var_* variables: these hold constant
@@ -1548,7 +1541,7 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
   };
   for (uint32_t cap : info.capabilities) {
     if (kIntelOnlyCaps.count(cap)) {
-      // Return empty (no error) → silent fallback to clspv subprocess
+      err = "module uses Intel-only SPIR-V capability " + std::to_string(cap);
       return {};
     }
   }
@@ -1569,7 +1562,8 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
         // Function-scope variables.  Fall back to clspv subprocess silently.
         for (auto& [tid, pti] : info.ptr_types) {
           if (pti.base_type == param.byval_type_id && pti.storage_class == SC::Function) {
-            return {}; // silent fallback
+            err = "ByVal struct type used as Function-scope variable (VUID-10684)";
+            return {};
           }
         }
       }
@@ -1583,8 +1577,10 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     for (auto& [fn_id, fn] : info.functions) {
       for (auto& instr : fn.body) {
         if (instr.opcode == Op::ExtInst && instr.wc() >= 4) {
-          if (info.ext_inst_import_ids.count(instr.word(3)))
-            return {}; // silent fallback — has OpenCL.std/GLSL calls
+          if (info.ext_inst_import_ids.count(instr.word(3))) {
+            err = "module body uses OpExtInst from OpenCL.std/GLSL ext import";
+            return {};
+          }
         }
       }
     }
@@ -3014,7 +3010,7 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
           }
 
           // Cannot represent CopyMemorySized in Vulkan SPIR-V (requires Addresses cap).
-          return {}; // silent fallback to clspv pipeline
+          err = "in-body unsupported pattern (clspv-fallback comment)"; return {};
         }
 
         // Transform: OpInBoundsPtrAccessChain → OpPtrAccessChain with PSB type
@@ -3077,7 +3073,7 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
             // Function/Private SC pointer arithmetic cannot be expressed — bail out.
             if (pit == info.ptr_types.end() ||
                 pit->second.storage_class != SC::WorkgroupLocal) {
-              return {}; // silent fallback to clspv subprocess
+              err = "in-body unsupported pattern (subprocess fallback)"; return {};
             }
             if (elem_is_zero && has_extra_indices) {
               // elem_idx=0 is a no-op step; additional indices navigate into the
@@ -3164,7 +3160,7 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
                                    ? ptr_sb_type_map[cv.base_type_id] : 0;
             if (sb_ptr_type == 0) {
               // Pre-scan missed this type — indicates a bug in collectModuleInfo.
-              return {}; // silent fallback to clspv pipeline
+              err = "in-body unsupported pattern (clspv-fallback comment)"; return {};
             }
             emitInstr(out, Op::AccessChain, {sb_ptr_type, chain_id, cv.ssbo_var_id, const_uint32_0_id});
             // Load from chain
@@ -3276,7 +3272,7 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
               if (orig_pit == info.ptr_types.end() ||
                   (orig_pit->second.storage_class != SC::WorkgroupLocal &&
                    orig_pit->second.storage_class != SC::StorageBuffer)) {
-                return {}; // silent fallback to clspv subprocess
+                err = "in-body unsupported pattern (subprocess fallback)"; return {};
               }
             }
             if (elem_is_zero && has_extra_indices && !was_remapped) {
@@ -3402,7 +3398,7 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
           }
 
           // Cannot represent CopyMemorySized in Vulkan SPIR-V (requires Addresses cap).
-          return {}; // silent fallback to clspv pipeline
+          err = "in-body unsupported pattern (clspv-fallback comment)"; return {};
         }
 
         // Transform: chip_var Load
@@ -3539,7 +3535,7 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
                   (orig_pit->second.storage_class != SC::WorkgroupLocal &&
                    orig_pit->second.storage_class != SC::StorageBuffer &&
                    orig_pit->second.storage_class != SC::PhysicalStorageBuffer)) {
-                return {}; // silent fallback to clvk pipeline
+                err = "in-body unsupported pattern (clvk pipeline)"; return {};
               }
             }
             if (elem_is_zero && has_extra_indices && !was_remapped) {
