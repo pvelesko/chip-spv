@@ -414,6 +414,11 @@ struct ModuleInfo {
   std::unordered_map<uint32_t, uint32_t> builtin_input_ptr_types; // var_id → ptr_type_id
   // WorkgroupSize variable ID — to be removed (replaced by SpecConstantComposite)
   uint32_t workgroup_size_var_id = 0;
+  // True when the input module did not declare an OpTypeInt 32 0 and the emit
+  // pass synthesizes one. Triggers an extra OpTypeInt emission in the type
+  // section so downstream constants (uint32 0/1/2, refl constants, atomic
+  // scope substitutes) have a valid type id to reference.
+  bool synthesized_uint32 = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -1549,8 +1554,12 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     return {};
   }
   if (info.uint32_type_id == 0) {
-    err = "No uint32 type found in module";
-    return {};
+    // Modules with only 64-bit integer arithmetic may never declare uint32.
+    // Synthesize one so downstream emission (refl constants, atomic scope
+    // remap, vec3<uint32> spec composite, clz polyfill) has a valid id.
+    info.uint32_type_id = info.bound++;
+    info.int_widths[info.uint32_type_id] = 32;
+    info.synthesized_uint32 = true;
   }
 
   // Bail out for Intel-specific capabilities that require instruction-level translation
@@ -2931,6 +2940,13 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     skip_types.insert(fit->second.fn_type);
   }
 
+  // If we synthesized uint32, emit OpTypeInt 32 0 first so any downstream
+  // type/constant reference resolves correctly. Done before original_types
+  // since none of the input depended on this id (we only allocated it because
+  // it was missing).
+  if (info.synthesized_uint32) {
+    emitInstr(out, Op::TypeInt, {info.uint32_type_id, 32, 0});
+  }
   // Emit original types (filtering skipped)
   for (auto& instr : info.original_types) {
     uint32_t result_id = 0;
