@@ -1271,6 +1271,13 @@ void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
 
         std::vector<uint8_t> SrcBytes(SrcBin.begin(), SrcBin.end());
         std::string VkErr;
+        if (const char* dump_path = std::getenv("CHIP_DUMP_VK_SPV")) {
+          static int dump_seq = 0;
+          char p[1024];
+          snprintf(p, sizeof p, "%s.%d.in.spv", dump_path, dump_seq++);
+          FILE* f = std::fopen(p, "wb");
+          if (f) { std::fwrite(SrcBytes.data(), 1, SrcBytes.size(), f); std::fclose(f); }
+        }
         VkSpv = openclToVulkanSpirv(SrcBytes, ClspvOpts, &VkErr);
 
         if (!VkSpv.empty()) {

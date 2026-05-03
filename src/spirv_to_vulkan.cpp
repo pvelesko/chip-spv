@@ -3609,7 +3609,13 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
                 (pit->second.storage_class != SC::WorkgroupLocal &&
                  pit->second.storage_class != SC::StorageBuffer &&
                  pit->second.storage_class != SC::PhysicalStorageBuffer)) {
-              err = "in-body InBoundsPtrAccessChain in entry-point: non-WorkgroupLocal/SSBO/PSB SC"; return {};
+              uint32_t sc = (pit == info.ptr_types.end()) ? 0xFFFFFFFFu
+                                                          : pit->second.storage_class;
+              // SC=7 (Function) is the common case: byval struct copy bitcast to
+              // uchar* and offset by a runtime index. Vulkan SPIR-V cannot
+              // express byte-level pointer arithmetic on Function-scope storage,
+              // so we bail and let clspv legalize it instead.
+              err = "in-body InBoundsPtrAccessChain in impl-fn: unsupported SC=" + std::to_string(sc); return {};
             }
             if (elem_is_zero && has_extra_indices) {
               // elem_idx=0 is a no-op step; additional indices navigate into the
