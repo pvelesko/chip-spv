@@ -1253,32 +1253,40 @@ void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
       // driver issues with certain in-tree SPIR-V backend structures.
       logInfo("No rtdevlib imports, building directly");
 
-      // Pre-compile OpenCL SPIR-V → Vulkan SPIR-V before passing to clvk.
-      // clvk detects GLCompute and skips its own llvm-spirv+clspv pipeline.
-      std::string ClspvOpts;
-      if (ChipCtxOcl->getAllocStrategy() == AllocationStrategy::BufferDevAddr)
-        ClspvOpts = "-physical-storage-buffers";
+      // Optionally pre-compile OpenCL SPIR-V → Vulkan SPIR-V before passing
+      // to the OCL runtime. When CHIP_VULKANIZE_SPIRV=1 and clvk is the
+      // backing runtime, clvk detects GLCompute and skips its own
+      // llvm-spirv+clspv pipeline. Default off: pass plain OpenCL SPIR-V.
+      const char *VulkanizeEnv = std::getenv("CHIP_VULKANIZE_SPIRV");
+      bool Vulkanize = VulkanizeEnv && VulkanizeEnv[0] != '0' && VulkanizeEnv[0] != '\0';
 
-      std::vector<uint8_t> SrcBytes(SrcBin.begin(), SrcBin.end());
-      std::string VkErr;
-      auto VkSpv = openclToVulkanSpirv(SrcBytes, ClspvOpts, &VkErr);
+      const void *ILData = SrcBin.data();
+      size_t ILSize = SrcBin.size();
+      std::vector<uint32_t> VkSpv;
 
-      const void *ILData;
-      size_t ILSize;
-      if (!VkSpv.empty()) {
-        logInfo("Pre-compiled OpenCL SPIR-V to Vulkan SPIR-V ({} words)", VkSpv.size());
-        // Debug: dump Vulkan SPIR-V to /tmp if CHIP_DUMP_VK_SPV is set
-        if (const char* dump_path = std::getenv("CHIP_DUMP_VK_SPV")) {
-          FILE* f = std::fopen(dump_path, "wb");
-          if (f) { std::fwrite(VkSpv.data(), 4, VkSpv.size(), f); std::fclose(f); }
+      if (Vulkanize) {
+        std::string ClspvOpts;
+        if (ChipCtxOcl->getAllocStrategy() == AllocationStrategy::BufferDevAddr)
+          ClspvOpts = "-physical-storage-buffers";
+
+        std::vector<uint8_t> SrcBytes(SrcBin.begin(), SrcBin.end());
+        std::string VkErr;
+        VkSpv = openclToVulkanSpirv(SrcBytes, ClspvOpts, &VkErr);
+
+        if (!VkSpv.empty()) {
+          logInfo("Pre-compiled OpenCL SPIR-V to Vulkan SPIR-V ({} words)", VkSpv.size());
+          if (const char* dump_path = std::getenv("CHIP_DUMP_VK_SPV")) {
+            FILE* f = std::fopen(dump_path, "wb");
+            if (f) { std::fwrite(VkSpv.data(), 4, VkSpv.size(), f); std::fclose(f); }
+          }
+          ILData = VkSpv.data();
+          ILSize = VkSpv.size() * sizeof(uint32_t);
+        } else {
+          logWarn("CHIP_VULKANIZE_SPIRV set but conversion failed ({}), "
+                  "falling back to plain OpenCL SPIR-V", VkErr);
         }
-        ILData = VkSpv.data();
-        ILSize = VkSpv.size() * sizeof(uint32_t);
       } else {
-        logWarn("OpenCL→Vulkan SPIR-V pre-compilation failed ({}), "
-                "falling back to clvk compilation pipeline", VkErr);
-        ILData = SrcBin.data();
-        ILSize = SrcBin.size();
+        logDebug("CHIP_VULKANIZE_SPIRV unset, passing plain OpenCL SPIR-V");
       }
 
       cl_int CreateErr;
