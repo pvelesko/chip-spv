@@ -99,6 +99,7 @@ namespace Op {
   static const uint32_t ShiftRightLogical       = 194;
   static const uint32_t TypeBool                = 20;
   static const uint32_t IMul                    = 132;
+  static const uint32_t FMul                    = 133;
   static const uint32_t BitwiseAnd              = 199;
   static const uint32_t Label                   = 248;
   static const uint32_t Branch                  = 249;
@@ -2329,6 +2330,81 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
               new_body.push_back(makeI(Op::IAdd, {result_type, result_id, prod, op(2)}));
               continue;
             }
+            case 16: { // cospi(x) = cos(π * x)
+              if (nops != 1) { err = "cospi needs 1 operand"; ok = false; break; }
+              auto fit = info.float_widths.find(result_type);
+              if (fit == info.float_widths.end()) {
+                err = "cospi: result type is not a float";
+                ok = false; break;
+              }
+              uint64_t pi_bits = (fit->second == 64)
+                  ? 0x400921FB54442D18ull       // double π
+                  : (uint64_t)0x40490FDBu;       // float  π
+              uint32_t c_pi  = getTypedConst(result_type, pi_bits);
+              uint32_t prod  = idAlloc.alloc();
+              new_body.push_back(makeI(Op::FMul,
+                  {result_type, prod, op(0), c_pi}));
+              new_body.push_back(makeI(Op::ExtInst,
+                  {result_type, result_id, glsl_std_450_id, 14u, prod}));
+              glsl_std_450_used = true;
+              continue;
+            }
+            case 21: { // exp10(x) = pow(10, x)
+              if (nops != 1) { err = "exp10 needs 1 operand"; ok = false; break; }
+              auto fit = info.float_widths.find(result_type);
+              if (fit == info.float_widths.end()) {
+                err = "exp10: result type is not a float";
+                ok = false; break;
+              }
+              uint64_t ten_bits = (fit->second == 64)
+                  ? 0x4024000000000000ull        // double 10.0
+                  : (uint64_t)0x41200000u;        // float  10.0
+              uint32_t c_ten = getTypedConst(result_type, ten_bits);
+              new_body.push_back(makeI(Op::ExtInst,
+                  {result_type, result_id, glsl_std_450_id, 26u, c_ten, op(0)}));
+              glsl_std_450_used = true;
+              continue;
+            }
+            case 31: { // frexp(x, ptr) -> GLSL Frexp (same signature)
+              emit_glsl(52);
+              continue;
+            }
+            case 58: { // sincos(x, ptr_to_cos): result = sin(x); *ptr = cos(x)
+              if (nops != 2) { err = "sincos needs 2 operands"; ok = false; break; }
+              uint32_t cos_id = idAlloc.alloc();
+              new_body.push_back(makeI(Op::ExtInst,
+                  {result_type, result_id, glsl_std_450_id, 13u, op(0)}));
+              new_body.push_back(makeI(Op::ExtInst,
+                  {result_type, cos_id,    glsl_std_450_id, 14u, op(0)}));
+              new_body.push_back(makeI(Op::Store, {op(1), cos_id}));
+              glsl_std_450_used = true;
+              continue;
+            }
+            case 152: { // ctz(x): (x == 0) ? width : FindILsb(x)
+              if (nops != 1) { err = "ctz needs 1 operand"; ok = false; break; }
+              auto wit = info.int_widths.find(result_type);
+              if (wit == info.int_widths.end()) {
+                err = "ctz: result type is not an integer";
+                ok = false; break;
+              }
+              if (info.bool_type_id == 0) {
+                err = "ctz: missing bool type in module";
+                ok = false; break;
+              }
+              uint32_t width   = wit->second;
+              uint32_t c_zero  = getTypedConst(result_type, 0);
+              uint32_t c_width = getTypedConst(result_type, width);
+              uint32_t lsb     = idAlloc.alloc();
+              uint32_t is_zero = idAlloc.alloc();
+              new_body.push_back(makeI(Op::ExtInst,
+                  {result_type, lsb, glsl_std_450_id, 73u, op(0)}));
+              new_body.push_back(makeI(Op::IEqual,
+                  {info.bool_type_id, is_zero, op(0), c_zero}));
+              new_body.push_back(makeI(Op::Select,
+                  {result_type, result_id, is_zero, c_width, lsb}));
+              glsl_std_450_used = true;
+              continue;
+            }
             default:
               err = "untranslated OpenCL.std opcode " + std::to_string(ocl_op);
               ok = false;
@@ -3101,13 +3177,19 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     emitInstr(out, Op::Constant, {info.uint32_type_id, id, value});
   }
 
-  // New typed constants from OpExtInst translation (clz needs e.g. ulong 63).
+  // New typed constants from OpExtInst translation (clz needs e.g. ulong 63,
+  // cospi/exp10 need float π/10.0). Width is taken from int_widths or
+  // float_widths so float constants encode the right number of words.
   for (auto& [key, id] : extra_typed_const_ids) {
     if (info.constants.count(id)) continue;
     uint32_t type_id = key.first;
     uint64_t value   = key.second;
     auto wit = info.int_widths.find(type_id);
-    uint32_t width = (wit != info.int_widths.end()) ? wit->second : 32;
+    uint32_t width = (wit != info.int_widths.end()) ? wit->second : 0;
+    if (width == 0) {
+      auto fit = info.float_widths.find(type_id);
+      width = (fit != info.float_widths.end()) ? fit->second : 32;
+    }
     if (width <= 32) {
       emitInstr(out, Op::Constant, {type_id, id, (uint32_t)value});
     } else {
