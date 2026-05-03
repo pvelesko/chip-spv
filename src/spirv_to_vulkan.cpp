@@ -98,6 +98,8 @@ namespace Op {
   static const uint32_t Select                  = 169;
   static const uint32_t ShiftRightLogical       = 194;
   static const uint32_t TypeBool                = 20;
+  static const uint32_t IMul                    = 132;
+  static const uint32_t BitwiseAnd              = 199;
   static const uint32_t Label                   = 248;
   static const uint32_t Branch                  = 249;
   static const uint32_t BranchConditional       = 250;
@@ -2179,6 +2181,42 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
               if (nops != 1) { err = "popcount needs 1 operand"; ok = false; break; }
               new_body.push_back(makeI(Op::BitCount,
                   {result_type, result_id, op(0)}));
+              continue;
+            }
+            case 169: // s_mul24 -> SMul24: (a & 0xFFFFFF) * (b & 0xFFFFFF)
+            case 170: // u_mul24 -> UMul24
+            {
+              if (nops != 2) { err = "mul24 needs 2 operands"; ok = false; break; }
+              auto wit = info.int_widths.find(result_type);
+              if (wit == info.int_widths.end()) {
+                err = "mul24: result type is not an integer";
+                ok = false; break;
+              }
+              uint32_t mask = getTypedConst(result_type, 0xFFFFFFu);
+              uint32_t a_lo = idAlloc.alloc();
+              uint32_t b_lo = idAlloc.alloc();
+              new_body.push_back(makeI(Op::BitwiseAnd, {result_type, a_lo, op(0), mask}));
+              new_body.push_back(makeI(Op::BitwiseAnd, {result_type, b_lo, op(1), mask}));
+              new_body.push_back(makeI(Op::IMul, {result_type, result_id, a_lo, b_lo}));
+              continue;
+            }
+            case 167: // s_mad24 -> (a & 0xFFFFFF) * (b & 0xFFFFFF) + c
+            case 168: // u_mad24
+            {
+              if (nops != 3) { err = "mad24 needs 3 operands"; ok = false; break; }
+              auto wit = info.int_widths.find(result_type);
+              if (wit == info.int_widths.end()) {
+                err = "mad24: result type is not an integer";
+                ok = false; break;
+              }
+              uint32_t mask = getTypedConst(result_type, 0xFFFFFFu);
+              uint32_t a_lo = idAlloc.alloc();
+              uint32_t b_lo = idAlloc.alloc();
+              uint32_t prod = idAlloc.alloc();
+              new_body.push_back(makeI(Op::BitwiseAnd, {result_type, a_lo, op(0), mask}));
+              new_body.push_back(makeI(Op::BitwiseAnd, {result_type, b_lo, op(1), mask}));
+              new_body.push_back(makeI(Op::IMul, {result_type, prod, a_lo, b_lo}));
+              new_body.push_back(makeI(Op::IAdd, {result_type, result_id, prod, op(2)}));
               continue;
             }
             default:
