@@ -91,6 +91,13 @@ namespace Op {
   static const uint32_t ConvertUToPtr           = 120;
   static const uint32_t Bitcast                 = 124;
   static const uint32_t CopyMemorySized         = 64;
+  static const uint32_t ISub                    = 130;
+  static const uint32_t IAdd                    = 128;
+  static const uint32_t BitCount                = 205;
+  static const uint32_t IEqual                  = 170;
+  static const uint32_t Select                  = 169;
+  static const uint32_t ShiftRightLogical       = 194;
+  static const uint32_t TypeBool                = 20;
   static const uint32_t Label                   = 248;
   static const uint32_t Branch                  = 249;
   static const uint32_t BranchConditional       = 250;
@@ -342,6 +349,10 @@ struct ModuleInfo {
 
   // ExtInstImport IDs from the input module (e.g. OpenCL.std, GLSL.std.450)
   std::unordered_set<uint32_t> ext_inst_import_ids;
+  // ExtInstImport ID -> set name (e.g. 1 -> "OpenCL.std")
+  std::unordered_map<uint32_t, std::string> ext_inst_import_names;
+  // The id of the "OpenCL.std" ExtInstImport, if present (0 if not).
+  uint32_t opencl_std_import_id = 0;
 
   // Names and decorations
   std::unordered_map<uint32_t, std::string> names;
@@ -437,8 +448,14 @@ static bool collectModuleInfo(const Words& spv, ModuleInfo& info, std::string& e
       break;
 
     case Op::ExtInstImport:
-      if (instr.wc() >= 2)
-        info.ext_inst_import_ids.insert(instr.word(1));
+      if (instr.wc() >= 2) {
+        uint32_t import_id = instr.word(1);
+        info.ext_inst_import_ids.insert(import_id);
+        std::string name = decodeLiteralString(instr.words, 2);
+        info.ext_inst_import_names[import_id] = name;
+        if (name == "OpenCL.std")
+          info.opencl_std_import_id = import_id;
+      }
       break;
 
     case Op::Source:
@@ -1570,15 +1587,24 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     }
   }
 
-  // If any function body uses OpExtInst with an import from the input module
-  // (e.g. OpenCL.std fma/sqrt/etc.), we can't translate those to Vulkan.
-  // Fall back to clspv subprocess silently.
+  // If any function body uses OpExtInst with an import other than OpenCL.std
+  // (e.g. GLSL.std.450 which we already produce), we can't translate those.
+  // OpenCL.std calls are translated in-place during body emission via the
+  // OpenCL.std → GLSL.std.450 / core SPIR-V mapping. Bail only if the
+  // module uses an ext import we don't recognize OR uses an OpenCL.std
+  // opcode we don't yet translate (the latter check happens in the body
+  // emit path).
   if (!info.ext_inst_import_ids.empty()) {
     for (auto& [fn_id, fn] : info.functions) {
       for (auto& instr : fn.body) {
         if (instr.opcode == Op::ExtInst && instr.wc() >= 4) {
-          if (info.ext_inst_import_ids.count(instr.word(3))) {
-            err = "module body uses OpExtInst from OpenCL.std/GLSL ext import";
+          uint32_t import = instr.word(3);
+          if (info.ext_inst_import_ids.count(import) &&
+              import != info.opencl_std_import_id) {
+            auto nit = info.ext_inst_import_names.find(import);
+            std::string n = (nit != info.ext_inst_import_names.end())
+                              ? nit->second : "<unknown>";
+            err = "module body uses OpExtInst from unsupported ext import: " + n;
             return {};
           }
         }
@@ -1591,6 +1617,10 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
   // -------------------------------------------------------------------------
   // Allocate IDs for new constructs
   // -------------------------------------------------------------------------
+
+  // GLSL.std.450 ext-inst import (always allocated; emitted only if used).
+  uint32_t glsl_std_450_id = idAlloc.alloc();
+  bool glsl_std_450_used = false;
 
   // WorkgroupSize spec constants and variable
   uint32_t wgs_x_id     = idAlloc.alloc();
@@ -1977,6 +2007,194 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     return id;
   };
 
+  // Generic typed-constant allocator. Returns an id for a constant of the
+  // given (integer) type and value, reusing an existing constant from the
+  // input module if one exists, otherwise allocating a fresh id and queuing
+  // it for emission alongside refl constants.
+  // Stored as map<(type_id, value), id> so we can emit each with its real type.
+  std::map<std::pair<uint32_t,uint64_t>, uint32_t> extra_typed_const_ids;
+  auto getTypedConst = [&](uint32_t type_id, uint64_t value) -> uint32_t {
+    auto key = std::make_pair(type_id, value);
+    auto it = extra_typed_const_ids.find(key);
+    if (it != extra_typed_const_ids.end()) return it->second;
+    for (auto& [cid, ci] : info.constants) {
+      if (ci.type_id == type_id && ci.value == value) {
+        extra_typed_const_ids[key] = cid;
+        return cid;
+      }
+    }
+    uint32_t id = idAlloc.alloc();
+    extra_typed_const_ids[key] = id;
+    return id;
+  };
+
+  // -------------------------------------------------------------------------
+  // OpenCL.std → Vulkan-compatible OpExtInst translation pre-pass.
+  // Walks every function body and rewrites OpExtInst calls into the
+  // OpenCL.std import set as either core SPIR-V instructions or
+  // GLSL.std.450 extended instructions (which are valid in Vulkan).
+  // Bails (with a descriptive err message) for opcodes we don't yet
+  // translate so the rest of the pipeline doesn't try to emit invalid
+  // Vulkan SPIR-V. Must run BEFORE the header emit so the
+  // OpExtInstImport "GLSL.std.450" is correctly gated.
+  // -------------------------------------------------------------------------
+  if (info.opencl_std_import_id != 0) {
+    auto makeI = [](uint32_t opcode, std::initializer_list<uint32_t> ops) {
+      Instr i;
+      i.opcode = opcode;
+      i.words = makeInstr(opcode, ops);
+      return i;
+    };
+    for (auto& [fn_id, fn] : info.functions) {
+      std::vector<Instr> new_body;
+      new_body.reserve(fn.body.size());
+      bool ok = true;
+      for (auto& instr : fn.body) {
+        if (instr.opcode == Op::ExtInst && instr.wc() >= 5 &&
+            instr.word(3) == info.opencl_std_import_id) {
+          uint32_t result_type = instr.word(1);
+          uint32_t result_id   = instr.word(2);
+          uint32_t ocl_op      = instr.word(4);
+          // Operands start at word 5.
+          auto op = [&](size_t i) { return instr.word(5 + i); };
+          size_t nops = (instr.wc() > 5) ? (instr.wc() - 5) : 0;
+
+          // Direct one-to-one GLSL.std.450 mappings: same operand layout,
+          // just substitute the import set id and the ext-inst opcode.
+          auto emit_glsl = [&](uint32_t glsl_op) {
+            Words ops = {result_type, result_id, glsl_std_450_id, glsl_op};
+            for (size_t i = 0; i < nops; ++i) ops.push_back(op(i));
+            Instr ni;
+            ni.opcode = Op::ExtInst;
+            ni.words = makeInstr(Op::ExtInst, ops);
+            new_body.push_back(std::move(ni));
+            glsl_std_450_used = true;
+          };
+
+          switch (ocl_op) {
+            // Math (float): direct GLSL.std.450 equivalents.
+            case 14: emit_glsl(14); continue; // cos -> Cos
+            case 15: emit_glsl(20); continue; // cosh -> Cosh
+            case 19: emit_glsl(27); continue; // exp -> Exp
+            case 20: emit_glsl(29); continue; // exp2 -> Exp2
+            case 23: emit_glsl(4);  continue; // fabs -> FAbs
+            case 25: emit_glsl(8);  continue; // floor -> Floor
+            case 26: emit_glsl(50); continue; // fma -> Fma
+            case 27: emit_glsl(40); continue; // fmax -> FMax
+            case 28: emit_glsl(37); continue; // fmin -> FMin
+            case 37: emit_glsl(28); continue; // log -> Log
+            case 38: emit_glsl(30); continue; // log2 -> Log2
+            case 42: emit_glsl(50); continue; // mad (a*b+c) ~= Fma
+            case 48: emit_glsl(26); continue; // pow -> Pow
+            case 56: emit_glsl(32); continue; // rsqrt -> InverseSqrt
+            case 57: emit_glsl(13); continue; // sin -> Sin
+            case 61: emit_glsl(31); continue; // sqrt -> Sqrt
+            case 62: emit_glsl(15); continue; // tan -> Tan
+            case 66: emit_glsl(3);  continue; // trunc -> Trunc
+
+            // Integer: direct GLSL.std.450 equivalents.
+            case 141: emit_glsl(5);  continue; // s_abs -> SAbs
+            case 149: emit_glsl(45); continue; // s_clamp -> SClamp
+            case 150: emit_glsl(44); continue; // u_clamp -> UClamp
+            case 156: emit_glsl(42); continue; // s_max -> SMax
+            case 157: emit_glsl(41); continue; // u_max -> UMax
+            case 158: emit_glsl(39); continue; // s_min -> SMin
+            case 159: emit_glsl(38); continue; // u_min -> UMin
+
+            case 151: { // clz: convert to (width-1) - FindUMsb(x)
+              auto wit = info.int_widths.find(result_type);
+              if (wit == info.int_widths.end()) {
+                err = "clz: result type is not an integer";
+                ok = false; break;
+              }
+              uint32_t width = wit->second;
+              uint32_t x = op(0);
+              auto extInstr = [&](uint32_t set_id, uint32_t set_op,
+                                  uint32_t res_ty, uint32_t res_id, uint32_t arg) {
+                Instr ni;
+                ni.opcode = Op::ExtInst;
+                ni.words  = makeInstr(Op::ExtInst,
+                    Words{res_ty, res_id, set_id, set_op, arg});
+                return ni;
+              };
+              if (width <= 32) {
+                // 32-bit (or narrower): clz(x) = 31 - FindUMsb(x).
+                uint32_t tmp = idAlloc.alloc();
+                uint32_t cw  = getTypedConst(result_type, width - 1);
+                new_body.push_back(extInstr(glsl_std_450_id, 75u,
+                    result_type, tmp, x));
+                new_body.push_back(makeI(Op::ISub,
+                    {result_type, result_id, cw, tmp}));
+                glsl_std_450_used = true;
+                continue;
+              } else if (width == 64) {
+                // 64-bit clz polyfill: GLSL FindUMsb only supports 32-bit, so
+                // split into hi/lo 32-bit halves, find_msb each, then select.
+                //   hi = (uint32)(x >> 32), lo = (uint32)x
+                //   hi_clz = 31 - FindUMsb(hi)
+                //   lo_clz = 31 - FindUMsb(lo)
+                //   r32    = hi == 0 ? lo_clz + 32 : hi_clz
+                //   result = (ulong)r32
+                if (info.uint32_type_id == 0 || info.bool_type_id == 0) {
+                  err = "clz 64-bit: missing uint32 or bool type in module";
+                  ok = false; break;
+                }
+                uint32_t U32 = info.uint32_type_id;
+                uint32_t U64 = result_type; // ulong
+                uint32_t Bo  = info.bool_type_id;
+                uint32_t c_ulong_32 = getTypedConst(U64, 32);
+                uint32_t c_uint_31  = getTypedConst(U32, 31);
+                uint32_t c_uint_32  = getTypedConst(U32, 32);
+                uint32_t c_uint_0   = getTypedConst(U32, 0);
+                uint32_t hi64    = idAlloc.alloc();
+                uint32_t hi32    = idAlloc.alloc();
+                uint32_t lo32    = idAlloc.alloc();
+                uint32_t hi_msb  = idAlloc.alloc();
+                uint32_t lo_msb  = idAlloc.alloc();
+                uint32_t hi_clz  = idAlloc.alloc();
+                uint32_t lo_clz  = idAlloc.alloc();
+                uint32_t lo_p32  = idAlloc.alloc();
+                uint32_t hi_zero = idAlloc.alloc();
+                uint32_t r32     = idAlloc.alloc();
+                new_body.push_back(makeI(Op::ShiftRightLogical,
+                    {U64, hi64, x, c_ulong_32}));
+                new_body.push_back(makeI(Op::UConvert, {U32, hi32, hi64}));
+                new_body.push_back(makeI(Op::UConvert, {U32, lo32, x}));
+                new_body.push_back(extInstr(glsl_std_450_id, 75u, U32, hi_msb, hi32));
+                new_body.push_back(extInstr(glsl_std_450_id, 75u, U32, lo_msb, lo32));
+                new_body.push_back(makeI(Op::ISub, {U32, hi_clz, c_uint_31, hi_msb}));
+                new_body.push_back(makeI(Op::ISub, {U32, lo_clz, c_uint_31, lo_msb}));
+                new_body.push_back(makeI(Op::IAdd, {U32, lo_p32, lo_clz, c_uint_32}));
+                new_body.push_back(makeI(Op::IEqual, {Bo, hi_zero, hi32, c_uint_0}));
+                new_body.push_back(makeI(Op::Select, {U32, r32, hi_zero, lo_p32, hi_clz}));
+                new_body.push_back(makeI(Op::UConvert, {U64, result_id, r32}));
+                glsl_std_450_used = true;
+                continue;
+              } else {
+                err = "clz: unsupported width " + std::to_string(width);
+                ok = false; break;
+              }
+            }
+            case 166: { // popcount -> core SPIR-V OpBitCount
+              if (nops != 1) { err = "popcount needs 1 operand"; ok = false; break; }
+              new_body.push_back(makeI(Op::BitCount,
+                  {result_type, result_id, op(0)}));
+              continue;
+            }
+            default:
+              err = "untranslated OpenCL.std opcode " + std::to_string(ocl_op);
+              ok = false;
+              break;
+          }
+          if (!ok) break;
+        }
+        new_body.push_back(instr);
+      }
+      if (!ok) return {};
+      fn.body = std::move(new_body);
+    }
+  }
+
   // Pre-allocate all reflection constants
   getReflConst(0); getReflConst(1); getReflConst(2); // specid constants
   for (auto& ep : info.entry_points) {
@@ -2071,6 +2289,14 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     if (ext.find("cl_khr_") == 0) continue;
     if (ext.find("cl_intel_") == 0) continue;
     emitExtension(ext); // deduplication is handled inside
+  }
+
+  // --- OpExtInstImport GLSL.std.450 (only if used by translated OpenCL.std calls) ---
+  if (glsl_std_450_used) {
+    Words ops = {glsl_std_450_id};
+    Words strWords = encodeLiteralString("GLSL.std.450");
+    for (uint32_t w : strWords) ops.push_back(w);
+    emitInstr(out, Op::ExtInstImport, ops);
   }
 
   // --- OpExtInstImport NonSemantic.ClspvReflection.5 ---
@@ -2507,11 +2733,20 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
       static const uint32_t kValidMemSemBits = 0xFDEu;
       uint32_t order_bits = value & 0x1Eu; // bits 1-4: order flags
       bool has_one_order_bit = (order_bits != 0) && ((order_bits & (order_bits - 1)) == 0);
-      if (is_uint32 && !(value & ~kValidMemSemBits) && (value & 0x10u) && (value & 0xFC0u) && has_one_order_bit) {
-        // Replace SequentiallyConsistent (0x10) with AcquireRelease (0x8)
-        uint32_t fixed = (value & ~0x10u) | 0x8u;
-        emitInstr(out, Op::Constant, {type_id, const_id, fixed});
-        continue;
+      // Detect memory-semantics-looking constants and rewrite OpenCL-only
+      // bits to Vulkan-compatible ones:
+      //   SequentiallyConsistent (0x010) → AcquireRelease (0x008)
+      //   CrossWorkgroupMemory   (0x200) → UniformMemory   (0x040)
+      // Match: only uses valid mem-sem bits, has at least one memory-scope
+      // bit, and has at most one order bit.
+      if (is_uint32 && !(value & ~kValidMemSemBits) && (value & 0xFC0u) && has_one_order_bit) {
+        uint32_t fixed = value;
+        if (fixed & 0x010u) fixed = (fixed & ~0x010u) | 0x008u;
+        if (fixed & 0x200u) fixed = (fixed & ~0x200u) | 0x040u;
+        if (fixed != value) {
+          emitInstr(out, Op::Constant, {type_id, const_id, fixed});
+          continue;
+        }
       }
     }
     emit(out, instr.words);
@@ -2692,6 +2927,25 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
     // Skip if already emitted (i.e., was found in info.constants)
     if (info.constants.count(id)) continue;
     emitInstr(out, Op::Constant, {info.uint32_type_id, id, value});
+  }
+
+  // New typed constants from OpExtInst translation (clz needs e.g. ulong 63).
+  for (auto& [key, id] : extra_typed_const_ids) {
+    if (info.constants.count(id)) continue;
+    uint32_t type_id = key.first;
+    uint64_t value   = key.second;
+    auto wit = info.int_widths.find(type_id);
+    uint32_t width = (wit != info.int_widths.end()) ? wit->second : 32;
+    if (width <= 32) {
+      emitInstr(out, Op::Constant, {type_id, id, (uint32_t)value});
+    } else {
+      // 64-bit constant: two literal words.
+      emitInstr(out, Op::Constant, {
+        type_id, id,
+        (uint32_t)(value & 0xFFFFFFFFu),
+        (uint32_t)((value >> 32) & 0xFFFFFFFFu)
+      });
+    }
   }
 
   // WGS spec constants (new)
@@ -3187,6 +3441,52 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
               Words store_words = {chain_id, val_id};
               for (uint32_t i = 3; i < instr.wc(); ++i) store_words.push_back(instr.word(i));
               emitInstr(out, Op::Store, store_words);
+              continue;
+            }
+          }
+        }
+
+        // OpAtomic* with pointer operand at word[3] and chip_var as pointer →
+        // AccessChain + atomic on the chained pointer. Covers the common
+        // result-producing atomics (IAdd, ISub, IIncrement, IDecrement, And,
+        // Or, Xor, SMin/UMin/SMax/UMax, Exchange) and OpAtomicLoad.
+        // OpAtomicStore (228) has the pointer at word[1] (no result), handled
+        // separately below.
+        // The pointer may be the chip_var directly OR an OpPtrCastToGeneric
+        // result that earlier got remapped to the chip_var id.
+        if (instr.opcode >= 227 && instr.opcode <= 242 &&
+            instr.opcode != 228 /*Store*/ && instr.wc() >= 4) {
+          uint32_t ptr_id = remapId(instr.word(3), remap);
+          auto cv_it = info.chip_var_by_id.find(ptr_id);
+          if (cv_it != info.chip_var_by_id.end()) {
+            ChipVarInfo& cv = info.chip_vars[cv_it->second];
+            uint32_t sb_ptr_type = ptr_sb_type_map.count(cv.base_type_id)
+                                   ? ptr_sb_type_map[cv.base_type_id] : 0;
+            if (sb_ptr_type != 0) {
+              uint32_t chain_id = idAlloc.alloc();
+              emitInstr(out, Op::AccessChain, {sb_ptr_type, chain_id, cv.ssbo_var_id, const_uint32_0_id});
+              Words atomic_words = {instr.word(1), instr.word(2), chain_id};
+              for (uint32_t i = 4; i < instr.wc(); ++i)
+                atomic_words.push_back(remapId(instr.word(i), remap));
+              emitInstr(out, instr.opcode, atomic_words);
+              continue;
+            }
+          }
+        }
+        if (instr.opcode == 228 /*OpAtomicStore*/ && instr.wc() >= 4) {
+          uint32_t ptr_id = remapId(instr.word(1), remap);
+          auto cv_it = info.chip_var_by_id.find(ptr_id);
+          if (cv_it != info.chip_var_by_id.end()) {
+            ChipVarInfo& cv = info.chip_vars[cv_it->second];
+            uint32_t sb_ptr_type = ptr_sb_type_map.count(cv.base_type_id)
+                                   ? ptr_sb_type_map[cv.base_type_id] : 0;
+            if (sb_ptr_type != 0) {
+              uint32_t chain_id = idAlloc.alloc();
+              emitInstr(out, Op::AccessChain, {sb_ptr_type, chain_id, cv.ssbo_var_id, const_uint32_0_id});
+              Words store_words = {chain_id};
+              for (uint32_t i = 2; i < instr.wc(); ++i)
+                store_words.push_back(remapId(instr.word(i), remap));
+              emitInstr(out, instr.opcode, store_words);
               continue;
             }
           }
