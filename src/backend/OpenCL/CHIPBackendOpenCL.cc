@@ -1289,8 +1289,13 @@ void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
           ILData = VkSpv.data();
           ILSize = VkSpv.size() * sizeof(uint32_t);
         } else {
-          logWarn("CHIP_VULKANIZE_SPIRV set but conversion failed ({}), "
-                  "falling back to plain OpenCL SPIR-V", VkErr);
+          // No clspv fallback when CHIP_VULKANIZE_SPIRV is enabled — surface
+          // the conversion error as a build failure so unhandled patterns
+          // show up in the test pass rate instead of being masked by clspv.
+          logError("openclToVulkanSpirv failed: {}", VkErr);
+          CHIPERR_LOG_AND_THROW(
+              "Vulkan SPIR-V conversion failed (CHIP_VULKANIZE_SPIRV=1, no clspv fallback): " + VkErr,
+              hipErrorInitializationError);
         }
       } else {
         logDebug("CHIP_VULKANIZE_SPIRV unset, passing plain OpenCL SPIR-V");
