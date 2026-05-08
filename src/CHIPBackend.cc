@@ -400,23 +400,57 @@ chipstar::Module::allocateDeviceVariablesNoLock(chipstar::Device *Device,
   }
   if (!AllShadow) {
     auto *Ctx = Device->getContext();
+    // Phase I3: if a DeviceVar has zero size (device-only globals), look
+    // up its size from the SPVModuleInfo::DeviceGlobals reflection table.
+    const auto &MI = getInfo();
+    auto LookupDG = [&MI](std::string_view Name) -> const SPVDeviceGlobal * {
+      for (const auto &DG : MI.DeviceGlobals)
+        if (DG.Name == Name)
+          return &DG;
+      return nullptr;
+    };
     for (auto *Var : ChipVars_) {
       size_t Size = Var->getSize();
       if (Size == 0) {
-        // Host-side __hipRegisterVar didn't carry size for this entry;
-        // device-only / template-instantiated globals fall through here
-        // and aren't supported by the Vulkan path yet.
+        if (const auto *DG = LookupDG(Var->getName())) {
+          Size = DG->Size;
+          if (Size > 0) {
+            // Refresh SPVVariable::Size so subsequent getSize() calls and
+            // assertions agree with the allocated buffer size.
+            const_cast<SPVVariable *>(Var->getSrcVar())->Size = Size;
+          }
+        }
+      }
+      if (Size == 0) {
         logWarn("Device variable '{}' has zero size; skipping allocation.",
                 Var->getName());
         continue;
       }
-      Var->setDevAddr(
-          Ctx->allocate(Size, /*alignment=*/16, hipMemoryType::hipMemoryTypeDevice));
-      // Vulkan path: HasInitializer is unknown; mark false so the host-side
-      // shadow-kernel-driven init path is skipped. Initial values come from
-      // the SPV's OpVariable initialiser at descriptor binding time.
-      Var->markHasInitializer(false);
+      void *Addr = Ctx->allocate(Size, /*alignment=*/16,
+                                 hipMemoryType::hipMemoryTypeDevice);
+      Var->setDevAddr(Addr);
+      // Phase I3: seed init bytes (recovered from the SPV OpName encoding).
+      // The runtime treats absent InitData as "leave the buffer at its
+      // alloc-default zero" — Vulkan StorageBuffer descriptors are zeroed
+      // at first allocation, matching `__device__ int X;` semantics.
+      if (Var->getInitData().empty()) {
+        if (const auto *DG = LookupDG(Var->getName())) {
+          if (!DG->InitData.empty())
+            Var->setInitData(DG->InitData);
+        }
+      }
+      const auto &Init = Var->getInitData();
+      logTrace("[I3] Var '{}' Size={} Addr={} InitBytes={}",
+               Var->getName(), Size, Addr, Init.size());
+      if (!Init.empty() && Addr) {
+        size_t CopyN = std::min(Init.size(), Size);
+        Queue->memCopyAsync(Addr, Init.data(), CopyN, hipMemcpyHostToDevice);
+        Var->markHasInitializer(true);
+      } else {
+        Var->markHasInitializer(false);
+      }
     }
+    Queue->finish();
     DeviceVariablesAllocated_ = true;
     return hipSuccess;
   }
@@ -522,10 +556,27 @@ void chipstar::Module::prepareDeviceVariablesNoLock(chipstar::Device *Device,
 
   bool QueuedKernels = false;
   for (auto *Var : ChipVars_) {
-    logTrace("Checking variable '{}' for initialization: hasInitializer={}", 
+    logTrace("Checking variable '{}' for initialization: hasInitializer={}",
              Var->getName(), Var->hasInitializer());
     if (!Var->hasInitializer())
       continue;
+    // Phase I3 (Vulkan path): if we recovered the initializer bytes from
+    // the SPV OpName encoding, re-seed the device buffer via memCopyAsync
+    // rather than launching the shadow init kernel (which doesn't exist
+    // in the bridging-pass-rewritten module). This is the hipDeviceReset
+    // re-init path: allocate left the buffer alone (no free/realloc) but
+    // cleared `DeviceVariablesInitialized_`, so we must restore the
+    // declaration-time initializer here.
+    const auto &Init = Var->getInitData();
+    if (!Init.empty() && Var->getDevAddr()) {
+      size_t CopyN = std::min(Init.size(), Var->getSize());
+      logTrace("Re-seeding variable '{}' from cached InitData ({} bytes)",
+               Var->getName(), CopyN);
+      Queue->memCopyAsync(Var->getDevAddr(), Init.data(), CopyN,
+                          hipMemcpyHostToDevice);
+      QueuedKernels = true;
+      continue;
+    }
     logTrace("Initializing variable '{}'", Var->getName());
     queueVariableInitShadowKernel(Queue, this, Var);
     QueuedKernels = true;
@@ -1243,6 +1294,19 @@ chipstar::Module *chipstar::Device::getOrCreateModule(HostPtr Ptr) {
              HasShadow ? "shadow kernel" : "device-global descriptor",
              NameTmp);
     auto *Var = new chipstar::DeviceVar(&Info);
+    // Phase I3: propagate per-symbol initial-value bytes (decoded from the
+    // SPV `__hipspv_dg_<sym>__sz_<n>__init_<hex>` OpName) so the
+    // allocator/reset paths can seed the device buffer to match the HIP
+    // source initializer.
+    {
+      const auto &MI = SrcMod->getInfo();
+      for (const auto &DG : MI.DeviceGlobals) {
+        if (DG.Name == NameTmp && !DG.InitData.empty()) {
+          Var->setInitData(DG.InitData);
+          break;
+        }
+      }
+    }
     Mod->addDeviceVariable(Var);
 
     DeviceVarLookup_.insert(std::make_pair(Info.Ptr, Var));
@@ -1311,6 +1375,64 @@ chipstar::Module *chipstar::Device::getOrCreateModule(HostPtr Ptr) {
       SyntheticVars.push_back(std::move(SyntheticVar));
 
       // Note: We don't add to DeviceVarLookup_ since there's no host pointer
+    }
+
+    // Phase I3 (Vulkan path): synthesise DeviceVars for any
+    // SPVModuleInfo::DeviceGlobal not yet registered via either the host
+    // __hipRegisterVar entry above or the shadow-kernel synthesis just
+    // performed. This covers template-instantiated and function-static
+    // __device__ globals, which clang doesn't emit __hipRegisterVar for
+    // and for which the Vulkan bridging pass strips the shadow kernels.
+    // Size + InitData come from the OpName-encoded suffix decoded in
+    // tryAnalyzeVulkanReflection.
+    const auto &MI = SrcMod->getInfo();
+    if (!MI.DeviceGlobals.empty()) {
+      auto *MutableSrcMod = const_cast<SPVModule *>(SrcMod);
+      for (const auto &DG : MI.DeviceGlobals) {
+        if (DG.Name.empty())
+          continue;
+        bool AlreadyRegistered = false;
+        for (const auto &Info : SrcMod->Variables) {
+          std::string NameTmp(Info.Name.begin(), Info.Name.end());
+          if (NameTmp == DG.Name) {
+            AlreadyRegistered = true;
+            break;
+          }
+        }
+        if (AlreadyRegistered)
+          continue;
+        bool AlreadySynthesized = false;
+        for (const auto &SV : SyntheticVars) {
+          if (SV->Name == DG.Name) {
+            AlreadySynthesized = true;
+            break;
+          }
+        }
+        if (AlreadySynthesized)
+          continue;
+        // Skip if a shadow-kernel-driven entry already exists in the
+        // compiled Module's ChipVars (unlikely on the Vulkan path).
+        bool AlreadyInMod = false;
+        for (auto *V : Mod->getDeviceVariables()) {
+          if (std::string(V->getName()) == DG.Name) {
+            AlreadyInMod = true;
+            break;
+          }
+        }
+        if (AlreadyInMod)
+          continue;
+        logTrace("Synthesizing Vulkan device-only DeviceVar for '{}' "
+                 "(size={}, init_bytes={})",
+                 DG.Name, DG.Size, DG.InitData.size());
+        auto *RawVar = new SPVVariable{
+            {MutableSrcMod, HostPtr(&DummyHostPtr), DG.Name}, DG.Size};
+        std::unique_ptr<SPVVariable> SyntheticVar(RawVar);
+        auto *Var = new chipstar::DeviceVar(SyntheticVar.get());
+        if (!DG.InitData.empty())
+          Var->setInitData(DG.InitData);
+        Mod->addDeviceVariable(Var);
+        SyntheticVars.push_back(std::move(SyntheticVar));
+      }
     }
   }
 

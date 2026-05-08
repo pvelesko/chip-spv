@@ -687,6 +687,23 @@ public:
   }
   bool hasInitializer() const { return HasInitializer_; }
   void markHasInitializer(bool State = true) { HasInitializer_ = State; }
+
+  /// Phase I3 (Vulkan path): cached initializer bytes recovered from the
+  /// SPV's `__hipspv_dg_<sym>__sz_<n>__init_<hex>` OpName encoding. The
+  /// Module::allocateDeviceVariablesNoLock fast-path memcpys these into
+  /// the freshly-allocated device buffer; the Module::resetDeviceVariables
+  /// path re-applies them on hipDeviceReset. Empty for OpenCL-path vars
+  /// and for Vulkan vars whose initializer was zero/undef (the runtime
+  /// leaves the buffer at its alloc-default).
+  const std::vector<uint8_t> &getInitData() const { return InitData_; }
+  void setInitData(std::vector<uint8_t> Bytes) {
+    InitData_ = std::move(Bytes);
+    if (!InitData_.empty())
+      HasInitializer_ = true;
+  }
+
+private:
+  std::vector<uint8_t> InitData_;
 };
 
 class Event : public ihipEvent_t {

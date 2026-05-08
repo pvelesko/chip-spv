@@ -55,6 +55,12 @@ struct SPVDeviceGlobal {
   uint32_t Set = 0;       ///< Descriptor set (always 0 in the H4 path).
   uint32_t Binding = 0;   ///< Descriptor binding within set 0 (legacy; per-kernel binding lives in HiddenArgsByKernel below).
   size_t Size = 0;        ///< Size in bytes of the underlying element type.
+  /// Phase I3: initial-value bytes recovered from the bridging pass via
+  /// the `__hipspv_dg_<sym>__sz_<size>__init_<hex>` OpName encoding. The
+  /// runtime copies these into the per-symbol device buffer at allocate
+  /// time and on every hipDeviceReset() to satisfy the HIP semantics that
+  /// `__device__ int A = 123;` reads back as 123 unless explicitly written.
+  std::vector<uint8_t> InitData;
 };
 
 /// Phase H4: per-kernel record of which device-global symbol is bound at

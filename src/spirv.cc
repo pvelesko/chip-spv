@@ -1377,6 +1377,15 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
     static constexpr const char *kPrefix = "__hipspv_dg_";
     static constexpr size_t kPrefixLen = 12;
     std::set<std::string> SeenSymbols;
+    auto hexNibble = [](char C) -> int {
+      if (C >= '0' && C <= '9')
+        return C - '0';
+      if (C >= 'a' && C <= 'f')
+        return 10 + (C - 'a');
+      if (C >= 'A' && C <= 'F')
+        return 10 + (C - 'A');
+      return -1;
+    };
     for (InstWord Id : StorageBufferVars) {
       auto SI = DescSet.find(Id);
       auto BI = DescBinding.find(Id);
@@ -1389,7 +1398,42 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
       const std::string &Full = NI->second;
       if (Full.compare(0, kPrefixLen, kPrefix) != 0)
         continue;
-      std::string Symbol = Full.substr(kPrefixLen);
+      // Phase I3: split off the optional `__sz_<size>__init_<hex>` suffix
+      // emitted by HIPSPVLowerToHLSLShape::encodeDgArgName so the runtime
+      // can size + seed each device global's storage buffer at allocation
+      // time and re-seed it on hipDeviceReset.
+      std::string Tail = Full.substr(kPrefixLen);
+      std::string Symbol = Tail;
+      size_t SizeBytes = 0;
+      std::vector<uint8_t> InitBytes;
+      auto SzPos = Tail.find("__sz_");
+      if (SzPos != std::string::npos) {
+        Symbol = Tail.substr(0, SzPos);
+        std::string Rest = Tail.substr(SzPos + 5);
+        size_t SzEnd = Rest.find("__init_");
+        std::string SizeStr =
+            (SzEnd == std::string::npos) ? Rest : Rest.substr(0, SzEnd);
+        try {
+          SizeBytes = static_cast<size_t>(std::stoull(SizeStr));
+        } catch (...) {
+          SizeBytes = 0;
+        }
+        if (SzEnd != std::string::npos) {
+          std::string Hex = Rest.substr(SzEnd + 7);
+          size_t HexLen = 0;
+          while (HexLen < Hex.size() && hexNibble(Hex[HexLen]) >= 0)
+            ++HexLen;
+          HexLen &= ~size_t(1); // round down to even
+          InitBytes.reserve(HexLen / 2);
+          for (size_t k = 0; k + 1 < HexLen; k += 2) {
+            int Hi = hexNibble(Hex[k]);
+            int Lo = hexNibble(Hex[k + 1]);
+            if (Hi < 0 || Lo < 0)
+              break;
+            InitBytes.push_back(static_cast<uint8_t>((Hi << 4) | Lo));
+          }
+        }
+      }
       if (Symbol.empty())
         continue;
       BindingToDGSymbol[BI->second] = Symbol;
@@ -1398,7 +1442,8 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
         DG.Name = Symbol;
         DG.Set = 0;
         DG.Binding = BI->second;
-        DG.Size = 0; // Filled in from __hipRegisterVar at host registration.
+        DG.Size = SizeBytes; // 0 for legacy SPVs without the __sz_ suffix.
+        DG.InitData = std::move(InitBytes);
         Output.DeviceGlobals.push_back(std::move(DG));
       }
     }
