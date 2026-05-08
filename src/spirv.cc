@@ -1106,6 +1106,14 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
   std::map<InstWord, std::string> Strings;
   std::map<InstWord, uint64_t> Consts;
   std::map<InstWord, std::string> EntryPointNames; // fn_id → entry name
+  // Phase G4: per-result-id OpName plus DescriptorSet/Binding decorations,
+  // and result-ids of OpVariable in StorageBuffer storage class. These three
+  // sources together identify the device-global descriptors emitted by the
+  // HIPSPVLowerToHLSLShape bridging pass at (set=1, binding=N).
+  std::map<InstWord, std::string> ResultNames;       // id → OpName
+  std::map<InstWord, uint32_t> DescSet;              // id → DescriptorSet
+  std::map<InstWord, uint32_t> DescBinding;          // id → Binding
+  std::set<InstWord> StorageBufferVars;              // result-ids
   InstWord ReflSetId = 0;
 
   auto decodeOpString = [&](const InstWord *Words, size_t WC) -> std::string {
@@ -1177,8 +1185,75 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
           break;
       }
       EntryPointNames[FnId] = EpName;
+    } else if (Op == 5 /*OpName*/ && Wc >= 3) {
+      // OpName target_id <literal name>
+      InstWord Tgt = Words[1];
+      std::string N;
+      for (size_t k = 2; k < Wc; ++k) {
+        InstWord X = Words[k];
+        bool Done = false;
+        for (int b = 0; b < 4; ++b) {
+          char C = static_cast<char>((X >> (8 * b)) & 0xff);
+          if (C == 0) {
+            Done = true;
+            break;
+          }
+          N.push_back(C);
+        }
+        if (Done)
+          break;
+      }
+      ResultNames[Tgt] = std::move(N);
+    } else if (Op == 71 /*OpDecorate*/ && Wc >= 4) {
+      // OpDecorate target_id Decoration <literals>
+      InstWord Tgt = Words[1];
+      uint32_t Dec = Words[2];
+      if (Dec == 34 /*DescriptorSet*/ && Wc >= 4)
+        DescSet[Tgt] = Words[3];
+      else if (Dec == 33 /*Binding*/ && Wc >= 4)
+        DescBinding[Tgt] = Words[3];
+    } else if (Op == 59 /*OpVariable*/ && Wc >= 4) {
+      // OpVariable result_type result_id storage_class [initializer]
+      InstWord Sc = Words[3];
+      if (Sc == 12 /*StorageBuffer*/)
+        StorageBufferVars.insert(Words[2]);
     }
     I += Wc;
+  }
+
+  // Phase G4: regardless of whether ClspvReflection metadata is present,
+  // gather any module-scope StorageBuffer descriptors at (set=1, binding=N)
+  // whose OpName matches the bridging-pass naming convention `<var>.<kernel>`
+  // (or `<var>` for a direct match). The runtime uses these to populate its
+  // host-symbol -> device-buffer table for hipMemcpyToSymbol.
+  {
+    std::set<std::string> SeenNames;
+    for (InstWord Id : StorageBufferVars) {
+      auto SI = DescSet.find(Id);
+      auto BI = DescBinding.find(Id);
+      auto NI = ResultNames.find(Id);
+      if (SI == DescSet.end() || BI == DescBinding.end() ||
+          NI == ResultNames.end())
+        continue;
+      if (SI->second != 1)
+        continue;
+      // Strip `<var>.<kernel>` -> `<var>`. The bridging pass appends
+      // `.<kernelname>` so each kernel has a distinct OpName but they
+      // alias the same underlying device global at (set=1, binding=N).
+      std::string Full = NI->second;
+      std::string VarName = Full;
+      auto Dot = Full.find('.');
+      if (Dot != std::string::npos)
+        VarName = Full.substr(0, Dot);
+      if (VarName.empty() || !SeenNames.insert(VarName).second)
+        continue;
+      SPVDeviceGlobal DG;
+      DG.Name = std::move(VarName);
+      DG.Set = SI->second;
+      DG.Binding = BI->second;
+      DG.Size = 0; // Filled in from __hipRegisterVar at host registration.
+      Output.DeviceGlobals.push_back(std::move(DG));
+    }
   }
 
   if (ReflSetId == 0)

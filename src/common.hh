@@ -43,12 +43,28 @@
 
 using SPVFunctionInfoMap = std::map<std::string, std::shared_ptr<SPVFuncInfo>>;
 
+/// Phase G4 (Vulkan path): a module-scope `__device__` global lowered by
+/// the HIPSPVLowerToHLSLShape pass into a StorageBuffer descriptor at
+/// (set=1, binding=N). Recovered by walking OpName + DescriptorSet/Binding
+/// decorations on the SPIR-V binary. Used by the chipStar runtime to
+/// populate its host-symbol -> device-buffer map for hipMemcpyToSymbol.
+struct SPVDeviceGlobal {
+  std::string Name;       ///< Original `__device__` variable name (e.g. "A").
+  uint32_t Set = 1;       ///< Descriptor set (always 1 for device globals).
+  uint32_t Binding = 0;   ///< Descriptor binding within set 1.
+  size_t Size = 0;        ///< Size in bytes of the underlying element type.
+};
+
 struct SPVModuleInfo {
   SPVFunctionInfoMap FuncInfoMap;
 
   /// Set to true if the module is known not to have indirect global
   /// buffer accesses (IGBA) in any kernel.
   bool HasNoIGBAs = false;
+
+  /// Phase G4: device globals lowered to (set=1, binding=N) StorageBuffer
+  /// descriptors. Empty in OCL / non-Vulkan modules.
+  std::vector<SPVDeviceGlobal> DeviceGlobals;
 };
 
 // Processing done before analysis.

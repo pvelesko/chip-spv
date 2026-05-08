@@ -384,6 +384,43 @@ chipstar::Module::allocateDeviceVariablesNoLock(chipstar::Device *Device,
 
   logTrace("Allocate storage for device variables in module: {}", (void *)this);
 
+  // Phase G4 (Vulkan path): if any DeviceVar in this module has no
+  // matching `__chip_var_info_<name>` shadow kernel (i.e. the bridging
+  // pass replaced shadow kernels with reflected device-globals), fall
+  // back to allocating storage from the host-registered SPVVariable size.
+  // This skips the shadow-kernel-driven introspection used by the OCL
+  // path, which is unavailable in Vulkan mode.
+  bool AllShadow = true;
+  for (auto *Var : ChipVars_) {
+    std::string Name(Var->getName());
+    if (!hasKernel(std::string(ChipVarInfoPrefix) + Name)) {
+      AllShadow = false;
+      break;
+    }
+  }
+  if (!AllShadow) {
+    auto *Ctx = Device->getContext();
+    for (auto *Var : ChipVars_) {
+      size_t Size = Var->getSize();
+      if (Size == 0) {
+        // Host-side __hipRegisterVar didn't carry size for this entry;
+        // device-only / template-instantiated globals fall through here
+        // and aren't supported by the Vulkan path yet.
+        logWarn("Device variable '{}' has zero size; skipping allocation.",
+                Var->getName());
+        continue;
+      }
+      Var->setDevAddr(
+          Ctx->allocate(Size, /*alignment=*/16, hipMemoryType::hipMemoryTypeDevice));
+      // Vulkan path: HasInitializer is unknown; mark false so the host-side
+      // shadow-kernel-driven init path is skipped. Initial values come from
+      // the SPV's OpVariable initialiser at descriptor binding time.
+      Var->markHasInitializer(false);
+    }
+    DeviceVariablesAllocated_ = true;
+    return hipSuccess;
+  }
+
   // TODO: catch any exception and abort as it's probably an unrecoverable
   //       condition?
 
@@ -1175,7 +1212,22 @@ chipstar::Module *chipstar::Device::getOrCreateModule(HostPtr Ptr) {
 
     logTrace("Processing variable: {} with host pointer: {}", NameTmp, (const void*)Info.Ptr.Value);
 
-    if (!Mod->hasKernel(VarInfoKernelName)) {
+    // Phase G4 (Vulkan path): the bridging pass replaces shadow kernels
+    // with reflected device globals at (set=1, binding=N). Accept either
+    // mechanism: if no shadow kernel exists, look for a matching entry
+    // in SPVModuleInfo::DeviceGlobals.
+    bool HasShadow = Mod->hasKernel(VarInfoKernelName);
+    bool HasDeviceGlobal = false;
+    {
+      const auto &MI = SrcMod->getInfo();
+      for (const auto &DG : MI.DeviceGlobals) {
+        if (DG.Name == NameTmp) {
+          HasDeviceGlobal = true;
+          break;
+        }
+      }
+    }
+    if (!HasShadow && !HasDeviceGlobal) {
       // The kernel compilation pipe is allowed to remove device-side unused
       // global variables from the device modules. This is utilized in the
       // abort implementation to signal that abort is not called in the
@@ -1187,7 +1239,9 @@ chipstar::Module *chipstar::Device::getOrCreateModule(HostPtr Ptr) {
           Info.Name);
       continue;
     }
-    logTrace("Found shadow kernel for variable: {}", NameTmp);
+    logTrace("Found {} for variable: {}",
+             HasShadow ? "shadow kernel" : "device-global descriptor",
+             NameTmp);
     auto *Var = new chipstar::DeviceVar(&Info);
     Mod->addDeviceVariable(Var);
 
