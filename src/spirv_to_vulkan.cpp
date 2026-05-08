@@ -414,6 +414,7 @@ struct ModuleInfo {
   std::unordered_map<uint32_t, uint32_t> builtin_input_ptr_types; // var_id → ptr_type_id
   // WorkgroupSize variable ID — to be removed (replaced by SpecConstantComposite)
   uint32_t workgroup_size_var_id = 0;
+
   // True when the input module did not declare an OpTypeInt 32 0 and the emit
   // pass synthesizes one. Triggers an extra OpTypeInt emission in the type
   // section so downstream constants (uint32 0/1/2, refl constants, atomic
@@ -2971,6 +2972,7 @@ static Words emitVulkanSpirv(ModuleInfo& info, std::string& err) {
   if (info.synthesized_uint32) {
     emitInstr(out, Op::TypeInt, {info.uint32_type_id, 32, 0});
   }
+
   // Emit original types (filtering skipped)
   for (auto& instr : info.original_types) {
     uint32_t result_id = 0;
