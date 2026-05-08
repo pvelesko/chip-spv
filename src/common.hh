@@ -43,16 +43,26 @@
 
 using SPVFunctionInfoMap = std::map<std::string, std::shared_ptr<SPVFuncInfo>>;
 
-/// Phase G4 (Vulkan path): a module-scope `__device__` global lowered by
-/// the HIPSPVLowerToHLSLShape pass into a StorageBuffer descriptor at
-/// (set=1, binding=N). Recovered by walking OpName + DescriptorSet/Binding
-/// decorations on the SPIR-V binary. Used by the chipStar runtime to
-/// populate its host-symbol -> device-buffer map for hipMemcpyToSymbol.
+/// Phase H4 (Vulkan path): a module-scope `__device__` global lowered by
+/// the HIPSPVLowerToHLSLShape pass into a *per-kernel hidden kernel-arg*
+/// (set=0). Recovered by walking OpName decorations on set=0 StorageBuffer
+/// descriptors whose name matches the `__hipspv_dg_<symbol>` prefix. Used
+/// by the chipStar runtime to populate its host-symbol -> device-buffer map
+/// for hipMemcpyToSymbol and to bind the corresponding cl_mem at kernel
+/// launch via `clSetKernelArg`.
 struct SPVDeviceGlobal {
   std::string Name;       ///< Original `__device__` variable name (e.g. "A").
-  uint32_t Set = 1;       ///< Descriptor set (always 1 for device globals).
-  uint32_t Binding = 0;   ///< Descriptor binding within set 1.
+  uint32_t Set = 0;       ///< Descriptor set (always 0 in the H4 path).
+  uint32_t Binding = 0;   ///< Descriptor binding within set 0 (legacy; per-kernel binding lives in HiddenArgsByKernel below).
   size_t Size = 0;        ///< Size in bytes of the underlying element type.
+};
+
+/// Phase H4: per-kernel record of which device-global symbol is bound at
+/// which kernel-argument ordinal. Populated from the SPV's `__hipspv_dg_*`
+/// OpName decorations during analyzeSPIRV.
+struct SPVKernelDeviceGlobalArg {
+  std::string Symbol;     ///< `__device__` variable name.
+  uint32_t ArgIndex = 0;  ///< Kernel-arg ordinal (post-bridging-pass).
 };
 
 struct SPVModuleInfo {
@@ -62,9 +72,15 @@ struct SPVModuleInfo {
   /// buffer accesses (IGBA) in any kernel.
   bool HasNoIGBAs = false;
 
-  /// Phase G4: device globals lowered to (set=1, binding=N) StorageBuffer
-  /// descriptors. Empty in OCL / non-Vulkan modules.
+  /// Phase H4: device globals lowered to per-kernel hidden args. Empty in
+  /// OCL / non-Vulkan modules.
   std::vector<SPVDeviceGlobal> DeviceGlobals;
+
+  /// Phase H4: kernel-name -> ordered list of (symbol, kernel-arg-index)
+  /// hidden device-global args. The runtime uses this map at launch to
+  /// bind the chipStar-allocated cl_mem of `<symbol>` at the recorded ord.
+  std::map<std::string, std::vector<SPVKernelDeviceGlobalArg>>
+      HiddenDGArgsByKernel;
 };
 
 // Processing done before analysis.

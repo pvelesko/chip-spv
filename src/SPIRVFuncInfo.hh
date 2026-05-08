@@ -44,6 +44,9 @@ enum class SPVTypeKind : unsigned {
             // a device buffer.
   Image,    // The type is a image.
   Sampler,  // The type is a sample.
+  DeviceGlobalHidden, // Phase H4: hidden pointer arg synthesised by
+                      // HIPSPVLowerToHLSLShape to bind a `__device__`
+                      // global as a per-kernel kernel-arg buffer.
 
   // Should not appear in kernel parameter lists.
   Opaque, // The type is an unresolved, special SPIR-V type.
@@ -62,6 +65,14 @@ struct SPVArgTypeInfo {
   SPVTypeKind Kind;
   SPVStorageClass StorageClass;
   size_t Size;
+  /// Optional override for the OpenCL kernel argument index passed to
+  /// clSetKernelArg. When negative, the visitor uses the linear ordinal
+  /// position in ArgTypeInfo_ (matching the OpenCL kernel signature).
+  /// Used by the Vulkan-flavored SPIR-V reflection path where clspv
+  /// reorders kernel arguments (storage buffers before push constants)
+  /// while the HIP host still passes its argument list in original HIP
+  /// source order.
+  int KernelArgIndex = -1;
 
   bool isWorkgroupPtr() const {
     return Kind == SPVTypeKind::Pointer &&

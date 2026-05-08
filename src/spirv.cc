@@ -32,6 +32,7 @@
 #include <unordered_map>
 #include <memory>
 #include <regex>
+#include <cxxabi.h>
 
 #include "common.hh"
 #include "spirv.hh"
@@ -1080,6 +1081,149 @@ bool postprocessSPIRV(std::vector<uint32_t> &Input) {
 //      name we recover from OpEntryPoint matches up).
 namespace {
 
+// Parse the demangled signature from `cxxabi.h` to recover, for
+// each HIP source argument, whether the type is a pointer/reference.
+// Used to remap clspv-flavored reflection arg ordinals (which place
+// pointers/storage-buffers before PODs/push-constants) back into the
+// original HIP source argument order — required so that the HIP
+// runtime, which always passes its kernel-argument list in HIP
+// source order, hands the right value to the right OpenCL kernel
+// arg index.
+//
+// On any failure (unrecognised mangling, demangler unavailable,
+// etc.) returns an empty vector and the caller falls back to
+// treating reflection ord as the HIP source order — which preserves
+// the legacy behaviour for kernels that happen to have all
+// pointers, all PODs, or only one argument.
+namespace {
+
+// Walk a demangled C++ signature `Name(Params)` and return a vector
+// of bools over the top-level parameters: true = pointer/reference.
+// Skips templates, parens, brackets, and angle brackets when
+// counting commas at depth 0.
+static std::vector<bool>
+classifyDemangledArgs(const std::string &Demangled) {
+  std::vector<bool> Result;
+  // Find the parameter list. The signature may be like
+  // `bcast(int, int*)` or `addCountReverse<int>(int const*, int*, long, int)`.
+  // We want the outermost parens.
+  size_t LParen = std::string::npos;
+  int Depth = 0;
+  for (size_t I = 0; I < Demangled.size(); ++I) {
+    char C = Demangled[I];
+    if (C == '<')
+      Depth++;
+    else if (C == '>')
+      Depth--;
+    else if (C == '(' && Depth == 0) {
+      LParen = I;
+      break;
+    }
+  }
+  if (LParen == std::string::npos)
+    return Result;
+  // Match the closing paren.
+  int PDepth = 1;
+  size_t RParen = std::string::npos;
+  Depth = 0;
+  for (size_t I = LParen + 1; I < Demangled.size(); ++I) {
+    char C = Demangled[I];
+    if (C == '<' || C == '(' || C == '[')
+      Depth++;
+    else if (C == '>' || C == ')' || C == ']') {
+      if (C == ')' && Depth == 0) {
+        if (--PDepth == 0) {
+          RParen = I;
+          break;
+        }
+        continue;
+      }
+      Depth--;
+    }
+  }
+  if (RParen == std::string::npos)
+    return Result;
+  // Split the parameter list on commas at depth 0.
+  std::string ParamList = Demangled.substr(LParen + 1, RParen - LParen - 1);
+  size_t Start = 0;
+  Depth = 0;
+  auto pushParam = [&](size_t Begin, size_t End) {
+    // Trim trailing whitespace.
+    while (End > Begin && std::isspace(static_cast<unsigned char>(ParamList[End - 1])))
+      End--;
+    while (Begin < End && std::isspace(static_cast<unsigned char>(ParamList[Begin])))
+      Begin++;
+    if (Begin >= End)
+      return;
+    // Top-level pointer/reference: the *last* non-whitespace, non-cv-token
+    // character is '*' or '&'.
+    bool IsPtr = false;
+    // Look at the trailing token, skipping cv qualifiers.
+    std::string_view Sv(ParamList.data() + Begin, End - Begin);
+    // Find rightmost '*' or '&' that is at top level.
+    int InnerDepth = 0;
+    for (size_t I = Sv.size(); I-- > 0;) {
+      char C = Sv[I];
+      if (C == '>' || C == ')' || C == ']') InnerDepth++;
+      else if (C == '<' || C == '(' || C == '[') InnerDepth--;
+      else if (InnerDepth == 0 && (C == '*' || C == '&')) {
+        IsPtr = true;
+        break;
+      } else if (InnerDepth == 0 && !std::isspace(static_cast<unsigned char>(C))) {
+        // Hit an alphanumeric/identifier character → not a pointer.
+        if (std::isalnum(static_cast<unsigned char>(C)) || C == '_') {
+          // Could still be a const/volatile suffix — keep looking
+          // past 'const' / 'volatile' tokens.
+          continue;
+        }
+      }
+    }
+    Result.push_back(IsPtr);
+  };
+  for (size_t I = 0; I < ParamList.size(); ++I) {
+    char C = ParamList[I];
+    if (C == '<' || C == '(' || C == '[')
+      Depth++;
+    else if (C == '>' || C == ')' || C == ']')
+      Depth--;
+    else if (C == ',' && Depth == 0) {
+      pushParam(Start, I);
+      Start = I + 1;
+    }
+  }
+  pushParam(Start, ParamList.size());
+  // Special case: single "void" parameter means no args.
+  if (Result.size() == 1) {
+    // Trim ParamList and check.
+    std::string T = ParamList;
+    T.erase(std::remove_if(T.begin(), T.end(),
+                           [](char C) {
+                             return std::isspace(static_cast<unsigned char>(C));
+                           }),
+            T.end());
+    if (T == "void")
+      Result.clear();
+  }
+  return Result;
+}
+
+static std::vector<bool>
+classifyHipKernelArgsByMangling(const std::string &MangledName) {
+  std::vector<bool> Empty;
+  int Status = 0;
+  char *Demangled =
+      abi::__cxa_demangle(MangledName.c_str(), nullptr, nullptr, &Status);
+  if (Status != 0 || !Demangled) {
+    if (Demangled)
+      free(Demangled);
+    return Empty;
+  }
+  std::string D(Demangled);
+  free(Demangled);
+  return classifyDemangledArgs(D);
+}
+} // namespace
+
 bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
                                 SPVModuleInfo &Output) {
   // Find OpMemoryModel; require Logical addressing for the Vulkan path.
@@ -1221,13 +1365,18 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
     I += Wc;
   }
 
-  // Phase G4: regardless of whether ClspvReflection metadata is present,
-  // gather any module-scope StorageBuffer descriptors at (set=1, binding=N)
-  // whose OpName matches the bridging-pass naming convention `<var>.<kernel>`
-  // (or `<var>` for a direct match). The runtime uses these to populate its
-  // host-symbol -> device-buffer table for hipMemcpyToSymbol.
+  // Phase H4: gather set=0 StorageBuffer descriptors whose OpName matches
+  // the bridging-pass naming convention `__hipspv_dg_<symbol>`. Each such
+  // descriptor is a hidden kernel arg synthesised by
+  // lowerDeviceGlobalsToStorageBuffers; the runtime needs to bind the
+  // chipStar-allocated cl_mem of `<symbol>` at the corresponding kernel
+  // arg ordinal. Build a per-binding -> symbol map here; per-kernel ord
+  // mapping is built below in the reflection-walk.
+  std::map<uint32_t, std::string> BindingToDGSymbol; // set=0 binding -> symbol
   {
-    std::set<std::string> SeenNames;
+    static constexpr const char *kPrefix = "__hipspv_dg_";
+    static constexpr size_t kPrefixLen = 12;
+    std::set<std::string> SeenSymbols;
     for (InstWord Id : StorageBufferVars) {
       auto SI = DescSet.find(Id);
       auto BI = DescBinding.find(Id);
@@ -1235,24 +1384,23 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
       if (SI == DescSet.end() || BI == DescBinding.end() ||
           NI == ResultNames.end())
         continue;
-      if (SI->second != 1)
+      if (SI->second != 0)
         continue;
-      // Strip `<var>.<kernel>` -> `<var>`. The bridging pass appends
-      // `.<kernelname>` so each kernel has a distinct OpName but they
-      // alias the same underlying device global at (set=1, binding=N).
-      std::string Full = NI->second;
-      std::string VarName = Full;
-      auto Dot = Full.find('.');
-      if (Dot != std::string::npos)
-        VarName = Full.substr(0, Dot);
-      if (VarName.empty() || !SeenNames.insert(VarName).second)
+      const std::string &Full = NI->second;
+      if (Full.compare(0, kPrefixLen, kPrefix) != 0)
         continue;
-      SPVDeviceGlobal DG;
-      DG.Name = std::move(VarName);
-      DG.Set = SI->second;
-      DG.Binding = BI->second;
-      DG.Size = 0; // Filled in from __hipRegisterVar at host registration.
-      Output.DeviceGlobals.push_back(std::move(DG));
+      std::string Symbol = Full.substr(kPrefixLen);
+      if (Symbol.empty())
+        continue;
+      BindingToDGSymbol[BI->second] = Symbol;
+      if (SeenSymbols.insert(Symbol).second) {
+        SPVDeviceGlobal DG;
+        DG.Name = Symbol;
+        DG.Set = 0;
+        DG.Binding = BI->second;
+        DG.Size = 0; // Filled in from __hipRegisterVar at host registration.
+        Output.DeviceGlobals.push_back(std::move(DG));
+      }
     }
   }
 
@@ -1305,11 +1453,32 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
           if (It == Kernels.end())
             break;
           uint32_t Ord = static_cast<uint32_t>(Consts[Words[6]]);
+          uint32_t ArgSet = static_cast<uint32_t>(Consts[Words[7]]);
+          uint32_t ArgBinding = static_cast<uint32_t>(Consts[Words[8]]);
           SPVArgTypeInfo Ti;
           Ti.Kind = SPVTypeKind::Pointer;
           Ti.StorageClass = SPVStorageClass::CrossWorkgroup;
           Ti.Size = 8; // pointer size
+          // Phase H4: if this descriptor is a hidden device-global arg,
+          // record (kernel, ord, symbol) so the launch path can bind the
+          // chipStar-allocated cl_mem, and mark its kind so visitClientArgs
+          // skips it.
+          if (ArgSet == 0) {
+            auto SymIt = BindingToDGSymbol.find(ArgBinding);
+            if (SymIt != BindingToDGSymbol.end()) {
+              SPVKernelDeviceGlobalArg HA;
+              HA.Symbol = SymIt->second;
+              HA.ArgIndex = Ord;
+              Output.HiddenDGArgsByKernel[It->second.Name].push_back(HA);
+              Ti.Kind = SPVTypeKind::DeviceGlobalHidden;
+              logDebug(
+                  "Reflect kernel='{}' hidden DG arg ord={} symbol='{}'",
+                  It->second.Name, Ord, SymIt->second);
+            }
+          }
           It->second.Args.emplace_back(Ord, Ti);
+          logDebug("Reflect kernel='{}' ArgStorageBuffer ord={}",
+                   It->second.Name, Ord);
           break;
         }
         case 7: { // ArgumentPodPushConstant(kernel, ord, offset, size)
@@ -1325,6 +1494,8 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
           Ti.StorageClass = SPVStorageClass::Private;
           Ti.Size = static_cast<size_t>(Sz);
           It->second.Args.emplace_back(Ord, Ti);
+          logDebug("Reflect kernel='{}' ArgPodPushConstant ord={} size={}",
+                   It->second.Name, Ord, Sz);
           break;
         }
         default:
@@ -1343,13 +1514,97 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
     auto &Rec = Kv.second;
     if (Rec.Name.empty())
       continue;
-    // Sort args by ordinal, then store.
+    // Sort args by clspv reflection ordinal. After this, the vector is
+    // in OpenCL kernel signature order: storage buffers (user pointers,
+    // then any hidden device-global descriptors) first, then push
+    // constants (PODs).
     std::sort(Rec.Args.begin(), Rec.Args.end(),
               [](const auto &A, const auto &B) { return A.first < B.first; });
+
+    // The HIP runtime walks ArgTypeInfo_ alongside ClientArgList in HIP
+    // source order. The chipstarvulkan-flavored SPIR-V reorders args
+    // (pointers/SBs first, PODs last), so we must rebuild the vector in
+    // HIP source order with each entry's KernelArgIndex set to the OCL
+    // kernel-arg ordinal (the reflection ord).
+    auto IsPtrPerHipArg = classifyHipKernelArgsByMangling(Rec.Name);
+
+    // Partition the reflected args into three buckets.
+    std::vector<size_t> PointerArgsOcl;
+    std::vector<size_t> HiddenDgArgsOcl;
+    std::vector<size_t> PodArgsOcl;
+    for (size_t I = 0; I < Rec.Args.size(); ++I) {
+      auto &Ti = Rec.Args[I].second;
+      if (Ti.Kind == SPVTypeKind::Pointer)
+        PointerArgsOcl.push_back(I);
+      else if (Ti.Kind == SPVTypeKind::DeviceGlobalHidden)
+        HiddenDgArgsOcl.push_back(I);
+      else
+        PodArgsOcl.push_back(I);
+    }
+
     std::vector<SPVArgTypeInfo> ArgInfos;
     ArgInfos.reserve(Rec.Args.size());
-    for (auto &P : Rec.Args)
-      ArgInfos.push_back(P.second);
+
+    long NumHipPtrs =
+        std::count(IsPtrPerHipArg.begin(), IsPtrPerHipArg.end(), true);
+    long NumHipPods = (long)IsPtrPerHipArg.size() - NumHipPtrs;
+    // Allow more reflected ords than HIP source args: chipstarvulkan
+    // / clspv emits extra SBs (one per module-level descriptor) and
+    // extra PCs across all kernels in the program. We bind only the
+    // first NumHipPtrs SBs (in clspv ord order) to the HIP pointer
+    // args and only the first NumHipPods PCs to the HIP POD args.
+    bool RemapOk = !IsPtrPerHipArg.empty() &&
+                   NumHipPtrs <= (long)PointerArgsOcl.size() &&
+                   NumHipPods <= (long)PodArgsOcl.size();
+
+    if (RemapOk) {
+      size_t NextPtr = 0, NextPod = 0;
+      for (bool IsPtr : IsPtrPerHipArg) {
+        size_t OclIdx;
+        if (IsPtr)
+          OclIdx = PointerArgsOcl[NextPtr++];
+        else
+          OclIdx = PodArgsOcl[NextPod++];
+        SPVArgTypeInfo Ti = Rec.Args[OclIdx].second;
+        Ti.KernelArgIndex = (int)Rec.Args[OclIdx].first;
+        ArgInfos.push_back(Ti);
+      }
+      // Append hidden device-global descriptors and any leftover
+      // pointer/POD ords that the program-wide reflection injected
+      // across kernels (clspv exposes every module-level descriptor
+      // as a kernel arg of every kernel). These don't consume a
+      // ClientArgList slot. Pointer leftovers are reclassified as
+      // DeviceGlobalHidden (with no associated symbol) so the OpenCL
+      // launch path binds them to nullptr; POD leftovers are dropped
+      // because clvk doesn't enforce push-constant binding count.
+      for (size_t Idx : HiddenDgArgsOcl) {
+        SPVArgTypeInfo Ti = Rec.Args[Idx].second;
+        Ti.KernelArgIndex = (int)Rec.Args[Idx].first;
+        ArgInfos.push_back(Ti);
+      }
+      for (size_t I = NextPtr; I < PointerArgsOcl.size(); ++I) {
+        SPVArgTypeInfo Ti = Rec.Args[PointerArgsOcl[I]].second;
+        Ti.Kind = SPVTypeKind::DeviceGlobalHidden;
+        Ti.KernelArgIndex = (int)Rec.Args[PointerArgsOcl[I]].first;
+        ArgInfos.push_back(Ti);
+      }
+      logDebug(
+          "Reflect kernel='{}' remapped {} HIP-source args (KernelArgIndex "
+          "set per-arg, {} unbound SBs)",
+          Rec.Name, IsPtrPerHipArg.size(),
+          PointerArgsOcl.size() - NumHipPtrs);
+    } else {
+      // Fallback: keep the legacy behaviour of using reflection-ord
+      // order. Works correctly for all-pointer or all-POD kernels.
+      for (auto &P : Rec.Args)
+        ArgInfos.push_back(P.second);
+      logDebug("Reflect kernel='{}' using legacy ord order ({} args, "
+               "demangle={} produced {} entries)",
+               Rec.Name, Rec.Args.size(),
+               IsPtrPerHipArg.empty() ? "failed" : "ok",
+               IsPtrPerHipArg.size());
+    }
+
     auto FInfo = std::make_shared<SPVFuncInfo>(ArgInfos);
     Output.FuncInfoMap.emplace(Rec.Name, std::move(FInfo));
   }

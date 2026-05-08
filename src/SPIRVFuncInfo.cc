@@ -81,6 +81,8 @@ std::string_view SPVFuncInfo::Arg::getKindAsString() const {
     return "Image";
   case SPVTypeKind::Sampler:
     return "Sampler";
+  case SPVTypeKind::DeviceGlobalHidden:
+    return "DeviceGlobalHidden";
   }
 }
 
@@ -106,6 +108,9 @@ void SPVFuncInfo::visitClientArgsImpl(void **ClientArgList,
     // Dynamic shared memory which is passed in hipLaunchKernel() or
     // <<<>>>-syntax - not in a kernel parameter list.
     if (ArgTI.isWorkgroupPtr())
+      continue;
+    // Phase H4: hidden device-global arg - never visible to the HIP client.
+    if (ArgKind == SPVTypeKind::DeviceGlobalHidden)
       continue;
 
     // Map kernel argument types to types as defined in HIP source code.
@@ -153,18 +158,33 @@ void SPVFuncInfo::visitKernelArgsImpl(void **ClientArgList,
       ArgListIndex--;
 
     const void *ArgData = nullptr;
-    if (ClientArgList && !ArgTI.isWorkgroupPtr()) {
+    bool ConsumesClientSlot = !ArgTI.isWorkgroupPtr() &&
+                              ArgKind != SPVTypeKind::DeviceGlobalHidden;
+    if (ClientArgList && ConsumesClientSlot) {
       ArgData = ClientArgList[ArgListIndex];
 
       // Clang geerated  argument list should not have nullptrs in it.
       assert(ArgData && "nullptr in the argument list");
     }
 
-    KernelArg KArg{{{ArgKind, ArgTI.StorageClass, ArgSize}, ArgIndex, ArgData}};
+    unsigned EffectiveIndex =
+        ArgTI.KernelArgIndex >= 0 ? (unsigned)ArgTI.KernelArgIndex : ArgIndex;
+    // Use direct field assignment instead of nested aggregate
+    // initialization because brace-init through derived structs
+    // (KernelArg : Arg : SPVArgTypeInfo) was silently dropping the
+    // overridden Index in older toolchains.
+    KernelArg KArg{};
+    KArg.Kind = ArgKind;
+    KArg.StorageClass = ArgTI.StorageClass;
+    KArg.Size = ArgSize;
+    KArg.KernelArgIndex = ArgTI.KernelArgIndex;
+    KArg.Index = EffectiveIndex;
+    KArg.Data = ArgData;
     Visitor(KArg);
 
     ArgIndex++;
-    ArgListIndex++;
+    if (ConsumesClientSlot)
+      ArgListIndex++;
   }
 }
 
@@ -184,7 +204,8 @@ unsigned SPVFuncInfo::getNumClientArgs() const {
   unsigned Count = getNumKernelArgs();
   for (const auto &ArgTI : ArgTypeInfo_) {
     auto ArgKind = ArgTI.Kind;
-    Count -= ArgKind == SPVTypeKind::Sampler || ArgTI.isWorkgroupPtr();
+    Count -= ArgKind == SPVTypeKind::Sampler || ArgTI.isWorkgroupPtr() ||
+             ArgKind == SPVTypeKind::DeviceGlobalHidden;
   }
   return Count;
 }

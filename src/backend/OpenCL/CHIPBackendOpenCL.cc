@@ -2473,11 +2473,89 @@ void CHIPExecItemOpenCL::setupAllArgs() {
 
   cl_kernel KernelHandle = ClKernel_.get()->get();
 
+  // Phase H4: build ord -> symbol map for hidden device-global args of this
+  // kernel (if any). The reflection parser populates
+  // SPVModuleInfo::HiddenDGArgsByKernel from set=0 OpName decorations of
+  // the form `__hipspv_dg_<symbol>`.
+  std::map<uint32_t, std::string> HiddenDGOrdToSymbol;
+  {
+    const SPVModuleInfo &MI = Kernel->getModule()->getInfo();
+    auto It = MI.HiddenDGArgsByKernel.find(Kernel->getName());
+    if (It != MI.HiddenDGArgsByKernel.end())
+      for (const auto &HA : It->second)
+        HiddenDGOrdToSymbol[HA.ArgIndex] = HA.Symbol;
+  }
+  auto *ChipModule = Kernel->getModule();
+
   auto ArgVisitor = [&](const SPVFuncInfo::KernelArg &Arg) -> void {
     switch (Arg.Kind) {
     default:
       CHIPERR_LOG_AND_THROW("Internal chipStar error: Unknown argument kind",
                             hipErrorTbd);
+    case SPVTypeKind::DeviceGlobalHidden: {
+      auto SymIt = HiddenDGOrdToSymbol.find(Arg.Index);
+      if (SymIt == HiddenDGOrdToSymbol.end()) {
+        // Unbound hidden SB descriptor injected by clspv across kernels
+        // in the program (e.g. addCountReverse's signature includes a
+        // descriptor referenced only by addOne). Bind it to nullptr so
+        // clvk accepts the launch.
+        // clvk injects extra storage-buffer descriptors per-kernel so
+        // every kernel's pipeline layout covers all module-level
+        // descriptors. Walk the bound user pointer args of this
+        // kernel and bind the unbound descriptor to one of their
+        // device pointers (clvk only validates that the arg is set;
+        // the kernel won't dereference these aliased descriptors).
+        const void *FallbackPtr = nullptr;
+        FuncInfo->visitKernelArgs(getArgs(),
+                                  [&](const SPVFuncInfo::KernelArg &A2) {
+                                    if (FallbackPtr)
+                                      return;
+                                    if (A2.Kind == SPVTypeKind::Pointer &&
+                                        !A2.isWorkgroupPtr() && A2.Data) {
+                                      FallbackPtr = *reinterpret_cast<
+                                          const void *const *>(A2.Data);
+                                    }
+                                  });
+        logDebug("clSetKernelArgDevicePointerEXT (unbound) idx={} -> "
+                 "fallback={}",
+                 Arg.Index, FallbackPtr);
+        Err = Ctx->clSetKernelArgDevicePointerEXT(KernelHandle, Arg.Index,
+                                                  FallbackPtr);
+        if (Err != CL_SUCCESS) {
+          logWarn("Unbound SB clSetKernelArgDevicePointerEXT idx={} "
+                  "returned err={}",
+                  Arg.Index, Err);
+          // Last resort: fall back to clSetKernelArg with null cl_mem.
+          cl_mem NullBuf = nullptr;
+          Err = ::clSetKernelArg(KernelHandle, Arg.Index, sizeof(cl_mem),
+                                 &NullBuf);
+        }
+        break;
+      }
+      chipstar::DeviceVar *Var =
+          ChipModule->getGlobalVar(SymIt->second.c_str());
+      if (!Var || !Var->getDevAddr()) {
+        CHIPERR_LOG_AND_THROW(
+            "Internal chipStar error: device global not allocated",
+            hipErrorTbd);
+      }
+      void *DevPtr = Var->getDevAddr();
+      if (Ctx->getAllocStrategy() == AllocationStrategy::BufferDevAddr) {
+        // clvk path: bind cl_mem via clSetKernelArg (cl_mem, sizeof(cl_mem)).
+        auto [Buf, Off] = Ctx->translateDevPtrToBuffer(DevPtr);
+        (void)Off;
+        logTrace("clSetKernelArg DG ord={} symbol={} cl_mem={}\n", Arg.Index,
+                 SymIt->second, (void *)Buf);
+        Err = ::clSetKernelArg(KernelHandle, Arg.Index, sizeof(cl_mem), &Buf);
+        CHIPERR_CHECK_LOG_AND_THROW_TABLE(clSetKernelArg);
+      } else {
+        logTrace("clSetKernelArgSVMPointer DG ord={} symbol={} ptr={}\n",
+                 Arg.Index, SymIt->second, DevPtr);
+        Err = ::clSetKernelArgSVMPointer(KernelHandle, Arg.Index, DevPtr);
+        CHIPERR_CHECK_LOG_AND_THROW_TABLE(clSetKernelArgSVMPointer);
+      }
+      break;
+    }
     case SPVTypeKind::Image: {
       auto *TexObj =
           *reinterpret_cast<const CHIPTextureOpenCL *const *>(Arg.Data);
