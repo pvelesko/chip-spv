@@ -45,6 +45,7 @@ endfunction()
 ## 0_Simple
 add_cuda_sample(cuda-asyncAPI 0_Simple/asyncAPI asyncAPI.cu)
 add_cuda_sample(cuda-lambda 0_Simple/lambda lambda.cu)
+if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
 add_cuda_sample(cuda-matrixMul 0_Simple/matrixMul matrixMul.cu)
 add_cuda_sample(cuda-template 0_Simple/template template.cu template_cpu.cpp)
 add_cuda_sample(cuda-vectorAdd 0_Simple/vectorAdd vectorAdd.cu)
@@ -115,6 +116,7 @@ endif()
 add_cuda_sample(cuda-sobolqrng  4_Finance/SobolQRNG sobol.cpp  sobol_gold.cpp  sobol_gpu.cu  sobol_primitives.cpp)
 add_cuda_sample(cuda-reduction  6_Advanced/reduction reduction.cpp  reduction_kernel.cu)
 add_cuda_sample(cuda-fastwalsh  6_Advanced/fastWalshTransform fastWalshTransform.cu  fastWalshTransform_gold.cpp)
+endif() # close line-48 if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
 
 ############################
 
