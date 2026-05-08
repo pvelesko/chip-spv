@@ -90,8 +90,13 @@ add_shell_test(TestAssert.bash)
 add_shell_test(TestAssertFail.bash)
 add_shell_test(TestForgottenModuleUnload.bash)
 
-add_hip_runtime_test(TestIndirectCall.hip)
-add_hip_runtime_test(TestStructWithFnPtr.hip)
+# Vulkan compute SPIR-V does not support indirect calls / function pointers
+# without the non-portable SPV_INTEL_function_pointers extension. Skip these
+# tests when targeting native Vulkan SPIR-V.
+if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
+  add_hip_runtime_test(TestIndirectCall.hip)
+  add_hip_runtime_test(TestStructWithFnPtr.hip)
+endif()
 add_hip_runtime_test(TestHipInit.hip)
 
 add_shell_test(TestRuntimeWarnings.bash)
