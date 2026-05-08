@@ -425,7 +425,18 @@ endif()
 
 message(STATUS "chipStar will be installed to: ${CMAKE_INSTALL_PREFIX}")
 
-if(LLVM_VERSION_MAJOR GREATER_EQUAL 23)
+option(CHIP_USE_NATIVE_VULKAN_SPIRV
+  "Compile HIP kernels directly to Vulkan-flavored SPIR-V via clang's HIPSPV \
+chipstar-vulkan environment, skipping the runtime openclToVulkanSpirv \
+post-processor. Requires LLVM 23 with the HIPSPVLowerToHLSLShape pass."
+  OFF)
+
+if(CHIP_USE_NATIVE_VULKAN_SPIRV)
+  if(LLVM_VERSION_MAJOR LESS 23)
+    message(FATAL_ERROR "CHIP_USE_NATIVE_VULKAN_SPIRV requires LLVM 23+")
+  endif()
+  set(OFFLOAD_TRIPLE spirv64-unknown-chipstar-chipstarvulkan)
+elseif(LLVM_VERSION_MAJOR GREATER_EQUAL 23)
   # On LLVM-23+ the emitted SPIR-V version can be controlled with
   # subarch string (v#.#). The new "chipstar" OS component sets
   # allowed SPIR-V extensions tailored for chipStar.

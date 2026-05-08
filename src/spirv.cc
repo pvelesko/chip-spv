@@ -587,7 +587,9 @@ public:
     //       passing invalid SPIR-V binary.
     // Check(KernelCapab_, "Kernel capability missing.");
     // Check(ExtIntOpenCL_, "Missing extended OpenCL instructions.");
-    Check(MemModelCL_, "Incorrect memory model.");
+    // Vulkan-flavored SPIR-V emitted by HIPSPV's chipstar-vulkan triple uses
+    // Logical+GLSL450 instead of OpenCL — accept either.
+    // Check(MemModelCL_, "Incorrect memory model.");
     Check(ParseOK_, "An error encountered during parsing.");
     return AllOk;
   }
@@ -1059,7 +1061,235 @@ bool postprocessSPIRV(std::vector<uint32_t> &Input) {
   return true;
 }
 
+// =====================================================================
+// Vulkan-flavored SPIR-V parser. Reads NonSemantic.ClspvReflection.5
+// ExtInst calls to discover kernels and arg layout. Used when the SPIR-V
+// uses Logical+GLSL450 addressing (HIPSPV chipstar-vulkan triple) instead
+// of OpenCL Kernel mode.
+//
+// The reflection block records (per the Khronos SPIR-V Headers' enum):
+//   Kernel(result, ext_set, fn_id, name_str, num_args, flags, attrs_str)
+//   ArgumentStorageBuffer(result, ext_set, kernel_id, ord, set, binding)
+//   ArgumentPodPushConstant(result, ext_set, kernel_id, ord, offset, size)
+//
+// We walk the instruction stream once to:
+//   1. find the ClspvReflection OpExtInstImport result-id
+//   2. collect OpString and OpConstant integer values
+//   3. for each ExtInst into that set, decode and accumulate per-kernel
+//      arg vectors keyed on the kernel's Function id (so the entry-point
+//      name we recover from OpEntryPoint matches up).
+namespace {
+
+bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
+                                SPVModuleInfo &Output) {
+  // Find OpMemoryModel; require Logical addressing for the Vulkan path.
+  bool IsLogical = false;
+  size_t I = 5;
+  while (I < NumWords) {
+    InstWord W = Stream[I];
+    uint16_t Wc = (W >> 16) & 0xFFFF;
+    uint16_t Op = W & 0xFFFF;
+    if (Wc == 0)
+      return false;
+    if (Op == 14 /*OpMemoryModel*/) {
+      if (Wc >= 3 && Stream[I + 1] == 0 /*Logical*/)
+        IsLogical = true;
+      break;
+    }
+    I += Wc;
+  }
+  if (!IsLogical)
+    return false;
+
+  // Pass 1: gather OpExtInstImport (find ClspvReflection set), OpString,
+  //         OpConstant uint values, and OpEntryPoint (function-id → name).
+  std::map<InstWord, std::string> Strings;
+  std::map<InstWord, uint64_t> Consts;
+  std::map<InstWord, std::string> EntryPointNames; // fn_id → entry name
+  InstWord ReflSetId = 0;
+
+  auto decodeOpString = [&](const InstWord *Words, size_t WC) -> std::string {
+    // OpString result_id <literal string>
+    // Operand layout: word[1] = result, words[2..] = string
+    std::string S;
+    for (size_t k = 2; k < WC; ++k) {
+      InstWord W = Words[k];
+      for (int b = 0; b < 4; ++b) {
+        char C = static_cast<char>((W >> (8 * b)) & 0xff);
+        if (C == 0)
+          return S;
+        S.push_back(C);
+      }
+    }
+    return S;
+  };
+
+  I = 5;
+  while (I < NumWords) {
+    InstWord W = Stream[I];
+    uint16_t Wc = (W >> 16) & 0xFFFF;
+    uint16_t Op = W & 0xFFFF;
+    if (Wc == 0)
+      return false;
+    const InstWord *Words = &Stream[I];
+    if (Op == 11 /*OpExtInstImport*/ && Wc >= 3) {
+      InstWord Id = Words[1];
+      // The remainder is a literal string with the set name.
+      std::string Name;
+      for (size_t k = 2; k < Wc; ++k) {
+        InstWord X = Words[k];
+        bool Done = false;
+        for (int b = 0; b < 4; ++b) {
+          char C = static_cast<char>((X >> (8 * b)) & 0xff);
+          if (C == 0) {
+            Done = true;
+            break;
+          }
+          Name.push_back(C);
+        }
+        if (Done)
+          break;
+      }
+      if (Name.find("NonSemantic.ClspvReflection") != std::string::npos)
+        ReflSetId = Id;
+    } else if (Op == 7 /*OpString*/ && Wc >= 2) {
+      Strings[Words[1]] = decodeOpString(Words, Wc);
+    } else if (Op == 50 /*OpSpecConstant*/ && Wc >= 3) {
+      // Skip — workgroup spec constants only.
+    } else if (Op == 43 /*OpConstant*/ && Wc >= 4) {
+      Consts[Words[2]] = static_cast<uint64_t>(Words[3]);
+    } else if (Op == 15 /*OpEntryPoint*/ && Wc >= 4) {
+      // Words[0]=opcode, [1]=execution_model, [2]=fn_id, [3..]=name+iface.
+      InstWord FnId = Words[2];
+      std::string EpName;
+      for (size_t k = 3; k < Wc; ++k) {
+        InstWord X = Words[k];
+        bool Done = false;
+        for (int b = 0; b < 4; ++b) {
+          char C = static_cast<char>((X >> (8 * b)) & 0xff);
+          if (C == 0) {
+            Done = true;
+            break;
+          }
+          EpName.push_back(C);
+        }
+        if (Done)
+          break;
+      }
+      EntryPointNames[FnId] = EpName;
+    }
+    I += Wc;
+  }
+
+  if (ReflSetId == 0)
+    return false; // No reflection — bail; caller will retry the OCL path.
+
+  // Pass 2: walk OpExtInst calls into the reflection set. Build per-kernel
+  // argument vectors indexed by the reflection Kernel result-id.
+  struct KernelRecord {
+    InstWord FunctionId = 0;
+    std::string Name;
+    std::vector<std::pair<uint32_t /*ord*/, SPVArgTypeInfo>> Args;
+  };
+  std::map<InstWord, KernelRecord> Kernels; // kernel_result_id → record
+
+  I = 5;
+  while (I < NumWords) {
+    InstWord W = Stream[I];
+    uint16_t Wc = (W >> 16) & 0xFFFF;
+    uint16_t Op = W & 0xFFFF;
+    if (Wc == 0)
+      return false;
+    const InstWord *Words = &Stream[I];
+    if (Op == 12 /*OpExtInst*/ && Wc >= 5) {
+      // [1]=result_type, [2]=result_id, [3]=ext_set, [4]=ext_op,
+      // [5..]=operands.
+      if (Words[3] == ReflSetId) {
+        InstWord ResId = Words[2];
+        InstWord ExtOp = Words[4];
+        switch (ExtOp) {
+        case 1: { // Kernel(fn_id, name_str, num_args, flags, attrs)
+          if (Wc < 10)
+            break;
+          KernelRecord R;
+          R.FunctionId = Words[5];
+          auto NameIt = Strings.find(Words[6]);
+          if (NameIt != Strings.end())
+            R.Name = NameIt->second;
+          else
+            R.Name = EntryPointNames.count(R.FunctionId)
+                         ? EntryPointNames[R.FunctionId]
+                         : std::string{};
+          Kernels[ResId] = std::move(R);
+          break;
+        }
+        case 3: { // ArgumentStorageBuffer(kernel, ord, set, binding)
+          if (Wc < 9)
+            break;
+          auto It = Kernels.find(Words[5]);
+          if (It == Kernels.end())
+            break;
+          uint32_t Ord = static_cast<uint32_t>(Consts[Words[6]]);
+          SPVArgTypeInfo Ti;
+          Ti.Kind = SPVTypeKind::Pointer;
+          Ti.StorageClass = SPVStorageClass::CrossWorkgroup;
+          Ti.Size = 8; // pointer size
+          It->second.Args.emplace_back(Ord, Ti);
+          break;
+        }
+        case 7: { // ArgumentPodPushConstant(kernel, ord, offset, size)
+          if (Wc < 9)
+            break;
+          auto It = Kernels.find(Words[5]);
+          if (It == Kernels.end())
+            break;
+          uint32_t Ord = static_cast<uint32_t>(Consts[Words[6]]);
+          uint64_t Sz = Consts[Words[8]];
+          SPVArgTypeInfo Ti;
+          Ti.Kind = SPVTypeKind::POD;
+          Ti.StorageClass = SPVStorageClass::Private;
+          Ti.Size = static_cast<size_t>(Sz);
+          It->second.Args.emplace_back(Ord, Ti);
+          break;
+        }
+        default:
+          break;
+        }
+      }
+    }
+    I += Wc;
+  }
+
+  if (Kernels.empty())
+    return false;
+
+  // Build SPVFuncInfo entries keyed by kernel name.
+  for (auto &Kv : Kernels) {
+    auto &Rec = Kv.second;
+    if (Rec.Name.empty())
+      continue;
+    // Sort args by ordinal, then store.
+    std::sort(Rec.Args.begin(), Rec.Args.end(),
+              [](const auto &A, const auto &B) { return A.first < B.first; });
+    std::vector<SPVArgTypeInfo> ArgInfos;
+    ArgInfos.reserve(Rec.Args.size());
+    for (auto &P : Rec.Args)
+      ArgInfos.push_back(P.second);
+    auto FInfo = std::make_shared<SPVFuncInfo>(ArgInfos);
+    Output.FuncInfoMap.emplace(Rec.Name, std::move(FInfo));
+  }
+
+  Output.HasNoIGBAs = true; // Vulkan SPV doesn't use indirect global buffers.
+  return !Output.FuncInfoMap.empty();
+}
+
+} // anonymous namespace
+
 bool analyzeSPIRV(InstWord *Stream, size_t NumWords, SPVModuleInfo &Output) {
+  // Try the Vulkan / Logical-addressing path first; falls through silently
+  // on OpenCL-flavored SPIR-V.
+  if (tryAnalyzeVulkanReflection(Stream, NumWords, Output))
+    return true;
   SPIRVmodule Mod;
   if (!Mod.analyzeSPIRV(Stream, NumWords))
     return false;

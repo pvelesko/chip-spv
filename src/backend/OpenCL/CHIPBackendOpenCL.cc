@@ -1302,8 +1302,44 @@ void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
       }
 
       cl_int CreateErr;
-      Program_ = cl::Program(clCreateProgramWithIL(
-          ChipCtxOcl->get()->get(), ILData, ILSize, &CreateErr));
+      // Detect Vulkan-flavored SPIR-V (Logical addressing, GLSL450 memory
+      // model) emitted by HIPSPV's chipstar-vulkan triple — those go through
+      // clCreateProgramWithBinary so clvk skips its OpenCL→Vulkan clspv
+      // pipeline. OpenCL-flavored SPIR-V uses clCreateProgramWithIL as before.
+      bool IsVulkanSpv = false;
+      if (ILSize >= 5 * 4) {
+        const uint32_t *Words = static_cast<const uint32_t *>(ILData);
+        // Walk to OpMemoryModel (opcode 14). It's near the start.
+        size_t I = 5;
+        size_t NWords = ILSize / 4;
+        while (I < NWords) {
+          uint32_t W = Words[I];
+          uint16_t Wc = (W >> 16) & 0xFFFF;
+          uint16_t Op = W & 0xFFFF;
+          if (Op == 14 && Wc >= 3) {
+            uint32_t AddressingModel = Words[I + 1];
+            // 0 = Logical (Vulkan), 1/2 = Physical32/64 (OpenCL).
+            IsVulkanSpv = (AddressingModel == 0);
+            break;
+          }
+          if (Wc == 0) break;
+          I += Wc;
+        }
+      }
+      if (IsVulkanSpv) {
+        logInfo("Detected Vulkan-flavored SPIR-V; using clCreateProgramWithBinary");
+        cl_device_id Dev = ChipDevOcl->get()->get();
+        size_t LenSz = ILSize;
+        const unsigned char *BinPtr =
+            static_cast<const unsigned char *>(ILData);
+        cl_int BinStatus;
+        Program_ = cl::Program(clCreateProgramWithBinary(
+            ChipCtxOcl->get()->get(), 1, &Dev, &LenSz, &BinPtr, &BinStatus,
+            &CreateErr));
+      } else {
+        Program_ = cl::Program(clCreateProgramWithIL(
+            ChipCtxOcl->get()->get(), ILData, ILSize, &CreateErr));
+      }
       CHIPERR_CHECK_LOG_AND_THROW_TABLE(clCreateProgramWithIL);
       cl_device_id DevId = ChipDevOcl->get()->get();
       auto Flags = ChipEnvVars.hasJitOverride()
