@@ -83,7 +83,17 @@ add_cuda_sample(cuda-histogram  2_Graphics/histogram  histogram_gold.cpp  main.c
 ## 4_Finance
 add_cuda_sample(cuda-binomialoptions  4_Finance/binomialOptions binomialOptions.cpp  binomialOptions_gold.cpp  binomialOptions_kernel.cu)
 add_cuda_sample(cuda-blackscholes  4_Finance/BlackScholes BlackScholes.cu  BlackScholes_gold.cpp)
-add_cuda_sample(cuda-qrng  4_Finance/quasirandomGenerator quasirandomGenerator.cpp  quasirandomGenerator_gold.cpp  quasirandomGenerator_kernel.cu)
+# cuda-qrng: DISABLED on Vulkan/Logical SPIR-V backend.
+# Kernel `inverseCNDKernel` branches on a nullable buffer pointer
+# (`if (d_Input)`); SPIRVLegalizePointerCast aborts with
+# "Unsupported ptrcast user. Please fix." in the backend's logical
+# pointer legalisation. Re-enable once the backend handles the
+# ptrcast user generated from the null-pointer compare on a kernel
+# storage-buffer arg. (Originally reported as a vector_types/
+# helper_cuda.h collision; that turned out to be a separate concern.)
+if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
+  add_cuda_sample(cuda-qrng  4_Finance/quasirandomGenerator quasirandomGenerator.cpp  quasirandomGenerator_gold.cpp  quasirandomGenerator_kernel.cu)
+endif()
 
 ############################
 
