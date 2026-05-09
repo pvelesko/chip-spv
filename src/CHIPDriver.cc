@@ -187,12 +187,16 @@ void CHIPUninitializeCallOnce() {
       if (LegacyQueue) {
         LegacyQueue->finish();
       }
-      if (Dev->isPerThreadStreamUsed()) {
-        auto PerThreadQueue = Dev->getPerThreadDefaultQueue();
-        if (PerThreadQueue) {
-          PerThreadQueue->finish();
-        }
-      }
+      // PerThreadDefaultQueue is a thread_local unique_ptr. By the
+      // time exit handlers run, the main thread's queue may already
+      // have been destroyed by the thread_local destructor (and
+      // worker-thread queues are unreachable from here). Calling
+      // getPerThreadDefaultQueue() here would lazily create a brand
+      // new queue on the dying thread, dereference it, and segfault
+      // (Unit_hipMemset3DAsync_MemsetMaxValue and friends).  Skip the
+      // sync entirely — the user-queue loop above has already drained
+      // every explicit stream, and finishing a default per-thread
+      // stream from the wrong thread never had defined semantics.
     }
 
     // call deallocateDeviceVariables on all devices.
