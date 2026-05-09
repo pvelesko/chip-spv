@@ -1592,6 +1592,13 @@ void chipstar::Context::reset() {
   if (auto *DefaultQ = Dev->getDefaultQueue())
     DefaultQ->finish();
 
+  // Tear down device-side __device__/__constant__ variable allocations and
+  // null their device addresses so a subsequent prepareDeviceVariables call
+  // re-allocates them. Without this the AllocTracker drain below would free
+  // the backing memory while DeviceVar nodes still hold dangling pointers,
+  // and post-reset hipMemcpy{To,From}Symbol crashes (sample
+  // hipTestSymbolReset).
+  Dev->deallocateDeviceVariables();
   // Drain every recorded allocation belonging to this device. AllocatedPtrs_
   // was never populated, so snapshot the AllocationTracker via the public
   // visitor and ensure all device pointers handed to the user become
