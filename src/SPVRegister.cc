@@ -176,6 +176,28 @@ const SPVModule *SPVRegister::getSource(HostPtr Ptr) {
   return getFinalizedSource(IT->second->Parent);
 }
 
+/// Look up the registered byte size of a __device__ / __constant__
+/// variable by its host shadow pointer. Returns std::nullopt when the
+/// pointer is unknown or refers to a kernel rather than a variable.
+std::optional<size_t> SPVRegister::getVariableSize(HostPtr Ptr) {
+  LOCK(Mtx_); // SPVRegister::HostPtrLookup_
+  auto IT = HostPtrLookup_.find(Ptr);
+  if (IT == HostPtrLookup_.end())
+    return std::nullopt;
+  // Variables registered via bindVariable() are SPVVariable instances; the
+  // bindFunction() entries are SPVFunction (no Size field). Distinguish by
+  // checking membership in the parent module's variable list.
+  auto *Obj = IT->second;
+  for (const auto &V : Obj->Parent->Variables)
+    if (&V == Obj)
+      return static_cast<const SPVVariable *>(Obj)->Size;
+  return std::nullopt;
+}
+
+bool SPVRegister::isRegisteredVariable(HostPtr Ptr) {
+  return getVariableSize(Ptr).has_value();
+}
+
 /// Get finalized source module associated with the given Handle.
 const SPVModule *SPVRegister::getSource(SPVRegister::Handle Handle) {
   return getFinalizedSource(reinterpret_cast<SPVModule *>(Handle.Module));

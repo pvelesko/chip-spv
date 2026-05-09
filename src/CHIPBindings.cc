@@ -1405,6 +1405,12 @@ hipError_t hipGraphGetEdges(hipGraph_t graph, hipGraphNode_t *from,
     RETURN(hipSuccess);
   }
 
+  // Mixed null/non-null is invalid (CUDA semantics). The edge-fill mode
+  // requires both arrays. Catch test Unit_hipGraphGetEdges_Negative
+  // exercises the cases where exactly one of from/to is nullptr.
+  if (!from || !to)
+    RETURN(hipErrorInvalidValue);
+
   for (int i = 0; i < Edges.size(); i++) {
     auto Edge = Edges[i];
     auto FromNode = Edge.first;
@@ -2054,6 +2060,34 @@ hipError_t hipGraphMemcpyNodeSetParams1D(hipGraphNode_t node, void *dst,
   CHIP_TRY
   LOCK(ApiMtx);
   CHIPInitialize();
+  if (!node)
+    RETURN(hipErrorInvalidValue);
+  if (!dst || !src)
+    RETURN(hipErrorInvalidValue);
+  if (count == 0)
+    RETURN(hipErrorInvalidValue);
+  // Self-copy and forward-overlapping copies are illegal (Catch test
+  // Unit_hipGraphMemcpyNodeSetParams1D_Negative). A backward overlap (src
+  // ahead of dst) is permitted by HIP.
+  if (dst == src)
+    RETURN(hipErrorInvalidValue);
+  if (dst > src && static_cast<const char *>(src) + count >
+                       static_cast<const char *>(dst))
+    RETURN(hipErrorInvalidValue);
+  // Reject copies that exceed any tracked allocation's size.
+  {
+    auto *AllocTracker = Backend->getActiveDevice()->AllocTracker;
+    auto checkSize = [&](const void *Ptr) -> bool {
+      auto *AI = AllocTracker->getAllocInfo(Ptr);
+      if (!AI)
+        return true; // Untracked (host malloc) - skip the size check.
+      auto BaseAddr = reinterpret_cast<uintptr_t>(AI->DevPtr ? AI->DevPtr
+                                                              : AI->HostPtr);
+      auto Offset = reinterpret_cast<uintptr_t>(Ptr) - BaseAddr;
+      return (Offset + count) <= AI->Size;
+    };
+    if (!checkSize(dst) || !checkSize(src))
+      RETURN(hipErrorInvalidValue);
   auto CastNode = static_cast<CHIPGraphNodeMemcpy *>(node);
   if (!CastNode)
     CHIPERR_LOG_AND_THROW("Node provided failed to cast to CHIPGraphNodeMemcpy",
@@ -2151,7 +2185,26 @@ hipError_t hipGraphMemcpyNodeSetParamsFromSymbol(hipGraphNode_t node, void *dst,
   LOCK(ApiMtx);
   CHIPInitialize();
 
-  if (!node || !dst || !symbol)
+  if (!node)
+    RETURN(hipErrorInvalidValue);
+  if (!symbol)
+    RETURN(hipErrorInvalidSymbol);
+  if (!dst)
+    RETURN(hipErrorInvalidValue);
+  if (count == 0)
+    RETURN(hipErrorInvalidValue);
+  // Validate count/offset against the destination symbol size. Mirrors the
+  // checks in hipGraphMemcpyNodeSetParamsToSymbol; covered by Catch test
+  // Unit_hipGraphMemcpyNodeSetParamsFromSymbol_Negative. Use the
+  // SPVRegister directly so this works before any kernel launches.
+  auto SymSize = getSPVRegister().getVariableSize(HostPtr(symbol));
+  if (SymSize.has_value()) {
+    if (offset + count > *SymSize)
+      RETURN(hipErrorInvalidValue);
+  }
+  if (dst == symbol)
+    RETURN(hipErrorInvalidValue);
+  if (getSPVRegister().isRegisteredVariable(HostPtr(dst)))
     RETURN(hipErrorInvalidValue);
 
   static_cast<CHIPGraphNodeMemcpyFromSymbol *>(node)->setParams(
@@ -2213,8 +2266,43 @@ hipError_t hipGraphMemcpyNodeSetParamsToSymbol(hipGraphNode_t node,
   LOCK(ApiMtx);
   CHIPInitialize();
 
-  if (!node || !symbol || !src)
+  if (!node)
     RETURN(hipErrorInvalidValue);
+  if (!symbol)
+    RETURN(hipErrorInvalidSymbol);
+  if (!src)
+    RETURN(hipErrorInvalidValue);
+  if (count == 0)
+    RETURN(hipErrorInvalidValue);
+  // Resolve the symbol so we can validate count + offset against its size.
+  // Catch test Unit_hipGraphMemcpyNodeSetParamsToSymbol_Negative covers
+  // out-of-range count, offset, self-symbol, and different-symbol-as-src
+  // cases — all expect hipErrorInvalidValue. Use the SPVRegister directly
+  // because the device-side module may not have been compiled yet at the
+  // time the graph is constructed (no kernel launch on these symbols).
+  auto SymSize = getSPVRegister().getVariableSize(HostPtr(symbol));
+  if (SymSize.has_value()) {
+    if (offset + count > *SymSize)
+      RETURN(hipErrorInvalidValue);
+  }
+  if (src == symbol)
+    RETURN(hipErrorInvalidValue);
+  // Reject the case where src is itself a registered global symbol other
+  // than the destination - HIP requires src to be a generic memory pointer.
+  if (getSPVRegister().isRegisteredVariable(HostPtr(src)))
+    RETURN(hipErrorInvalidValue);
+  // For DeviceToDevice copies, src must be a real device allocation. A
+  // plain host malloc / pageable host buffer is invalid (Catch test
+  // "Copy from host ptr to device ptr but pass kind as different").
+  if (kind == hipMemcpyDeviceToDevice) {
+    auto *AllocTracker = Backend->getActiveDevice()->AllocTracker;
+    auto *AI = AllocTracker->getAllocInfo(src);
+    bool IsDeviceAccessible =
+        AI && (AI->MemoryType == hipMemoryTypeDevice ||
+               AI->MemoryType == hipMemoryTypeUnified || AI->isMappedHostAllocation());
+    if (!IsDeviceAccessible)
+      RETURN(hipErrorInvalidValue);
+  }
 
   static_cast<CHIPGraphNodeMemcpyToSymbol *>(node)->setParams(
       const_cast<void *>(src), symbol, count, offset, kind);
