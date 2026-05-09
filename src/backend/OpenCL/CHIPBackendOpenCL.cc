@@ -2048,9 +2048,17 @@ CHIPQueueOpenCL::memCopyAsyncImpl(void *Dst, const void *Src, size_t Size,
 
       case hipMemcpyHostToDevice: {
         auto [DstBuf, DstOffset] = Ctx->translateDevPtrToBuffer(Dst);
-        if (!DstBuf)
-          CHIPERR_LOG_AND_THROW("Invalid destination pointer.",
-                                hipErrorRuntimeMemory);
+        if (!DstBuf) {
+          // Dst is a host pointer (e.g. from hipHostMalloc on a backend
+          // without UVA). Fall back to a plain host memcpy and emit a
+          // marker event so the caller still gets a valid completion.
+          std::memcpy(Dst, Src, Size);
+          clStatus = clEnqueueMarker(
+              get()->get(),
+              std::static_pointer_cast<CHIPEventOpenCL>(Event)->getNativePtr());
+          CHIPERR_CHECK_LOG_AND_THROW_TABLE(clEnqueueMarker);
+          break;
+        }
         logTrace("clEnqueueWriteBuffer {} -> {} / {} B\n", Src, Dst, Size);
         clStatus = ::clEnqueueWriteBuffer(
             get()->get(), DstBuf, CL_FALSE, DstOffset, Size, Src,
@@ -2060,9 +2068,16 @@ CHIPQueueOpenCL::memCopyAsyncImpl(void *Dst, const void *Src, size_t Size,
       }
       case hipMemcpyDeviceToHost: {
         auto [SrcBuf, SrcOffset] = Ctx->translateDevPtrToBuffer(Src);
-        if (!SrcBuf)
-          CHIPERR_LOG_AND_THROW("Invalid source pointer.",
-                                hipErrorRuntimeMemory);
+        if (!SrcBuf) {
+          // Src is a host pointer (e.g. from hipHostMalloc on a backend
+          // without UVA). Fall back to a plain host memcpy.
+          std::memcpy(Dst, Src, Size);
+          clStatus = clEnqueueMarker(
+              get()->get(),
+              std::static_pointer_cast<CHIPEventOpenCL>(Event)->getNativePtr());
+          CHIPERR_CHECK_LOG_AND_THROW_TABLE(clEnqueueMarker);
+          break;
+        }
         logTrace("clEnqueueReadBuffer {} -> {} / {} B\n", Src, Dst, Size);
         clStatus = ::clEnqueueReadBuffer(
             get()->get(), SrcBuf, CL_FALSE, SrcOffset, Size, Dst,
