@@ -5250,13 +5250,18 @@ hipError_t hipMallocArray(hipArray **Array, const hipChannelFormatDesc *Desc,
 
   // Bit-width validity (only 8/16/32 channels supported, plus 0 for unused
   // trailing channels). Unit_hipMallocArray_Negative_BadNumberOfBits expects
-  // hipErrorUnknown.
+  // hipErrorUnknown for any non-{0,8,16,32} bit width and also for the
+  // all-zero descriptor (no usable channels at all).
   auto IsValidChannelBits = [](int Bits) {
     return Bits == 0 || Bits == 8 || Bits == 16 || Bits == 32;
   };
   if (!IsValidChannelBits(Desc->x) || !IsValidChannelBits(Desc->y) ||
       !IsValidChannelBits(Desc->z) || !IsValidChannelBits(Desc->w)) {
     CHIPERR_LOG_AND_THROW("Invalid bit channels", hipErrorUnknown);
+  }
+  if (Desc->x == 0 && Desc->y == 0 && Desc->z == 0 && Desc->w == 0) {
+    CHIPERR_LOG_AND_THROW("Channel descriptor has no non-zero channel",
+                          hipErrorUnknown);
   }
 
   // No channel may be present after a zero-size channel
