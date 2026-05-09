@@ -368,11 +368,25 @@ void CHIPGraphNodeHost::execute(chipstar::Queue *Queue) const {
 
 void CHIPGraphExec::ExtractSubGraphs_() {
   auto Nodes = CompiledGraph_.getNodes();
+  // Track which subgraphs we've already expanded so a self-referencing or
+  // diamond-referenced child graph doesn't blow up here. Without this guard,
+  // a graph that adds itself as a child node (legal CUDA pattern, exercised
+  // by Unit_hipGraphAddChildGraphNode_OrgGraphAsChildGraph) recursively
+  // re-expands its own nodes and hangs the launch.
+  std::set<CHIPGraph *> Expanded;
   for (int i = 0; i < Nodes.size(); i++) {
     auto Node = Nodes[i];
     if (Node->getType() == hipGraphNodeTypeGraph) {
       auto SubGraphNode = static_cast<CHIPGraphNodeGraph *>(Node);
       auto SubGraph = SubGraphNode->getGraph();
+
+      // Self-reference / already-expanded: drop the wrapper and skip
+      // re-injecting nodes (they're already present in the parent).
+      if (SubGraph == OriginalGraph_ || !Expanded.insert(SubGraph).second) {
+        Nodes.erase(Nodes.begin() + i);
+        --i;
+        continue;
+      }
 
       // 1. get all the root nodes
       auto RootNodes = SubGraph->getRootNodes();
