@@ -1580,25 +1580,30 @@ void chipstar::Context::reset() {
 
   auto Dev = getDevice();
 
-  // Properly free all allocations and clean up AllocationTracker
-  for (auto &Ptr : AllocatedPtrs_) {
-    // Get allocation info before freeing
-    chipstar::AllocationInfo *AllocInfo = Dev->AllocTracker->getAllocInfo(Ptr);
-
-    // Free the memory
-    freeImpl(Ptr);
-
-    // Remove from AllocationTracker to prevent double-allocation errors
-    if (AllocInfo) {
-      Dev->AllocTracker->eraseRecord(AllocInfo);
+  // Drain every recorded allocation belonging to this device. AllocatedPtrs_
+  // was never populated, so snapshot the AllocationTracker via the public
+  // visitor and ensure all device pointers handed to the user become
+  // invalid for the post-reset hipFree contract.
+  if (Dev->AllocTracker) {
+    std::vector<chipstar::AllocationInfo *> ToFree;
+    Dev->AllocTracker->visitAllocations(
+        [&](const chipstar::AllocationInfo &Info) {
+          ToFree.push_back(const_cast<chipstar::AllocationInfo *>(&Info));
+        });
+    for (auto *Info : ToFree) {
+      if (Info->MemoryType == hipMemoryTypeHost && Info->HostPtr &&
+          !Info->Flags.isMapped()) {
+        std::free(Info->HostPtr);
+      } else if (Info->DevPtr) {
+        freeImpl(Info->DevPtr);
+      }
+      Dev->AllocTracker->eraseRecord(Info);
     }
+    Dev->AllocTracker->releaseMemReservation(Dev->AllocTracker->TotalMemSize);
   }
-
-  // Free all the memory reservations on each device
-  Dev->AllocTracker->releaseMemReservation(Dev->AllocTracker->TotalMemSize);
   AllocatedPtrs_.clear();
 
-  getDevice()->reset();
+  Dev->reset();
 }
 
 hipError_t chipstar::Context::free(void *Ptr) {

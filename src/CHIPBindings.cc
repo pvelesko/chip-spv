@@ -3665,9 +3665,14 @@ hipError_t hipDeviceReset(void) {
   LOCK(ApiMtx);
   CHIPInitialize();
 
-  chipstar::Device *ChipDev = Backend->getActiveDevice();
-
-  ChipDev->reset();
+  // Per CUDA semantics, hipDeviceReset destroys the primary context's
+  // allocations and restores device state. Reset the context first so
+  // existing allocations are released; then clear device-scope hints.
+  chipstar::Context *ChipCtx = Backend->getActiveContext();
+  if (ChipCtx)
+    ChipCtx->reset();
+  else
+    Backend->getActiveDevice()->reset();
   RETURN(hipSuccess);
   CHIP_CATCH
 }

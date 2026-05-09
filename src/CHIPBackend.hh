@@ -1572,6 +1572,11 @@ public:
    */
   void reset() {
     invalidateDeviceVariables();
+    // Restore device-scope hints to their defaults so a subsequent
+    // hipGetDeviceFlags / hipDeviceGetCacheConfig query reports the
+    // same values it would on a freshly-initialized device.
+    DeviceFlags_ = hipDeviceScheduleAuto;
+    CacheConfig_ = hipFuncCachePreferNone;
     // resetImpl();
   }
 
