@@ -148,7 +148,7 @@ public:
     if (FoundNode != Dependencies_.end()) {
       Dependencies_.erase(FoundNode);
     } else {
-      CHIPERR_LOG_AND_THROW("Failed to find", hipErrorTbd);
+      CHIPERR_LOG_AND_THROW("Failed to find", hipErrorInvalidValue);
     }
   }
 
@@ -611,7 +611,8 @@ public:
   std::vector<CHIPGraphNode *> getRootNodes();
   CHIPGraphNode *getClonedNodeFromOriginal(CHIPGraphNode *OriginalNode) {
     if (!CloneMap_.count(OriginalNode)) {
-      CHIPERR_LOG_AND_THROW("Failed to find the node in clone", hipErrorTbd);
+      CHIPERR_LOG_AND_THROW("Failed to find the node in clone",
+                            hipErrorInvalidValue);
     } else {
       return CloneMap_[OriginalNode];
     }
