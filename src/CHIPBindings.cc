@@ -5142,6 +5142,17 @@ hipError_t hipMalloc3DArray(hipArray **Array,
   if (Depth > 0 && (Flags == hipArrayTextureGather))
     RETURN(hipErrorInvalidValue); */
 
+  // hipArrayTextureGather requires a strictly 2D array (Height!=0 and
+  // Depth==0). Unit_hipMalloc3DArray_Negative_Non2DTextureGather verifies
+  // both 1D-style (Height==0) and 3D-style (Depth!=0) extents are
+  // rejected with hipErrorInvalidValue.
+  if (Flags & hipArrayTextureGather) {
+    if (Height == 0 || Depth != 0)
+      CHIPERR_LOG_AND_THROW(
+          "TextureGather arrays must be 2D (Height>0 and Depth==0)",
+          hipErrorInvalidValue);
+  }
+
   *Array = new hipArray;
   ERROR_IF((*Array == nullptr), hipErrorOutOfMemory);
 
