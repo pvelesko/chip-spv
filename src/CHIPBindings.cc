@@ -2384,8 +2384,30 @@ hipError_t hipGraphExecMemcpyNodeSetParamsFromSymbol(
   LOCK(ApiMtx);
   CHIPInitialize();
 
-  if (!hGraphExec || !node || !dst || !symbol)
+  if (!hGraphExec || !node || !dst)
     RETURN(hipErrorInvalidValue);
+  if (!symbol)
+    RETURN(hipErrorInvalidSymbol);
+  if (count == 0)
+    RETURN(hipErrorInvalidValue);
+  if (dst == symbol)
+    RETURN(hipErrorInvalidValue);
+  if (getSPVRegister().isRegisteredVariable(HostPtr(dst)))
+    RETURN(hipErrorInvalidValue);
+  if (auto SymSize = getSPVRegister().getVariableSize(HostPtr(symbol))) {
+    if (offset + count > *SymSize)
+      RETURN(hipErrorInvalidValue);
+  }
+  if (kind == hipMemcpyHostToDevice || kind == hipMemcpyHostToHost)
+    RETURN(hipErrorInvalidMemcpyDirection);
+  // Reject obvious host/device mismatches: when the user requests
+  // DeviceToDevice the destination must be a tracked device allocation.
+  if (kind == hipMemcpyDeviceToDevice) {
+    auto *Dev = Backend->getActiveDevice();
+    auto *Info = Dev->AllocTracker->getAllocInfoCheckPtrRanges(dst);
+    if (!Info || Info->MemoryType == hipMemoryTypeHost)
+      RETURN(hipErrorInvalidValue);
+  }
 
   // Graph obtained from hipGraphExec_t is a clone of the original
   CHIPGraph *Graph = EXEC(hGraphExec)->getOriginalGraphPtr();
@@ -2395,6 +2417,8 @@ hipError_t hipGraphExecMemcpyNodeSetParamsFromSymbol(
   CHIPGraphNodeMemcpyFromSymbol *ExecKernelNode =
       ((CHIPGraphNodeMemcpyFromSymbol *)GRAPH(Graph)->getClonedNodeFromOriginal(
           KernelNode));
+  if (!ExecKernelNode)
+    RETURN(hipErrorInvalidValue);
 
   ExecKernelNode->setParams(dst, symbol, count, offset, kind);
   RETURN(hipSuccess);
@@ -2481,8 +2505,26 @@ hipError_t hipGraphExecMemcpyNodeSetParamsToSymbol(
   LOCK(ApiMtx);
   CHIPInitialize();
 
-  if (!hGraphExec || !node || !symbol || !src)
+  if (!hGraphExec || !node)
     RETURN(hipErrorInvalidValue);
+  if (!symbol)
+    RETURN(hipErrorInvalidSymbol);
+  if (!src)
+    RETURN(hipErrorInvalidValue);
+  if (count == 0)
+    RETURN(hipErrorInvalidValue);
+  if (src == symbol)
+    RETURN(hipErrorInvalidValue);
+  if (getSPVRegister().isRegisteredVariable(HostPtr(src)))
+    RETURN(hipErrorInvalidValue);
+  if (auto SymSize = getSPVRegister().getVariableSize(HostPtr(symbol))) {
+    if (offset + count > *SymSize)
+      RETURN(hipErrorInvalidValue);
+  }
+  // The destination is always a device-side symbol; reject directions that
+  // imply a host destination.
+  if (kind == hipMemcpyDeviceToHost || kind == hipMemcpyHostToHost)
+    RETURN(hipErrorInvalidMemcpyDirection);
 
   auto ExecNode =
       EXEC(hGraphExec)->findOrLookupNode(NODE(node));
