@@ -5293,14 +5293,13 @@ hipError_t hipMemGetInfo(size_t *Free, size_t *Total) {
   LOCK(ApiMtx);
   CHIPInitialize();
 
-  if (!Free)
-    RETURN(hipErrorInvalidValue);
-
-  if (!Total)
-    RETURN(hipErrorInvalidValue);
-
+  // CUDA/HIP semantics: nullptr arguments are tolerated (no-op for that
+  // out-parameter). NVIDIA returns hipSuccess in that case; AMD ROCm crashes.
+  // chipStar matches the NVIDIA behaviour, which is what HIP catch tests
+  // (Unit_hipMemGetInfo_Negative) and a number of hipMallocArray tests
+  // expect when they pass nullptr for one of the parameters.
   auto Dev = Backend->getActiveDevice();
-  *Total = Dev->getGlobalMemSize();
+  size_t TotalMem = Dev->getGlobalMemSize();
 
   // Ensure the reported free memory accounts for minimum allocation size
   size_t usedMemory = Dev->getUsedGlobalMem();
@@ -5310,9 +5309,12 @@ hipError_t hipMemGetInfo(size_t *Free, size_t *Total) {
     usedMemory = minAllocSize;
 
   // Allocated memory should never exceed total memory.
-  assert(*Total >= usedMemory); 
+  assert(TotalMem >= usedMemory);
 
-  *Free = *Total - usedMemory;
+  if (Total)
+    *Total = TotalMem;
+  if (Free)
+    *Free = TotalMem - usedMemory;
 
   RETURN(hipSuccess);
   CHIP_CATCH
