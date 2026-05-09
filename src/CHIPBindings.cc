@@ -4860,24 +4860,67 @@ hipError_t hipMalloc3DArray(hipArray **Array,
   if (!Desc)
     RETURN(hipErrorInvalidValue);
 
-  // Valid channel layout check - commented as other tests fail due to this
-  // check
-  /*if (Desc->x == 0 ||
-      (Desc->x != 0 && Desc->x != 8 && Desc->x != 16 && Desc->x != 32) ||
-      (Desc->y != 0 && Desc->y != 8 && Desc->y != 16 && Desc->y != 32) ||
-      (Desc->z != 0 && Desc->z != 8 && Desc->z != 16 && Desc->z != 32) ||
-      (Desc->w != 0 && Desc->w != 8 && Desc->w != 16 && Desc->w != 32) ||
-      ((Desc->z == 0) && (Desc->y != 0 && Desc->x != 0 && Desc->w != 0)) ||
-      ((Desc->w == 0) && (Desc->x != 0 || Desc->y != 0 || Desc->z != 0))) {
-    CHIPERR_LOG_AND_THROW("Invalid channel layout", hipErrorInvalidValue);
-  }*/
+  // Bit-width validity (only 8/16/32 channels supported, plus 0 for unused
+  // trailing channels). Tests Unit_hipMalloc3DArray_Negative_BadChannelSize
+  // and friends expect hipErrorInvalidValue on the SPIRV branch.
+  auto Is3DValidChannelBits = [](int Bits) {
+    return Bits == 0 || Bits == 8 || Bits == 16 || Bits == 32;
+  };
+  if (!Is3DValidChannelBits(Desc->x) || !Is3DValidChannelBits(Desc->y) ||
+      !Is3DValidChannelBits(Desc->z) || !Is3DValidChannelBits(Desc->w)) {
+    CHIPERR_LOG_AND_THROW("Invalid bit channels", hipErrorInvalidValue);
+  }
 
-  // Arrays with channels of different size are not allowed. - commented as
-  // other tests fail due to this check
-  /*if(Desc->x != Desc->y || Desc->x != Desc->z || Desc->x != Desc->w){
-    CHIPERR_LOG_AND_THROW("Arrays with channels of different size are not
-  allowed", hipErrorInvalidValue);
-  }*/
+  // No channel may be present after a zero-size channel
+  // (Unit_hipMalloc3DArray_Negative_BadChannelLayout).
+  if ((Desc->x == 0 && (Desc->y != 0 || Desc->z != 0 || Desc->w != 0)) ||
+      (Desc->y == 0 && (Desc->z != 0 || Desc->w != 0)) ||
+      (Desc->z == 0 && Desc->w != 0)) {
+    CHIPERR_LOG_AND_THROW("Channel descriptor has gap", hipErrorInvalidValue);
+  }
+
+  // All non-zero channels must share the same bit size
+  // (Unit_hipMalloc3DArray_Negative_DifferentChannelSizes).
+  {
+    int RefBits = 0;
+    auto Check = [&RefBits](int Bits) {
+      if (Bits == 0)
+        return true;
+      if (RefBits == 0) {
+        RefBits = Bits;
+        return true;
+      }
+      return Bits == RefBits;
+    };
+    if (!Check(Desc->x) || !Check(Desc->y) || !Check(Desc->z) ||
+        !Check(Desc->w)) {
+      CHIPERR_LOG_AND_THROW("Channels of different sizes not supported",
+                            hipErrorInvalidValue);
+    }
+  }
+
+  // 8-bit float channels are not supported
+  // (Unit_hipMalloc3DArray_Negative_8BitFloat).
+  if ((Desc->x == 8 || Desc->y == 8 || Desc->z == 8 || Desc->w == 8) &&
+      Desc->f == hipChannelFormatKindFloat) {
+    CHIPERR_LOG_AND_THROW("8-bit float channels not supported",
+                          hipErrorInvalidValue);
+  }
+
+  // Reject unknown / unsupported flag bits
+  // (Unit_hipMalloc3DArray_Negative_InvalidFlags).
+  {
+    constexpr unsigned int KnownFlags = hipArrayDefault | hipArrayLayered |
+                                        hipArrayCubemap |
+                                        hipArraySurfaceLoadStore |
+                                        hipArrayTextureGather;
+    if (Flags & ~KnownFlags)
+      RETURN(hipErrorInvalidValue);
+    // hipArrayTextureGather is incompatible with the other 3D-only flags.
+    if ((Flags & hipArrayTextureGather) &&
+        (Flags & (hipArraySurfaceLoadStore | hipArrayCubemap)))
+      RETURN(hipErrorInvalidValue);
+  }
 
   auto Width = Extent.width;
   auto Height = Extent.height;
@@ -4885,12 +4928,24 @@ hipError_t hipMalloc3DArray(hipArray **Array,
 
   ERROR_IF((Width == 0), hipErrorInvalidValue);
 
+  // Reject pathologically large extents
+  // (Unit_hipMalloc3DArray_Negative_NumericLimit).
+  {
+    constexpr size_t MaxSafe = std::numeric_limits<size_t>::max() / 2;
+    if (Width >= MaxSafe || Height >= MaxSafe || Depth >= MaxSafe)
+      RETURN(hipErrorInvalidValue);
+  }
+
   // Zero height arrays are only allowed for 1D arrays and layered arrays
   if (Height == 0 && !(Depth == 0 || (Flags & hipArrayLayered)))
     CHIPERR_LOG_AND_THROW(
         "Zero height arrays are only allowed for 1D arrays and layered arrays",
         hipErrorInvalidValue);
 
+  // Texture-gather arrays are 2D only
+  // (Unit_hipMalloc3DArray_Negative_Non2DTextureGather).
+  if ((Flags & hipArrayTextureGather) && (Height == 0 || Depth != 0))
+    RETURN(hipErrorInvalidValue);
   // Check for invalid Height and Depth based on Flags - commented as other
   // tests fail due to this check
   /*if (Flags != hipArrayLayered && Flags != hipArrayCubemap && Height == 0)
