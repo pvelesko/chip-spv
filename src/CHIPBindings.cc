@@ -5663,20 +5663,32 @@ static inline hipError_t hipMemsetInternal(void *Dst, int Value,
     } else if (AllocInfo->MemoryType == hipMemoryTypeHost) {
       logDebug("AllocInfo->MemoryType == hipMemoryTypeHost - executing memset "
                "on host");
-      Backend->getActiveDevice()->getDefaultQueue()->MemMap(
-          AllocInfo, chipstar::Queue::MEM_MAP_TYPE::HOST_WRITE);
-      memset(AllocInfo->HostPtr, Value, SizeBytes);
-      Backend->getActiveDevice()->getDefaultQueue()->MemUnmap(AllocInfo);
+      // MemMap/MemUnmap is only needed for mapped host allocations (SVM-backed
+      // pinned memory). Unmapped host-only allocations (e.g. hipHostMalloc
+      // with flag=0 on a backend without UVA) have a plain host buffer that
+      // memFill / clEnqueueFillBuffer already filled directly, so issuing
+      // MemMap here would throw on backends like BufferDevAddr.
+      if (AllocInfo->isMappedHostAllocation()) {
+        Backend->getActiveDevice()->getDefaultQueue()->MemMap(
+            AllocInfo, chipstar::Queue::MEM_MAP_TYPE::HOST_WRITE);
+        memset(AllocInfo->HostPtr, Value, SizeBytes);
+        Backend->getActiveDevice()->getDefaultQueue()->MemUnmap(AllocInfo);
+      }
     } else if (AllocInfo->MemoryType == hipMemoryTypeManaged) {
       // For managed memory (from hipHostRegister), we need to memset both
       // device and host sides. Device memset is already done above.
       // Host memset ensures the host-accessible memory is also updated.
       logDebug("AllocInfo->MemoryType == hipMemoryTypeManaged - executing "
                "memset on host");
-      Backend->getActiveDevice()->getDefaultQueue()->MemMap(
-          AllocInfo, chipstar::Queue::MEM_MAP_TYPE::HOST_WRITE);
-      memset(AllocInfo->HostPtr, Value, SizeBytes);
-      Backend->getActiveDevice()->getDefaultQueue()->MemUnmap(AllocInfo);
+      // Only issue MemMap when the underlying buffer is SVM-backed; on
+      // backends without SVM (BufferDevAddr) MemMap throws hipErrorTbd. The
+      // device-side memFill above already wrote the host buffer for those.
+      if (AllocInfo->Flags.isMapped()) {
+        Backend->getActiveDevice()->getDefaultQueue()->MemMap(
+            AllocInfo, chipstar::Queue::MEM_MAP_TYPE::HOST_WRITE);
+        memset(AllocInfo->HostPtr, Value, SizeBytes);
+        Backend->getActiveDevice()->getDefaultQueue()->MemUnmap(AllocInfo);
+      }
     } else if (AllocInfo->MemoryType == hipMemoryTypeDevice) {
       CHIPERR_LOG_AND_THROW(
           "hipMemoryTypeDevice can't have an associated HostPtr", hipErrorTbd);
