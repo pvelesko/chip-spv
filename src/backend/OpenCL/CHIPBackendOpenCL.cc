@@ -2807,6 +2807,7 @@ void CHIPBackendOpenCL::initializeImpl() {
     // the chipstarvulkan triple ("uses unknown extension
     // 'SPV_KHR_16bit_storage'").
     const char *Candidates[] = {getenv("clvk_ROOT"), getenv("CLVK_ROOT"),
+                                "/space/pvelesko/install/clvk",
                                 "/usr/local/clvk", "/opt/clvk", nullptr};
     for (const char *Root : Candidates) {
       if (!Root || !*Root)
