@@ -1756,6 +1756,11 @@ hipError_t hipGraphAddKernelNode(hipGraphNode_t *pGraphNode, hipGraph_t graph,
   if (!pNodeParams->kernelParams)
     RETURN(hipErrorInvalidValue);
 
+  for (size_t i = 0; i < numDependencies; i++) {
+    if (!pDependencies[i])
+      RETURN(hipErrorInvalidValue);
+  }
+
   CHIPGraphNodeKernel *Node = new CHIPGraphNodeKernel{pNodeParams};
   Node->addDependencies(DECONST_NODES(pDependencies), numDependencies);
   *pGraphNode = Node;
