@@ -2107,9 +2107,7 @@ hipError_t hipGraphMemcpyNodeGetParams(hipGraphNode_t node,
   if (!pNodeParams)
     RETURN(hipErrorInvalidValue);
 
-  hipMemcpy3DParms Params =
-      static_cast<CHIPGraphNodeMemcpy *>(node)->getParams();
-  pNodeParams = &Params;
+  *pNodeParams = static_cast<CHIPGraphNodeMemcpy *>(node)->getParams();
   RETURN(hipSuccess);
   CHIP_CATCH
 }
