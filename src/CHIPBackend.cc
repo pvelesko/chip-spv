@@ -1580,6 +1580,18 @@ void chipstar::Context::reset() {
 
   auto Dev = getDevice();
 
+  // Wait for any in-flight commands to drain before freeing the underlying
+  // backend storage. Other threads may still hold references to the pointers
+  // we are about to release (Catch test
+  // Unit_hipStreamPerThread_DeviceReset_1 launches detached worker threads
+  // doing async copies while the main thread calls reset).
+  for (auto *Q : Dev->getQueuesNoLock()) {
+    if (Q)
+      Q->finish();
+  }
+  if (auto *DefaultQ = Dev->getDefaultQueue())
+    DefaultQ->finish();
+
   // Drain every recorded allocation belonging to this device. AllocatedPtrs_
   // was never populated, so snapshot the AllocationTracker via the public
   // visitor and ensure all device pointers handed to the user become
