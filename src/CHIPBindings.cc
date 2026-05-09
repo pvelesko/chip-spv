@@ -5456,15 +5456,15 @@ hipError_t hipMemsetAsync(void *Dst, int Value, size_t SizeBytes,
   if (!SizeBytes)
     return hipSuccess;
 
-  // Validate destination pointer is a known device-accessible allocation.
-  // Forward-declared helper defined alongside the synchronous hipMemset
-  // family.
+  // Validate destination pointer is a known allocation. The validate helper
+  // is defined later in the file (alongside the synchronous hipMemset
+  // family), so the same logic is inlined here.
   if (!Dst)
     RETURN(hipErrorInvalidValue);
   {
     auto *AllocTracker = Backend->getActiveDevice()->AllocTracker;
     const auto *AI = AllocTracker->getAllocInfo(Dst);
-    if (!AI || !AI->isDeviceAccessible())
+    if (!AI)
       RETURN(hipErrorInvalidValue);
   }
 
@@ -5691,18 +5691,19 @@ static inline hipError_t hipMemsetInternal(void *Dst, int Value,
 }
 
 // Helper used by hipMemset / hipMemsetAsync / hipMemsetD8/D16/D32(_Async):
-// validate that Dst is a known device-accessible allocation. Returns
+// validate that Dst is a known allocation tracked by chipStar. Returns
 // hipErrorInvalidValue when it is not. Catch tests
 // Unit_hipMemset_Negative_InvalidPtr exercise this path with uninitialized
 // garbage / nullptr / host pointers and expect hipErrorInvalidValue rather
 // than the underlying CL_INVALID_VALUE which surfaces as
-// hipErrorInvalidHandle.
+// hipErrorInvalidHandle. We accept both device and host (hipHostMalloc)
+// allocations because the functional memset tests target either.
 static inline hipError_t validateDevicePtrForMemset(hipDeviceptr_t Dst) {
   if (!Dst)
     return hipErrorInvalidValue;
   auto *AllocTracker = Backend->getActiveDevice()->AllocTracker;
   const auto *AI = AllocTracker->getAllocInfo(Dst);
-  if (!AI || !AI->isDeviceAccessible())
+  if (!AI)
     return hipErrorInvalidValue;
   return hipSuccess;
 }
