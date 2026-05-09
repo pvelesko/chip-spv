@@ -2088,6 +2088,7 @@ hipError_t hipGraphMemcpyNodeSetParams1D(hipGraphNode_t node, void *dst,
     };
     if (!checkSize(dst) || !checkSize(src))
       RETURN(hipErrorInvalidValue);
+  }
   auto CastNode = static_cast<CHIPGraphNodeMemcpy *>(node);
   if (!CastNode)
     CHIPERR_LOG_AND_THROW("Node provided failed to cast to CHIPGraphNodeMemcpy",
@@ -5557,15 +5558,21 @@ hipError_t hipMemsetAsync(void *Dst, int Value, size_t SizeBytes,
   if (!SizeBytes)
     return hipSuccess;
 
-  // Validate destination pointer is a known allocation. The validate helper
-  // is defined later in the file (alongside the synchronous hipMemset
-  // family), so the same logic is inlined here.
+  // Validate destination pointer and that the requested fill range fits
+  // inside the underlying allocation. The validate helper is defined later
+  // alongside the synchronous hipMemset family, so the same logic is
+  // inlined here.
   if (!Dst)
     RETURN(hipErrorInvalidValue);
   {
     auto *AllocTracker = Backend->getActiveDevice()->AllocTracker;
     const auto *AI = AllocTracker->getAllocInfo(Dst);
     if (!AI)
+      RETURN(hipErrorInvalidValue);
+    auto BaseAddr = reinterpret_cast<uintptr_t>(AI->DevPtr ? AI->DevPtr
+                                                            : AI->HostPtr);
+    auto Offset = reinterpret_cast<uintptr_t>(Dst) - BaseAddr;
+    if (Offset + SizeBytes > AI->Size)
       RETURN(hipErrorInvalidValue);
   }
 
@@ -5646,8 +5653,11 @@ static inline hipError_t hipMemset3DAsyncInternal(hipPitchedPtr PitchedDevPtr,
   if (!PitchedDevPtr.ptr)
     RETURN(hipErrorInvalidValue);
 
+  // Treat a nullptr stream as the default queue (HIP default-stream
+  // semantics). The public hipMemset3DAsync entry point already maps
+  // null -> default; this handles direct internal callers as well.
   if (!Stream)
-    RETURN(hipErrorInvalidValue);
+    Stream = Backend->getActiveDevice()->getDefaultQueue();
 
   auto ChipQueue = Backend->findQueue(static_cast<chipstar::Queue *>(Stream));
   LOCK(ChipQueue->QueueMtx);
@@ -5702,8 +5712,12 @@ hipError_t hipMemset3DAsync(hipPitchedPtr PitchedDevPtr, int Value,
   if (!PitchedDevPtr.ptr)
     RETURN(hipErrorInvalidValue);
 
+  // A nullptr stream argument refers to the default (legacy) stream, which
+  // is a valid value. Catch test
+  // Unit_hipMemset3D_Negative_OutOfBounds (Extent Equal to 0) passes
+  // nullStream and expects hipSuccess.
   if (!Stream)
-    RETURN(hipErrorInvalidValue);
+    Stream = Backend->getActiveDevice()->getDefaultQueue();
 
   if (Extent.height > PitchedDevPtr.ysize ||
       Extent.width > PitchedDevPtr.xsize || Extent.depth > PitchedDevPtr.pitch)
@@ -5811,13 +5825,26 @@ static inline hipError_t hipMemsetInternal(void *Dst, int Value,
 // than the underlying CL_INVALID_VALUE which surfaces as
 // hipErrorInvalidHandle. We accept both device and host (hipHostMalloc)
 // allocations because the functional memset tests target either.
-static inline hipError_t validateDevicePtrForMemset(hipDeviceptr_t Dst) {
+//
+// When SizeBytes is non-zero, also validate that the requested fill range
+// fits inside the allocation. Catch test
+// Unit_hipMemset_Negative_OutOfBoundsSize calls hipMemset with a size that
+// exceeds the underlying buffer and expects hipErrorInvalidValue.
+static inline hipError_t validateDevicePtrForMemset(hipDeviceptr_t Dst,
+                                                    size_t SizeBytes = 0) {
   if (!Dst)
     return hipErrorInvalidValue;
   auto *AllocTracker = Backend->getActiveDevice()->AllocTracker;
   const auto *AI = AllocTracker->getAllocInfo(Dst);
   if (!AI)
     return hipErrorInvalidValue;
+  if (SizeBytes) {
+    auto BaseAddr = reinterpret_cast<uintptr_t>(AI->DevPtr ? AI->DevPtr
+                                                            : AI->HostPtr);
+    auto Offset = reinterpret_cast<uintptr_t>(Dst) - BaseAddr;
+    if (Offset + SizeBytes > AI->Size)
+      return hipErrorInvalidValue;
+  }
   return hipSuccess;
 }
 
@@ -5828,7 +5855,7 @@ hipError_t hipMemset(void *Dst, int Value, size_t SizeBytes) {
   if (!SizeBytes)
     return hipSuccess;
 
-  if (auto Err = validateDevicePtrForMemset(Dst); Err != hipSuccess)
+  if (auto Err = validateDevicePtrForMemset(Dst, SizeBytes); Err != hipSuccess)
     RETURN(Err);
 
   RETURN(hipMemsetInternal(Dst, Value, SizeBytes));
@@ -5844,7 +5871,7 @@ hipError_t hipMemsetD8Async(hipDeviceptr_t Dest, unsigned char Value,
   if (!Count)
     return hipSuccess;
 
-  if (auto Err = validateDevicePtrForMemset(Dest); Err != hipSuccess)
+  if (auto Err = validateDevicePtrForMemset(Dest, Count); Err != hipSuccess)
     RETURN(Err);
 
   auto ChipQueue = Backend->findQueue(static_cast<chipstar::Queue *>(Stream));
@@ -5873,7 +5900,7 @@ hipError_t hipMemsetD8(hipDeviceptr_t Dest, unsigned char Value,
   if (!SizeBytes)
     return hipSuccess;
 
-  if (auto Err = validateDevicePtrForMemset(Dest); Err != hipSuccess)
+  if (auto Err = validateDevicePtrForMemset(Dest, SizeBytes); Err != hipSuccess)
     RETURN(Err);
 
   RETURN(hipMemsetInternal(Dest, Value, SizeBytes));
@@ -5888,7 +5915,7 @@ hipError_t hipMemsetD16Async(hipDeviceptr_t Dest, unsigned short Value,
   if (!Count)
     return hipSuccess;
 
-  if (auto Err = validateDevicePtrForMemset(Dest); Err != hipSuccess)
+  if (auto Err = validateDevicePtrForMemset(Dest, 2 * Count); Err != hipSuccess)
     RETURN(Err);
 
   auto ChipQueue = Backend->findQueue(static_cast<chipstar::Queue *>(Stream));
@@ -5916,7 +5943,7 @@ hipError_t hipMemsetD16(hipDeviceptr_t Dest, unsigned short Value,
   if (!Count)
     return hipSuccess;
 
-  if (auto Err = validateDevicePtrForMemset(Dest); Err != hipSuccess)
+  if (auto Err = validateDevicePtrForMemset(Dest, 2 * Count); Err != hipSuccess)
     RETURN(Err);
 
   Backend->getActiveDevice()->getDefaultQueue()->memFill(Dest, 2 * Count,
@@ -5934,7 +5961,7 @@ hipError_t hipMemsetD32Async(hipDeviceptr_t Dst, int Value, size_t Count,
   if (!Count)
     return hipSuccess;
 
-  if (auto Err = validateDevicePtrForMemset(Dst); Err != hipSuccess)
+  if (auto Err = validateDevicePtrForMemset(Dst, 4 * Count); Err != hipSuccess)
     RETURN(Err);
 
   auto ChipQueue = Backend->findQueue(static_cast<chipstar::Queue *>(Stream));
@@ -5962,7 +5989,7 @@ hipError_t hipMemsetD32(hipDeviceptr_t Dst, int Value, size_t Count) {
   if (!Count)
     return hipSuccess;
 
-  if (auto Err = validateDevicePtrForMemset(Dst); Err != hipSuccess)
+  if (auto Err = validateDevicePtrForMemset(Dst, 4 * Count); Err != hipSuccess)
     RETURN(Err);
 
   Backend->getActiveDevice()->getDefaultQueue()->memFill(Dst, 4 * Count, &Value,
