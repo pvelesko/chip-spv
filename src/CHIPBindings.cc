@@ -3134,9 +3134,27 @@ hipError_t hipStreamEndCapture(hipStream_t stream, hipGraph_t *pGraph) {
       hipStreamCaptureStatus::hipStreamCaptureStatusActive)
     RETURN(hipErrorInvalidValue);
 
+  unsigned long long EndedCaptureId = ChipQueue->getCaptureId();
   ChipQueue->setCaptureStatus(
       hipStreamCaptureStatus::hipStreamCaptureStatusNone);
   ChipQueue->setCaptureId(0);
+
+  // Reset capture state on every other queue that joined this capture via
+  // hipStreamWaitEvent so a subsequent hipStreamBeginCapture on those
+  // streams is accepted (Unit_hipStreamBeginCapture_streamReuse). We keyed
+  // each forked queue's CaptureId to the same value during propagation;
+  // anything still tagged with EndedCaptureId belongs to this capture.
+  if (EndedCaptureId != 0) {
+    for (auto *Q :
+         Backend->getActiveDevice()->getQueuesNoLock()) {
+      if (!Q || Q == ChipQueue)
+        continue;
+      if (Q->getCaptureId() == EndedCaptureId) {
+        Q->setCaptureStatus(hipStreamCaptureStatus::hipStreamCaptureStatusNone);
+        Q->setCaptureId(0);
+      }
+    }
+  }
 
   if (ChipQueue->getCaptureGraph())
     *pGraph = ChipQueue->getCaptureGraph();
@@ -4381,10 +4399,14 @@ hipError_t hipStreamWaitEventInternal(hipStream_t Stream, hipEvent_t Event,
   // Capture-propagation: if the event was recorded by a capturing stream and
   // the destination stream is not yet capturing, mark it active so a later
   // hipStreamBeginCapture on this stream is rejected as already capturing
-  // (Unit_hipStreamBeginCapture_DetectingInvalidCapture).
+  // (Unit_hipStreamBeginCapture_DetectingInvalidCapture). Also propagate the
+  // recording stream's CaptureId so EndCapture can find this fork and
+  // release it (Unit_hipStreamBeginCapture_streamReuse).
   if (ChipEvent && ChipEvent->wasRecordedFromCapturingStream() &&
       ChipQueue->getCaptureStatus() == hipStreamCaptureStatusNone) {
     ChipQueue->setCaptureStatus(hipStreamCaptureStatusActive);
+    if (auto RecordedId = ChipEvent->getRecordedCaptureId())
+      ChipQueue->setCaptureId(RecordedId);
   }
   if (ChipQueue->captureIntoGraph<CHIPGraphNodeWaitEvent>(ChipEvent)) {
     return hipSuccess;
@@ -4593,6 +4615,8 @@ hipError_t hipEventRecordInternal(hipEvent_t Event, hipStream_t Stream) {
   bool QueueCapturing =
       ChipQueue->getCaptureStatus() == hipStreamCaptureStatusActive;
   ChipEvent->setRecordedFromCapturingStream(QueueCapturing);
+  ChipEvent->setRecordedCaptureId(QueueCapturing ? ChipQueue->getCaptureId()
+                                                  : 0);
   if (ChipQueue->captureIntoGraph<CHIPGraphNodeEventRecord>(ChipEvent)) {
     return hipSuccess;
   }

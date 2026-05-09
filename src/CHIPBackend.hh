@@ -722,6 +722,10 @@ protected:
   // hipStreamBeginCapture on that stream is rejected (matching CUDA's
   // capture-propagation contract). Cleared when the event is reset.
   bool RecordedFromCapturingStream_ = false;
+  // CaptureId of the stream that recorded this event when capturing. Zero
+  // when the event was recorded outside of a capture. Propagated to a
+  // forked stream via hipStreamWaitEvent so EndCapture can reset that fork.
+  unsigned long long RecordedCaptureId_ = 0;
 
   /**
    * @brief Events are always created with a context
@@ -754,6 +758,10 @@ public:
   void setRecordedFromCapturingStream(bool Val) {
     RecordedFromCapturingStream_ = Val;
   }
+  unsigned long long getRecordedCaptureId() const {
+    return RecordedCaptureId_;
+  }
+  void setRecordedCaptureId(unsigned long long Id) { RecordedCaptureId_ = Id; }
   /// @brief Add an event on which this event depends, preventing that event
   /// from getting recycled
   /// @param Event
