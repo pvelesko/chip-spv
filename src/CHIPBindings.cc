@@ -1349,9 +1349,29 @@ hipError_t hipGraphGetNodes(hipGraph_t graph, hipGraphNode_t *nodes,
   CHIP_TRY
   LOCK(ApiMtx);
   CHIPInitialize();
+
+  if (!graph)
+    RETURN(hipErrorInvalidValue);
+
+  if (!numNodes)
+    RETURN(hipErrorInvalidValue);
+
   auto Nodes = GRAPH(graph)->getNodes();
-  *nodes = *(Nodes.data());
-  *numNodes = GRAPH(graph)->getNodes().size();
+  if (!nodes) {
+    // Query mode: report the count only.
+    *numNodes = Nodes.size();
+    RETURN(hipSuccess);
+  }
+
+  // Fill up to *numNodes entries; remaining slots are nulled out, and
+  // *numNodes is updated to the actual count returned.
+  size_t Cap = *numNodes;
+  size_t N = std::min(Cap, Nodes.size());
+  for (size_t i = 0; i < N; i++)
+    nodes[i] = Nodes[i];
+  for (size_t i = N; i < Cap; i++)
+    nodes[i] = nullptr;
+  *numNodes = N;
   RETURN(hipSuccess);
   CHIP_CATCH
 }
@@ -1361,9 +1381,27 @@ hipError_t hipGraphGetRootNodes(hipGraph_t graph, hipGraphNode_t *pRootNodes,
   CHIP_TRY
   LOCK(ApiMtx);
   CHIPInitialize();
+
+  if (!graph)
+    RETURN(hipErrorInvalidValue);
+
+  if (!pNumRootNodes)
+    RETURN(hipErrorInvalidValue);
+
   auto Nodes = GRAPH(graph)->getRootNodes();
-  *pRootNodes = *(Nodes.data());
-  *pNumRootNodes = GRAPH(graph)->getNodes().size();
+  if (!pRootNodes) {
+    // Query mode: report the count only.
+    *pNumRootNodes = Nodes.size();
+    RETURN(hipSuccess);
+  }
+
+  size_t Cap = *pNumRootNodes;
+  size_t N = std::min(Cap, Nodes.size());
+  for (size_t i = 0; i < N; i++)
+    pRootNodes[i] = Nodes[i];
+  for (size_t i = N; i < Cap; i++)
+    pRootNodes[i] = nullptr;
+  *pNumRootNodes = N;
   RETURN(hipSuccess);
   CHIP_CATCH
 }
