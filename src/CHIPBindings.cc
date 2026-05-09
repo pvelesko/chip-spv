@@ -1338,6 +1338,19 @@ hipError_t hipGraphAddDependencies(hipGraph_t graph, const hipGraphNode_t *from,
     CHIPGraphNode *FromNode = GRAPH(graph)->findNode(NODE(from[i]));
     if (!FromNode)
       RETURN(hipErrorInvalidValue);
+    // Reject self-dependency: a node cannot depend on itself. CUDA's
+    // cudaGraphAddDependencies returns cudaErrorInvalidValue in this case
+    // (Catch test Unit_hipGraphAddDependencies_NegTest "Same Node
+    // Dependencies").
+    if (FromNode == ToNode)
+      RETURN(hipErrorInvalidValue);
+    // Reject duplicate dependency: the same edge cannot be added twice
+    // (Catch test Unit_hipGraphAddDependencies_NegTest "Duplicate
+    // Dependencies").
+    const auto &ExistingDeps = ToNode->getDependencies();
+    if (std::find(ExistingDeps.begin(), ExistingDeps.end(), FromNode) !=
+        ExistingDeps.end())
+      RETURN(hipErrorInvalidValue);
     ToNode->addDependency(FromNode);
   }
   RETURN(hipSuccess);
