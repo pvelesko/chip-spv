@@ -299,12 +299,16 @@ public:
 
 class CHIPGraphNodeMemcpy : public CHIPGraphNode {
 private:
-  hipMemcpy3DParms Params_;
+  hipMemcpy3DParms Params_{};
 
-  void *Dst_;
-  const void *Src_;
-  size_t Count_;
-  hipMemcpyKind Kind_;
+  // Default-initialize so the 3D-Params constructors don't leave these
+  // members holding indeterminate values; execute() uses (Dst_ && Src_)
+  // to discriminate between the 1D and 3D code paths and would otherwise
+  // dereference garbage when constructed via the hipMemcpy3DParms ctors.
+  void *Dst_ = nullptr;
+  const void *Src_ = nullptr;
+  size_t Count_ = 0;
+  hipMemcpyKind Kind_ = hipMemcpyDefault;
 
 public:
   CHIPGraphNodeMemcpy(const CHIPGraphNodeMemcpy &Other)
