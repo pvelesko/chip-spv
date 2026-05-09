@@ -332,6 +332,11 @@ public:
 
   hipMemcpy3DParms getParams() { return Params_; }
 
+  // 1D-path accessor: returns hipMemcpyDefault for nodes constructed via
+  // the 3D-Params path. Used by hipGraphExecMemcpyNodeSetParams1D to enforce
+  // the CUDA contract that the copy direction cannot change after instantiation.
+  hipMemcpyKind get1DKind() const { return Kind_; }
+  bool is1D() const { return (Dst_ != nullptr) || (Src_ != nullptr); }
   // 1D MemCpy
   void setParams(void *Dst, const void *Src, size_t Count, hipMemcpyKind Kind) {
     Dst_ = Dst;

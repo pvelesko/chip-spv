@@ -2308,6 +2308,15 @@ hipError_t hipGraphExecMemcpyNodeSetParams1D(hipGraphExec_t hGraphExec,
     CHIPERR_LOG_AND_THROW("Node provided failed to cast to CHIPGraphNodeMemcpy",
                           hipErrorInvalidValue);
 
+  // CUDA contract: hipGraphExecMemcpyNodeSetParams1D may not change the copy
+  // direction after instantiation. Allow only the original kind or
+  // hipMemcpyDefault (which infers direction from pointer attributes).
+  if (CastNode->is1D()) {
+    hipMemcpyKind OrigKind = CastNode->get1DKind();
+    if (kind != hipMemcpyDefault && OrigKind != hipMemcpyDefault &&
+        kind != OrigKind)
+      RETURN(hipErrorInvalidValue);
+  }
   CastNode->setParams(dst, src, count, kind);
   RETURN(hipSuccess);
   CHIP_CATCH
