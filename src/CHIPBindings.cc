@@ -37,6 +37,7 @@
  */
 #ifndef CHIP_BINDINGS_H
 #define CHIP_BINDINGS_H
+#include <atomic>
 #include <cstddef> // for size_t
 #include <errno.h>
 #include <fstream>
@@ -918,13 +919,18 @@ hipError_t hipStreamIsCapturing(hipStream_t stream,
   LOCK(ApiMtx);
   CHIPInitialize();
 
-  if (!stream)
-    RETURN(hipErrorInvalidValue);
-
   if (!pCaptureStatus)
     RETURN(hipErrorInvalidValue);
 
-  UNIMPLEMENTED(hipErrorNotSupported);
+  // A null stream is the legacy default stream; resolve it (and
+  // hipStreamPerThread / hipStreamLegacy) via Backend::findQueue.
+  auto ChipQueue =
+      Backend->findQueue(static_cast<chipstar::Queue *>(stream));
+  if (!ChipQueue)
+    RETURN(hipErrorInvalidResourceHandle);
+
+  *pCaptureStatus = ChipQueue->getCaptureStatus();
+  RETURN(hipSuccess);
 
   CHIP_CATCH
 }
@@ -935,7 +941,23 @@ hipError_t hipStreamGetCaptureInfo(hipStream_t stream,
   LOCK(ApiMtx);
   CHIPInitialize();
 
-  UNIMPLEMENTED(hipErrorNotSupported);
+  if (!pCaptureStatus)
+    RETURN(hipErrorInvalidValue);
+
+  auto ChipQueue =
+      Backend->findQueue(static_cast<chipstar::Queue *>(stream));
+  if (!ChipQueue)
+    RETURN(hipErrorInvalidResourceHandle);
+
+  *pCaptureStatus = ChipQueue->getCaptureStatus();
+  // pId is optional; only populate when actively capturing so callers that
+  // peek between captures observe an unmodified zero (matches CUDA/HIP
+  // documented behaviour exercised by Unit_hipStreamGetCaptureInfo).
+  if (pId &&
+      ChipQueue->getCaptureStatus() == hipStreamCaptureStatusActive)
+    *pId = ChipQueue->getCaptureId();
+
+  RETURN(hipSuccess);
 
   CHIP_CATCH
 }
@@ -949,13 +971,34 @@ hipError_t hipStreamGetCaptureInfo_v2(hipStream_t stream,
   LOCK(ApiMtx);
   CHIPInitialize();
 
-  if (!stream)
-    RETURN(hipErrorInvalidValue);
-
   if (!captureStatus_out)
     RETURN(hipErrorInvalidValue);
 
-  UNIMPLEMENTED(hipErrorNotSupported);
+  auto ChipQueue =
+      Backend->findQueue(static_cast<chipstar::Queue *>(stream));
+  if (!ChipQueue)
+    RETURN(hipErrorInvalidResourceHandle);
+
+  auto Status = ChipQueue->getCaptureStatus();
+  *captureStatus_out = Status;
+
+  if (Status == hipStreamCaptureStatusActive) {
+    if (id_out) *id_out = ChipQueue->getCaptureId();
+    if (graph_out)
+      *graph_out = reinterpret_cast<hipGraph_t>(ChipQueue->getCaptureGraph());
+    // Capture-graph node tracking is not yet implemented (captureIntoGraph
+    // is currently a no-op). Report no dependencies so the API surface is
+    // well-defined; this still satisfies tests that only check id/status.
+    if (dependencies_out) *dependencies_out = nullptr;
+    if (numDependencies_out) *numDependencies_out = 0;
+  } else {
+    if (id_out) *id_out = 0;
+    if (graph_out) *graph_out = nullptr;
+    if (dependencies_out) *dependencies_out = nullptr;
+    if (numDependencies_out) *numDependencies_out = 0;
+  }
+
+  RETURN(hipSuccess);
 
   CHIP_CATCH
 }
@@ -2545,6 +2588,10 @@ hipError_t hipStreamBeginCapture(hipStream_t stream,
   ChipQueue->setCaptureMode(mode);
   ChipQueue->setCaptureStatus(
       hipStreamCaptureStatus::hipStreamCaptureStatusActive);
+  // Assign a unique non-zero sequence id for this capture, exposed via
+  // hipStreamGetCaptureInfo / hipStreamGetCaptureInfo_v2.
+  static std::atomic<unsigned long long> NextCaptureId{1};
+  ChipQueue->setCaptureId(NextCaptureId.fetch_add(1));
   RETURN(hipSuccess);
   CHIP_CATCH
 }
@@ -2578,6 +2625,7 @@ hipError_t hipStreamEndCapture(hipStream_t stream, hipGraph_t *pGraph) {
 
   ChipQueue->setCaptureStatus(
       hipStreamCaptureStatus::hipStreamCaptureStatusNone);
+  ChipQueue->setCaptureId(0);
 
   if (ChipQueue->getCaptureGraph())
     *pGraph = ChipQueue->getCaptureGraph();

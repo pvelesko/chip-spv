@@ -2129,6 +2129,10 @@ protected:
   hipStreamCaptureStatus CaptureStatus_ = hipStreamCaptureStatusNone;
   hipStreamCaptureMode CaptureMode_ = hipStreamCaptureModeGlobal;
   hipGraph_t CaptureGraph_;
+  /// Unique non-zero capture sequence ID assigned at hipStreamBeginCapture
+  /// and cleared (to 0) at hipStreamEndCapture. Reported by
+  /// hipStreamGetCaptureInfo / hipStreamGetCaptureInfo_v2.
+  unsigned long long CaptureId_ = 0;
   /// @brief  node for creating a dependency chain between subsequent record
   /// events when in graph capture mode
   CHIPGraphNode *LastNode_ = nullptr;
@@ -2295,6 +2299,8 @@ public:
   void setCaptureMode(hipStreamCaptureMode CaptureMode) {
     CaptureMode_ = CaptureMode;
   }
+  unsigned long long getCaptureId() const { return CaptureId_; }
+  void setCaptureId(unsigned long long Id) { CaptureId_ = Id; }
   CHIPGraph *getCaptureGraph() const;
 
   chipstar::Device *PerThreadQueueForDevice = nullptr;
