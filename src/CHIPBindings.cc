@@ -1757,8 +1757,19 @@ hipError_t hipGraphInstantiateWithFlags(hipGraphExec_t *pGraphExec,
   if (!graph)
     RETURN(hipErrorInvalidValue);
 
-  // flags not yet defined in HIP API.
-  UNIMPLEMENTED(hipErrorNotSupported);
+  // Only hipGraphInstantiateFlagAutoFreeOnLaunch (=1) is currently
+  // recognized by HIP. Treat it as a no-op hint and reject anything
+  // outside that mask, matching the test contract
+  // (Unit_hipGraphInstantiateWithFlags_Negative passes flag=10 and
+  // expects InvalidValue).
+  constexpr unsigned long long kValidFlagMask = 0x1ULL;
+  if (flags & ~kValidFlagMask)
+    RETURN(hipErrorInvalidValue);
+
+  CHIPGraphExec *GraphExec = new CHIPGraphExec(GRAPH(graph));
+  *pGraphExec = GraphExec;
+
+  RETURN(hipSuccess);
   CHIP_CATCH
 }
 
