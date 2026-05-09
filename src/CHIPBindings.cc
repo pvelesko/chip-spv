@@ -547,7 +547,33 @@ hipError_t hipDeviceGetUuid(hipUUID *uuid, hipDevice_t device) {
   if (device < 0 || device >= Backend->getNumDevices())
     RETURN(hipErrorInvalidDevice);
 
-  UNIMPLEMENTED(hipErrorNotSupported);
+  // chipStar lacks a hardware UUID for the underlying OpenCL/L0/Vulkan
+  // device; synthesize a stable, deterministic, non-empty UUID derived from
+  // the device name and index.
+  std::memset(uuid->bytes, 0, sizeof(uuid->bytes));
+  const std::string Name = Backend->getDevices()[device]->getName();
+  uint64_t Hash = 1469598103934665603ULL; // FNV-1a 64-bit
+  for (char C : Name) {
+    Hash ^= static_cast<uint8_t>(C);
+    Hash *= 1099511628211ULL;
+  }
+  Hash ^= static_cast<uint64_t>(device);
+  Hash *= 1099511628211ULL;
+  for (int I = 0; I < 8; ++I) {
+    uint8_t B = static_cast<uint8_t>((Hash >> (I * 8)) & 0xFF);
+    if (B == 0)
+      B = 1;
+    uuid->bytes[I] = static_cast<char>(B);
+  }
+  uuid->bytes[8] = 'C';
+  uuid->bytes[9] = 'H';
+  uuid->bytes[10] = 'I';
+  uuid->bytes[11] = 'P';
+  uuid->bytes[12] = static_cast<char>(0x80 | (device & 0x7F));
+  uuid->bytes[13] = 0x01;
+  uuid->bytes[14] = 0x02;
+  uuid->bytes[15] = 0x03;
+  RETURN(hipSuccess);
 
   CHIP_CATCH
 }
@@ -780,7 +806,36 @@ hipError_t hipMemAllocPitch(hipDeviceptr_t *dptr, size_t *pitch,
   if (height == std::numeric_limits<size_t>::max())
     RETURN(hipErrorOutOfMemory);
 
-  UNIMPLEMENTED(hipErrorNotSupported);
+  // elementSizeBytes must be 4, 8, or 16 per the CUDA/HIP spec.
+  if (elementSizeBytes != 4 && elementSizeBytes != 8 && elementSizeBytes != 16)
+    RETURN(hipErrorInvalidValue);
+
+  if (widthInBytes == 0 || height == 0) {
+    *dptr = nullptr;
+    *pitch = 0;
+    RETURN(hipSuccess);
+  }
+
+  // Round the pitch up to a multiple of elementSizeBytes and SVM_ALIGNMENT
+  // so that rows are properly aligned for vectorized accesses of the
+  // requested element size.
+  size_t Alignment = std::max<size_t>(elementSizeBytes, SVM_ALIGNMENT);
+  size_t CandidatePitch = roundUp(widthInBytes, Alignment);
+
+  // Detect overflow on pitch * height before calling the allocator.
+  if (CandidatePitch != 0 &&
+      height > std::numeric_limits<size_t>::max() / CandidatePitch)
+    RETURN(hipErrorOutOfMemory);
+
+  size_t SizeBytes = CandidatePitch * height;
+
+  void *RetVal = Backend->getActiveContext()->allocate(
+      SizeBytes, hipMemoryType::hipMemoryTypeDevice);
+  ERROR_IF((!RetVal), hipErrorOutOfMemory);
+
+  *dptr = RetVal;
+  *pitch = CandidatePitch;
+  RETURN(hipSuccess);
   CHIP_CATCH
 }
 hipError_t hipDeviceSetMemPool(int device, hipMemPool_t mem_pool) {
@@ -1517,6 +1572,9 @@ hipError_t hipGraphExecUpdate(hipGraphExec_t hGraphExec, hipGraph_t hGraph,
   CHIP_TRY
   LOCK(ApiMtx);
   CHIPInitialize();
+
+  if (!hGraphExec || !hGraph || !hErrorNode_out || !updateResult_out)
+    RETURN(hipErrorInvalidValue);
   // TODO Graphs - hipGraphExecUpdate
   /**
    * cudaGraphExecUpdate sets updateResult_out to
@@ -2308,6 +2366,12 @@ hipError_t hipGraphAddEmptyNode(hipGraphNode_t *pGraphNode, hipGraph_t graph,
     RETURN(hipErrorInvalidValue);
   if (!graph)
     RETURN(hipErrorInvalidValue);
+  if (!pDependencies && numDependencies != 0)
+    RETURN(hipErrorInvalidValue);
+  for (size_t i = 0; i < numDependencies; i++) {
+    if (!pDependencies[i])
+      RETURN(hipErrorInvalidValue);
+  }
   CHIPGraphNodeEmpty *Node = new CHIPGraphNodeEmpty();
   Node->addDependencies(DECONST_NODES(pDependencies), numDependencies);
   *pGraphNode = Node;
@@ -4589,6 +4653,7 @@ static inline hipError_t hipMallocPitch3DInternal(void **Ptr, size_t *Pitch,
 
   if (Width * Height == 0) {
     *Ptr = nullptr;
+    *Pitch = 0;
     return hipSuccess;
   }
 
@@ -4917,17 +4982,22 @@ hipError_t hipMalloc3D(hipPitchedPtr *PitchedDevPtr, hipExtent Extent) {
 
   // ERROR_IF((Extent.width == 0 || Extent.height == 0), hipErrorInvalidValue);
 
-  // Zero height arrays are allowed for 1D arrays
-  if ((Extent.width == 0) || (Extent.height == 0 && Extent.depth > 0))
-    RETURN(hipErrorInvalidValue);
+  // If any extent is zero, allocate nothing and return a zeroed pitched
+  // pointer. CUDA/HIP semantics are permissive here: zero-sized requests
+  // succeed with a null device pointer (Unit_hipMalloc3D_ValidatePitch
+  // exercises {0,0,0}, {1,0,0}, {0,1,0}, {0,0,1}).
+  if (Extent.width == 0 || Extent.height == 0 || Extent.depth == 0) {
+    PitchedDevPtr->ptr = nullptr;
+    PitchedDevPtr->pitch = 0;
+    PitchedDevPtr->xsize = Extent.width;
+    PitchedDevPtr->ysize = Extent.height;
+    RETURN(hipSuccess);
+  }
 
-  size_t Pitch;
+  size_t Pitch = 0;
 
   hipError_t HipStatus = hipMallocPitch3DInternal(
       &PitchedDevPtr->ptr, &Pitch, Extent.width, Extent.height, Extent.depth);
-
-  if (Pitch == 0)
-    RETURN(hipErrorInvalidValue);
 
   if (HipStatus == hipSuccess) {
     PitchedDevPtr->pitch = Pitch;

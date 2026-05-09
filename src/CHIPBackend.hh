@@ -482,6 +482,8 @@ struct AllocationInfo {
   enum hipMemoryType MemoryType;
   bool RequiresMapUnmap = false;
   bool IsHostRegistered = false; ///< True if registered via hipHostRegister().
+  /// Process-unique id for hipPointerGetAttribute(BUFFER_ID).
+  uint64_t BufferId = 0;
 
   // Managed memory attributes
   int LastPrefetchLocation = -2; ///< Device ID where memory was last prefetched, -2 if never prefetched
@@ -1347,11 +1349,19 @@ protected:
 
   int Idx_ = -1; // Initialized with a value indicating unset ID.
 
+  /// Device-scope flags as set by hipSetDeviceFlags / hipCtxCreate.
+  unsigned int DeviceFlags_ = hipDeviceScheduleAuto;
+
   // only callable from derived classes, because we need to call also init()
   Device(chipstar::Context *Ctx, int DeviceIdx);
   // initializer. may call virtual methods
   void init();
   bool PerThreadStreamUsed_ = false;
+
+public:
+  void setDeviceFlags(unsigned int Flags) { DeviceFlags_ = Flags; }
+  unsigned int getDeviceFlags() const { return DeviceFlags_; }
+protected:
 
 public:
   // atomic int for counting number of threads that were created
