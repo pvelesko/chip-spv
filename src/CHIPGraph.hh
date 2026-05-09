@@ -621,12 +621,19 @@ public:
   std::vector<CHIPGraphNode *> getLeafNodes();
   std::vector<CHIPGraphNode *> getRootNodes();
   CHIPGraphNode *getClonedNodeFromOriginal(CHIPGraphNode *OriginalNode) {
-    if (!CloneMap_.count(OriginalNode)) {
-      CHIPERR_LOG_AND_THROW("Failed to find the node in clone",
-                            hipErrorInvalidValue);
-    } else {
-      return CloneMap_[OriginalNode];
-    }
+    auto It = CloneMap_.find(OriginalNode);
+    if (It != CloneMap_.end())
+      return It->second;
+    // CHIPGraphExec stores the OriginalGraph by pointer (without copy-
+    // constructing it), so its CloneMap_ is empty: lookups for nodes that
+    // were inserted directly into the original graph will miss. Treat the
+    // original node itself as the resolved target in that case so callers
+    // can mutate it in place; the actual clone in CompiledGraph_ is rebuilt
+    // from the original on launch via the copy constructor.
+    if (std::find(Nodes_.begin(), Nodes_.end(), OriginalNode) != Nodes_.end())
+      return OriginalNode;
+    CHIPERR_LOG_AND_THROW("Failed to find the node in clone",
+                          hipErrorInvalidValue);
   }
 
   std::vector<CHIPGraphNode *> &getNodes() { return Nodes_; }
@@ -706,6 +713,26 @@ public:
   void launch(chipstar::Queue *Queue);
 
   CHIPGraph *getOriginalGraphPtr() const { return OriginalGraph_; }
+  CHIPGraph *getCompiledGraphPtr() { return &CompiledGraph_; }
+
+  /**
+   * @brief Resolve a user-supplied original-graph node to its clone in
+   * CompiledGraph_.
+   *
+   * The compiled graph copy-constructs from the original at instantiation,
+   * so its CloneMap_ holds Original->Clone for every original node. Callers
+   * that mutate a node post-instantiation must operate on the clone owned by
+   * the executable graph; otherwise their changes never reach the launched
+   * graph. Returns nullptr if the original node is unknown to this graph
+   * exec, allowing callers to surface hipErrorInvalidValue.
+   */
+  CHIPGraphNode *findOrLookupNode(CHIPGraphNode *Node) {
+    if (auto *Cloned = CompiledGraph_.nodeLookup(Node))
+      return Cloned;
+    if (OriginalGraph_ && OriginalGraph_->findNode(Node))
+      return Node;
+    return nullptr;
+  }
 
   /**
    * @brief Optimize and generate ExecQueues_

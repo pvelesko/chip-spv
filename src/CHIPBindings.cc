@@ -2108,7 +2108,7 @@ hipError_t hipGraphExecMemcpyNodeSetParams(hipGraphExec_t hGraphExec,
     RETURN(hipErrorInvalidValue);
 
   auto ExecNode =
-      EXEC(hGraphExec)->getOriginalGraphPtr()->nodeLookup(NODE(node));
+      EXEC(hGraphExec)->findOrLookupNode(NODE(node));
   if (!ExecNode)
     CHIPERR_LOG_AND_THROW("Failed to find the node in hipGraphExec_t",
                           hipErrorInvalidValue);
@@ -2251,7 +2251,7 @@ hipError_t hipGraphExecMemcpyNodeSetParams1D(hipGraphExec_t hGraphExec,
     RETURN(hipErrorInvalidValue);
 
   auto ExecNode =
-      EXEC(hGraphExec)->getOriginalGraphPtr()->nodeLookup(NODE(node));
+      EXEC(hGraphExec)->findOrLookupNode(NODE(node));
   if (!ExecNode)
     CHIPERR_LOG_AND_THROW("Failed to find the node in hipGraphExec_t",
                           hipErrorInvalidValue);
@@ -2429,7 +2429,7 @@ hipError_t hipGraphExecMemcpyNodeSetParamsToSymbol(
     RETURN(hipErrorInvalidValue);
 
   auto ExecNode =
-      EXEC(hGraphExec)->getOriginalGraphPtr()->nodeLookup(NODE(node));
+      EXEC(hGraphExec)->findOrLookupNode(NODE(node));
   if (!ExecNode)
     CHIPERR_LOG_AND_THROW("Failed to find the node in hipGraphExec_t",
                           hipErrorInvalidValue);
@@ -2532,7 +2532,7 @@ hipError_t hipGraphExecMemsetNodeSetParams(hipGraphExec_t hGraphExec,
     RETURN(hipErrorInvalidValue);
 
   auto ExecNode =
-      EXEC(hGraphExec)->getOriginalGraphPtr()->nodeLookup(NODE(node));
+      EXEC(hGraphExec)->findOrLookupNode(NODE(node));
   if (!ExecNode)
     CHIPERR_LOG_AND_THROW("Failed to find the node in hipGraphExec_t",
                           hipErrorInvalidValue);
@@ -2625,7 +2625,7 @@ hipError_t hipGraphExecHostNodeSetParams(hipGraphExec_t hGraphExec,
   LOCK(ApiMtx);
   CHIPInitialize();
   auto ExecNode =
-      EXEC(hGraphExec)->getOriginalGraphPtr()->nodeLookup(NODE(node));
+      EXEC(hGraphExec)->findOrLookupNode(NODE(node));
   if (!ExecNode)
     CHIPERR_LOG_AND_THROW("Failed to find the node in hipGraphExec_t",
                           hipErrorInvalidValue);
@@ -2851,7 +2851,7 @@ hipError_t hipGraphExecEventRecordNodeSetEvent(hipGraphExec_t hGraphExec,
     RETURN(hipErrorInvalidValue);
 
   auto ExecNode =
-      EXEC(hGraphExec)->getOriginalGraphPtr()->nodeLookup(NODE(hNode));
+      EXEC(hGraphExec)->findOrLookupNode(NODE(hNode));
   if (!ExecNode)
     CHIPERR_LOG_AND_THROW("Failed to find the node in hipGraphExec_t",
                           hipErrorInvalidValue);
@@ -2975,7 +2975,7 @@ hipError_t hipGraphExecEventWaitNodeSetEvent(hipGraphExec_t hGraphExec,
     RETURN(hipErrorInvalidValue);
 
   auto ExecNode =
-      EXEC(hGraphExec)->getOriginalGraphPtr()->nodeLookup(NODE(hNode));
+      EXEC(hGraphExec)->findOrLookupNode(NODE(hNode));
   if (!ExecNode)
     CHIPERR_LOG_AND_THROW("Failed to find the node in hipGraphExec_t",
                           hipErrorInvalidValue);
