@@ -2837,11 +2837,22 @@ hipError_t hipGraphExecChildGraphNodeSetParams(hipGraphExec_t hGraphExec,
 
   auto CastNode = static_cast<CHIPGraphNodeGraph *>(node);
 
-  // Check if childGraph is not parent graph
-  if (CastNode->getGraph() != childGraph)
-    RETURN(hipErrorInvalidValue);
+  // CUDA semantics: the new child graph must have the same topology
+  // (count + types) as the existing one, and may not equal the parent.
+  CHIPGraph *Existing = CastNode->getGraph();
+  CHIPGraph *NewG = GRAPH(childGraph);
+  if (Existing) {
+    auto OldNodes = Existing->getNodes();
+    auto NewNodes = NewG->getNodes();
+    if (OldNodes.size() != NewNodes.size())
+      RETURN(hipErrorInvalidValue);
+    for (size_t i = 0; i < OldNodes.size(); i++) {
+      if (OldNodes[i]->getType() != NewNodes[i]->getType())
+        RETURN(hipErrorInvalidValue);
+    }
+  }
 
-  CastNode->setGraph(GRAPH(childGraph));
+  CastNode->setGraph(NewG);
   RETURN(hipSuccess);
   CHIP_CATCH
 }
