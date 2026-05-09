@@ -716,6 +716,12 @@ protected:
   chipstar::EventFlags Flags_;
   bool SignalEnqueued_ = false;
   bool Deleted_ = false;
+  // Set when the event was recorded on a stream that is capturing into a
+  // graph. hipStreamWaitEvent uses this to propagate the capture-active
+  // status from the recording stream to the waiting stream so a subsequent
+  // hipStreamBeginCapture on that stream is rejected (matching CUDA's
+  // capture-propagation contract). Cleared when the event is reset.
+  bool RecordedFromCapturingStream_ = false;
 
   /**
    * @brief Events are always created with a context
@@ -742,6 +748,12 @@ public:
   void setTrackCalled(bool Val) { TrackCalled_ = Val; }
   bool isUserEvent() { return UserEvent_; }
   void setUserEvent(bool Val) { UserEvent_ = Val; }
+  bool wasRecordedFromCapturingStream() const {
+    return RecordedFromCapturingStream_;
+  }
+  void setRecordedFromCapturingStream(bool Val) {
+    RecordedFromCapturingStream_ = Val;
+  }
   /// @brief Add an event on which this event depends, preventing that event
   /// from getting recycled
   /// @param Event

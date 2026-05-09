@@ -4314,6 +4314,14 @@ hipError_t hipStreamWaitEventInternal(hipStream_t Stream, hipEvent_t Event,
 
   auto ChipQueue = Backend->findQueue(static_cast<chipstar::Queue *>(Stream));
 
+  // Capture-propagation: if the event was recorded by a capturing stream and
+  // the destination stream is not yet capturing, mark it active so a later
+  // hipStreamBeginCapture on this stream is rejected as already capturing
+  // (Unit_hipStreamBeginCapture_DetectingInvalidCapture).
+  if (ChipEvent && ChipEvent->wasRecordedFromCapturingStream() &&
+      ChipQueue->getCaptureStatus() == hipStreamCaptureStatusNone) {
+    ChipQueue->setCaptureStatus(hipStreamCaptureStatusActive);
+  }
   if (ChipQueue->captureIntoGraph<CHIPGraphNodeWaitEvent>(ChipEvent)) {
     return hipSuccess;
   }
@@ -4515,6 +4523,12 @@ hipError_t hipEventRecordInternal(hipEvent_t Event, hipStream_t Stream) {
   auto ChipQueue = Backend->findQueue(static_cast<chipstar::Queue *>(Stream));
   LOCK(ChipQueue->QueueMtx);
 
+  // Tag the event with the recording stream's capture state so a later
+  // hipStreamWaitEvent can propagate "stream is capturing" to its target
+  // (Unit_hipStreamBeginCapture_DetectingInvalidCapture and friends).
+  bool QueueCapturing =
+      ChipQueue->getCaptureStatus() == hipStreamCaptureStatusActive;
+  ChipEvent->setRecordedFromCapturingStream(QueueCapturing);
   if (ChipQueue->captureIntoGraph<CHIPGraphNodeEventRecord>(ChipEvent)) {
     return hipSuccess;
   }
