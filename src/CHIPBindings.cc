@@ -3146,6 +3146,7 @@ hipError_t hipStreamBeginCapture(hipStream_t stream,
   // hipStreamGetCaptureInfo / hipStreamGetCaptureInfo_v2.
   static std::atomic<unsigned long long> NextCaptureId{1};
   ChipQueue->setCaptureId(NextCaptureId.fetch_add(1));
+  ChipQueue->setCaptureThread(std::this_thread::get_id());
   RETURN(hipSuccess);
   CHIP_CATCH
 }
@@ -3183,6 +3184,12 @@ hipError_t hipStreamEndCapture(hipStream_t stream, hipGraph_t *pGraph) {
       hipStreamCaptureStatus::hipStreamCaptureStatusActive)
     RETURN(hipErrorInvalidValue);
 
+  // CUDA semantics: in Global / ThreadLocal mode, EndCapture must come from
+  // the same thread that called BeginCapture
+  // (Unit_hipStreamEndCapture_Thread_Negative).
+  if (ChipQueue->getCaptureMode() != hipStreamCaptureModeRelaxed &&
+      ChipQueue->getCaptureThread() != std::this_thread::get_id())
+    RETURN(hipErrorStreamCaptureWrongThread);
   unsigned long long EndedCaptureId = ChipQueue->getCaptureId();
   ChipQueue->setCaptureStatus(
       hipStreamCaptureStatus::hipStreamCaptureStatusNone);

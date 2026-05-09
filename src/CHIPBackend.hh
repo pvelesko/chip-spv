@@ -2172,6 +2172,10 @@ protected:
   /// and cleared (to 0) at hipStreamEndCapture. Reported by
   /// hipStreamGetCaptureInfo / hipStreamGetCaptureInfo_v2.
   unsigned long long CaptureId_ = 0;
+  /// Thread that called hipStreamBeginCapture. Used by hipStreamEndCapture
+  /// to enforce CUDA's same-thread rule for Global / ThreadLocal modes
+  /// (Unit_hipStreamEndCapture_Thread_Negative).
+  std::thread::id CaptureThread_{};
   /// @brief  node for creating a dependency chain between subsequent record
   /// events when in graph capture mode
   CHIPGraphNode *LastNode_ = nullptr;
@@ -2340,6 +2344,8 @@ public:
   }
   unsigned long long getCaptureId() const { return CaptureId_; }
   void setCaptureId(unsigned long long Id) { CaptureId_ = Id; }
+  std::thread::id getCaptureThread() const { return CaptureThread_; }
+  void setCaptureThread(std::thread::id Id) { CaptureThread_ = Id; }
   CHIPGraph *getCaptureGraph() const;
 
   chipstar::Device *PerThreadQueueForDevice = nullptr;
