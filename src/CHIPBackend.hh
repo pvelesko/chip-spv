@@ -482,6 +482,10 @@ struct AllocationInfo {
   enum hipMemoryType MemoryType;
   bool RequiresMapUnmap = false;
   bool IsHostRegistered = false; ///< True if registered via hipHostRegister().
+  /// Process-unique ID assigned at recordAllocation() time so that
+  /// hipPointerGetAttribute(HIP_POINTER_ATTRIBUTE_BUFFER_ID) is stable
+  /// for the lifetime of an allocation and unique across allocations.
+  uint64_t BufferId = 0;
 
   // Managed memory attributes
   int LastPrefetchLocation = -2; ///< Device ID where memory was last prefetched, -2 if never prefetched
@@ -1347,6 +1351,10 @@ protected:
 
   int Idx_ = -1; // Initialized with a value indicating unset ID.
 
+  /// Device flags as set by hipSetDeviceFlags / hipCtxCreate.
+  /// Default to hipDeviceScheduleAuto per HIP runtime convention.
+  unsigned int DeviceFlags_ = hipDeviceScheduleAuto;
+
   // only callable from derived classes, because we need to call also init()
   Device(chipstar::Context *Ctx, int DeviceIdx);
   // initializer. may call virtual methods
@@ -1584,6 +1592,16 @@ public:
    *
    * @param config
    */
+  /**
+   * @brief Set device flags (hipDeviceScheduleAuto, hipDeviceMapHost, etc.)
+   */
+  void setFlags(unsigned int Flags) { DeviceFlags_ = Flags; }
+
+  /**
+   * @brief Get device flags previously set via hipSetDeviceFlags / hipCtxCreate.
+   */
+  unsigned int getFlags() const { return DeviceFlags_; }
+
   virtual void setSharedMemConfig(hipSharedMemConfig Cfg);
 
   /**
