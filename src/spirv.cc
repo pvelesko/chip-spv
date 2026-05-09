@@ -1226,8 +1226,11 @@ classifyHipKernelArgsByMangling(const std::string &MangledName) {
 
 bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
                                 SPVModuleInfo &Output) {
-  // Find OpMemoryModel; require Logical addressing for the Vulkan path.
-  bool IsLogical = false;
+  // Find OpMemoryModel; accept either Logical addressing (Vulkan default) or
+  // PhysicalStorageBuffer64 (used by HIPSPV's bridging pass for byte-strided
+  // pitched-pointer access via BDA). Both are Vulkan-flavored SPV with the
+  // same ClspvReflection-style kernel metadata.
+  bool IsVulkanAddressing = false;
   size_t I = 5;
   while (I < NumWords) {
     InstWord W = Stream[I];
@@ -1236,13 +1239,17 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
     if (Wc == 0)
       return false;
     if (Op == 14 /*OpMemoryModel*/) {
-      if (Wc >= 3 && Stream[I + 1] == 0 /*Logical*/)
-        IsLogical = true;
+      if (Wc >= 3) {
+        InstWord AM = Stream[I + 1];
+        // 0 = Logical, 5348 = PhysicalStorageBuffer64.
+        if (AM == 0 || AM == 5348)
+          IsVulkanAddressing = true;
+      }
       break;
     }
     I += Wc;
   }
-  if (!IsLogical)
+  if (!IsVulkanAddressing)
     return false;
 
   // Pass 1: gather OpExtInstImport (find ClspvReflection set), OpString,

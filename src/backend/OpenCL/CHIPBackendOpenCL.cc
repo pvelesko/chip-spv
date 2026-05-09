@@ -1319,8 +1319,10 @@ void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
           uint16_t Op = W & 0xFFFF;
           if (Op == 14 && Wc >= 3) {
             uint32_t AddressingModel = Words[I + 1];
-            // 0 = Logical (Vulkan), 1/2 = Physical32/64 (OpenCL).
-            IsVulkanSpv = (AddressingModel == 0);
+            // 0 = Logical (Vulkan), 1/2 = Physical32/64 (OpenCL),
+            // 5348 = PhysicalStorageBuffer64 (Vulkan BDA, used by HIPSPV's
+            // bridging pass for byte-strided pitched-pointer access).
+            IsVulkanSpv = (AddressingModel == 0) || (AddressingModel == 5348);
             break;
           }
           if (Wc == 0) break;
