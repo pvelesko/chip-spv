@@ -47,13 +47,7 @@ hipError_t hipCtxCreate(hipCtx_t *ctx, unsigned int flags, hipDevice_t device) {
 
   ERROR_CHECK_DEVNUM(device);
 
-  auto *Dev = Backend->getDevices()[device];
-  // Record the requested flags so that subsequent hipGetDeviceFlags reflects
-  // the value passed into hipCtxCreate (CUDA-style behavior expected by
-  // Unit_hipGetDeviceFlags_Positive_Context).
-  Dev->setFlags(flags);
-
-  auto ChipCtx = Dev->getContext();
+  auto ChipCtx = Backend->getDevices()[device]->getContext();
   ChipCtx->retain();
   *ctx = ChipCtx;
 

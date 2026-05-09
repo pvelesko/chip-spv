@@ -209,10 +209,6 @@ void chipstar::AllocationTracker::recordAllocation(
     chipstar::HostAllocFlags Flags, hipMemoryType MemoryType) {
   chipstar::AllocationInfo *AllocInfo = new chipstar::AllocationInfo{
       DevPtr, HostPtr, Size, Flags, Device, false, MemoryType};
-  // Assign a process-unique buffer id used by
-  // hipPointerGetAttribute(HIP_POINTER_ATTRIBUTE_BUFFER_ID).
-  static std::atomic<uint64_t> NextBufferId{1};
-  AllocInfo->BufferId = NextBufferId.fetch_add(1, std::memory_order_relaxed);
   LOCK(AllocationTrackerMtx); // writing chipstar::AllocTracker::PtrToAllocInfo_
                               // chipstar::AllocTracker::AllocInfos_
   // TODO AllocInfo turned into class and constructor take care of this
