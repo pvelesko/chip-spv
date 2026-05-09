@@ -101,9 +101,52 @@ std::vector<void *> convertExtraArgsToPointerArray(void *ExtraArgBuf,
 std::string_view trim(std::string_view Str);
 bool startsWith(std::string_view Str, std::string_view WithStr);
 
+/// Return true if the SPIR-V binary uses a Vulkan-flavored addressing model
+/// (Logical or PhysicalStorageBuffer64). Such binaries cannot be linked
+/// against the OpenCL-flavored rtdevlib SPVs via clLinkProgram — and they
+/// don't need to: the chipstarvulkan bridging pass lowers
+/// `__chip_atomic_*` / `__chip_ballot` helpers to native SPIR-V atomicrmw /
+/// OpGroupNonUniformBallot in-IR before the SPIR-V backend runs.
+inline bool spirvIsVulkanFlavored(std::string_view Binary) {
+  if (Binary.size() < 5 * 4)
+    return false;
+  const uint32_t *Words = reinterpret_cast<const uint32_t *>(Binary.data());
+  // SPIR-V magic = 0x07230203.
+  if (Words[0] != 0x07230203u)
+    return false;
+  // Walk the instruction stream from word 5 looking for OpMemoryModel (op 14).
+  size_t I = 5;
+  size_t NWords = Binary.size() / 4;
+  while (I < NWords) {
+    uint32_t W = Words[I];
+    uint16_t Wc = (W >> 16) & 0xFFFFu;
+    uint16_t Op = W & 0xFFFFu;
+    if (Wc == 0)
+      break;
+    if (Op == 14 && Wc >= 3 && I + 1 < NWords) {
+      uint32_t AddressingModel = Words[I + 1];
+      // 0 = Logical (Vulkan), 5348 = PhysicalStorageBuffer64 (Vulkan BDA).
+      // 1/2 = Physical32/64 (OpenCL).
+      return AddressingModel == 0 || AddressingModel == 5348;
+    }
+    I += Wc;
+  }
+  return false;
+}
+
 /// Return true if the SPIR-V binary imports rtdevlib symbols (atomics, ballot).
 /// Used to decide whether to append device library sources/link step.
+///
+/// Vulkan-flavored SPIR-V (produced by the chipstarvulkan triple's bridging
+/// pass) is excluded: the bridging pass lowers `__chip_atomic_*` and
+/// `__chip_ballot` helpers to native SPIR-V atomic/ballot ops in-IR, so no
+/// rtdevlib link step is needed. Even if substring matches survive in OpName
+/// debug strings, attempting to clLinkProgram OpenCL-flavored rtdevlib SPVs
+/// against a Vulkan-flavored kernel SPV is unsupported by clvk (clspv refuses
+/// the empty main-module bitcode) and produces a CL_LINK_PROGRAM_FAILURE.
 inline bool spirvNeedsRtdevlib(std::string_view Binary) {
+  if (spirvIsVulkanFlavored(Binary))
+    return false;
   return Binary.find("__chip_atomic_add") != std::string_view::npos ||
          Binary.find("__chip_atomic_max") != std::string_view::npos ||
          Binary.find("__chip_atomic_min") != std::string_view::npos ||
