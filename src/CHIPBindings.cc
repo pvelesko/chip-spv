@@ -627,7 +627,77 @@ hipError_t hipDrvPointerGetAttributes(unsigned int numAttributes,
   if (ptr == 0)
     RETURN(hipErrorInvalidValue);
 
-  UNIMPLEMENTED(hipErrorNotSupported);
+  // Resolve the allocation once and answer per-attribute requests inline.
+  // Catch test Unit_hipDrvPtrGetAttributes_Functional exercises a mix of
+  // device-only, host-only, and pointer-with-offset queries; the previous
+  // UNIMPLEMENTED return failed all of them. Mirrors the per-attribute
+  // logic of hipPointerGetAttribute.
+  chipstar::AllocationInfo *AllocInfo = nullptr;
+  for (auto *Dev : Backend->getDevices()) {
+    AllocInfo = Dev->AllocTracker->getAllocInfoCheckPtrRanges(ptr);
+    if (AllocInfo)
+      break;
+    // Pinned-host allocations are keyed by their host pointer.
+    AllocInfo = Dev->AllocTracker->getAllocInfo(ptr);
+    if (AllocInfo)
+      break;
+  }
+  if (!AllocInfo)
+    RETURN(hipErrorInvalidValue);
+
+  for (unsigned i = 0; i < numAttributes; ++i) {
+    void *Out = data[i];
+    if (!Out)
+      RETURN(hipErrorInvalidValue);
+    switch (attributes[i]) {
+    case HIP_POINTER_ATTRIBUTE_MEMORY_TYPE:
+      *static_cast<unsigned int *>(Out) =
+          static_cast<unsigned int>(AllocInfo->MemoryType);
+      break;
+    case HIP_POINTER_ATTRIBUTE_DEVICE_POINTER:
+      *static_cast<void **>(Out) = AllocInfo->DevPtr;
+      break;
+    case HIP_POINTER_ATTRIBUTE_HOST_POINTER:
+      *static_cast<void **>(Out) =
+          (AllocInfo->MemoryType == hipMemoryTypeDevice) ? nullptr
+                                                          : AllocInfo->HostPtr;
+      break;
+    case HIP_POINTER_ATTRIBUTE_BUFFER_ID:
+      *static_cast<uint64_t *>(Out) = AllocInfo->BufferId;
+      break;
+    case HIP_POINTER_ATTRIBUTE_IS_MANAGED:
+      *static_cast<unsigned int *>(Out) =
+          (AllocInfo->MemoryType == hipMemoryTypeManaged) ? 1u : 0u;
+      break;
+    case HIP_POINTER_ATTRIBUTE_DEVICE_ORDINAL:
+      *static_cast<int *>(Out) = AllocInfo->Device;
+      break;
+    case HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR:
+      *static_cast<void **>(Out) = AllocInfo->DevPtr;
+      break;
+    case HIP_POINTER_ATTRIBUTE_RANGE_SIZE:
+      *static_cast<size_t *>(Out) = AllocInfo->Size;
+      break;
+    case HIP_POINTER_ATTRIBUTE_MAPPED: {
+      bool Mapped = AllocInfo->MemoryType == hipMemoryTypeDevice ||
+                    AllocInfo->MemoryType == hipMemoryTypeManaged ||
+                    AllocInfo->MemoryType == hipMemoryTypeUnified ||
+                    (AllocInfo->MemoryType == hipMemoryTypeHost &&
+                     AllocInfo->Flags.isMapped());
+      *static_cast<unsigned int *>(Out) = Mapped ? 1u : 0u;
+      break;
+    }
+    case HIP_POINTER_ATTRIBUTE_SYNC_MEMOPS:
+    case HIP_POINTER_ATTRIBUTE_ACCESS_FLAGS:
+      *static_cast<unsigned int *>(Out) = 0u;
+      break;
+    default:
+      // Other attributes are unsupported; signal but continue so a single
+      // unsupported entry does not invalidate the rest of the response.
+      RETURN(hipErrorNotSupported);
+    }
+  }
+  RETURN(hipSuccess);
   CHIP_CATCH
 }
 
