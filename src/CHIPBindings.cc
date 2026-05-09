@@ -6574,6 +6574,18 @@ hipError_t hipMemcpyToSymbolAsyncInternal(const void *Symbol, const void *Src,
     CHIPERR_LOG_AND_THROW("Invalid memcpy direction!",
                           hipErrorInvalidMemcpyDirection);
 
+  // Validate Offset + SizeBytes against the symbol's registered size up
+  // front. The chipstar::Device-level lookup below requires the device
+  // module to be finalized, but Catch test
+  // Unit_hipMemcpyFromToSymbol_Negative (Invalid Size / Invalid Offset)
+  // expects hipErrorInvalidValue regardless of whether the symbol has
+  // been resolved yet.
+  if (auto SymSize = getSPVRegister().getVariableSize(HostPtr(Symbol))) {
+    if (Offset + SizeBytes > *SymSize)
+      CHIPERR_LOG_AND_THROW("Copy has out-of-bounds accesses!",
+                            hipErrorInvalidValue);
+  }
+
   auto ChipQueue = Backend->findQueue(static_cast<chipstar::Queue *>(Stream));
   if (ChipQueue->captureIntoGraph<CHIPGraphNodeMemcpyToSymbol>(
           const_cast<void *>(Src), Symbol, SizeBytes, Offset, Kind)) {
@@ -6634,6 +6646,15 @@ hipError_t hipMemcpyFromSymbolAsyncInternal(void *Dst, const void *Symbol,
     CHIPERR_LOG_AND_THROW("Destination is nullptr!", hipErrorInvalidValue);
   if (!Symbol)
     CHIPERR_LOG_AND_THROW("Source is invalid symbol!", hipErrorInvalidSymbol);
+  // Up-front size/offset validation against the registered symbol size
+  // so the Invalid-Size / Invalid-Offset Catch sections of
+  // Unit_hipMemcpyFromToSymbol_Negative get hipErrorInvalidValue even when
+  // the device module has not been compiled yet.
+  if (auto SymSize = getSPVRegister().getVariableSize(HostPtr(Symbol))) {
+    if (Offset + SizeBytes > *SymSize)
+      CHIPERR_LOG_AND_THROW("Copy has out-of-bounds accesses!",
+                            hipErrorInvalidValue);
+  }
   if (!(Kind == hipMemcpyDeviceToHost || Kind == hipMemcpyDeviceToDevice))
     CHIPERR_LOG_AND_THROW("Invalid memcpy direction!",
                           hipErrorInvalidMemcpyDirection);
