@@ -1154,6 +1154,9 @@ hipError_t hipStreamGetCaptureInfo(hipStream_t stream,
   if (!pCaptureStatus)
     RETURN(hipErrorInvalidValue);
 
+  // Implicit (default) stream is not a valid argument here.
+  if (!stream)
+    RETURN(hipErrorStreamCaptureImplicit);
   auto ChipQueue =
       Backend->findQueue(static_cast<chipstar::Queue *>(stream));
   if (!ChipQueue)
@@ -1184,6 +1187,12 @@ hipError_t hipStreamGetCaptureInfo_v2(hipStream_t stream,
   if (!captureStatus_out)
     RETURN(hipErrorInvalidValue);
 
+  // Querying capture state on the implicit (default) stream is treated by
+  // CUDA/HIP as a capture-implicit error. Catch test
+  // Unit_hipStreamGetCaptureInfo_v2_ParamValidation accepts either
+  // hipErrorStreamCaptureImplicit or hipErrorUnknown.
+  if (!stream)
+    RETURN(hipErrorStreamCaptureImplicit);
   auto ChipQueue =
       Backend->findQueue(static_cast<chipstar::Queue *>(stream));
   if (!ChipQueue)
