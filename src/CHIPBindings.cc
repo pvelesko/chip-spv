@@ -5121,10 +5121,17 @@ hipError_t hipMalloc3DArray(hipArray **Array,
       RETURN(hipErrorInvalidValue);
   }
 
-  // Zero height arrays are only allowed for 1D arrays and layered arrays
-  if (Height == 0 && !(Depth == 0 || (Flags & hipArrayLayered)))
+  // Zero height is only valid for plain 1D (Depth==0) or 1D-layered
+  // arrays (Layered without Cubemap). Cubemaps are 6-face 2D arrays, so
+  // Height must be non-zero even when combined with Layered/SurfaceLS.
+  // Catch test Unit_hipMalloc3DArray_Negative_ZeroHeight enumerates all
+  // non-layered-only flag combinations and requires hipErrorInvalidValue.
+  if (Height == 0 &&
+      !(Depth == 0 ||
+        ((Flags & hipArrayLayered) && !(Flags & hipArrayCubemap))))
     CHIPERR_LOG_AND_THROW(
-        "Zero height arrays are only allowed for 1D arrays and layered arrays",
+        "Zero height arrays are only allowed for 1D arrays and 1D-layered "
+        "arrays",
         hipErrorInvalidValue);
 
   // Check for invalid Height and Depth based on Flags - commented as other
