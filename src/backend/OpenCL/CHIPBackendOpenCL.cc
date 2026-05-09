@@ -26,6 +26,7 @@
 
 #include <cstring>
 #include <sstream>
+#include <sys/stat.h>
 
 #include "Utils.hh"
 #include <chrono>
@@ -2780,6 +2781,46 @@ void CHIPBackendOpenCL::uninitialize() {
 
 void CHIPBackendOpenCL::initializeImpl() {
   logTrace("CHIPBackendOpenCL Initialize");
+  // clvk's SPIR-V capability validator is overly strict on
+  // StorageBuffer16BitAccess / StoragePushConstant16: it rejects modules
+  // declaring those caps even when the underlying Vulkan device exposes
+  // VK_KHR_16bit_storage. Setting CLVK_SKIP_SPIRV_CAPABILITY_CHECK=1
+  // bypasses the capability gate so chipStar fp16 kernels build on
+  // Intel Arc + clvk out of the box.
+  setenv("CLVK_SKIP_SPIRV_CAPABILITY_CHECK", "1", /*overwrite=*/0);
+  // Phase I5: when the system has multiple OpenCL ICDs registered
+  // (e.g. Intel CPU OpenCL alongside clvk), the SPIR-V the vulkan
+  // pipeline emits (Logical+GLSL450 + OpExtension SPV_KHR_16bit_storage)
+  // is rejected by intel-cpu-ocl's SPIRV-LLVM-Translator with
+  // "input SPIR-V module uses unknown extension 'SPV_KHR_16bit_storage'".
+  // Restrict OpenCL platform discovery to the clvk-only ICD vendors dir
+  // shipped alongside libOpenCL.so when CLVK_ROOT is detectable, so the
+  // chipStar/clvk path doesn't trip over the wider ICD list.
+  if (!getenv("OCL_ICD_VENDORS") && !getenv("OCL_ICD_FILENAMES")) {
+    // Look for a clvk-only ICD vendors directory in a few well-known
+    // installation prefixes. clvk ships an `etc/OpenCL/vendors/clvk.icd`
+    // file alongside its libOpenCL.so; pointing OCL_ICD_VENDORS at that
+    // directory makes ocl-icd skip system ICDs (intel-cpu-ocl,
+    // intel-gpu-igdrcl) which reject Vulkan-flavored SPIR-V emitted by
+    // the chipstarvulkan triple ("uses unknown extension
+    // 'SPV_KHR_16bit_storage'").
+    const char *Candidates[] = {getenv("clvk_ROOT"), getenv("CLVK_ROOT"),
+                                "/usr/local/clvk", "/opt/clvk", nullptr};
+    for (const char *Root : Candidates) {
+      if (!Root || !*Root)
+        continue;
+      std::string Vendors = std::string(Root) + "/etc/OpenCL/vendors";
+      struct stat St;
+      if (stat(Vendors.c_str(), &St) == 0 && S_ISDIR(St.st_mode)) {
+        std::string Icd = Vendors + "/clvk.icd";
+        if (stat(Icd.c_str(), &St) == 0) {
+          setenv("OCL_ICD_VENDORS", Vendors.c_str(), /*overwrite=*/0);
+          logInfo("OCL_ICD_VENDORS auto-set to '{}'", Vendors);
+          break;
+        }
+      }
+    }
+  }
   MinQueuePriority_ = CL_QUEUE_PRIORITY_MED_KHR;
 
   // For manual device selection, get all devices; otherwise filter by type
