@@ -342,7 +342,23 @@ std::vector<CHIPGraphNode *> CHIPGraph::getRootNodes() {
   return RootNodes;
 }
 
+std::unordered_set<const CHIPGraphExec *> &CHIPGraphExec::liveSet() {
+  static std::unordered_set<const CHIPGraphExec *> Set;
+  return Set;
+}
+std::mutex &CHIPGraphExec::liveSetMtx() {
+  static std::mutex Mtx;
+  return Mtx;
+}
+
 void CHIPGraphExec::compile() {
+  // Only run the queue-extraction pass once. Subsequent launches re-use
+  // ExecQueues_; the user may have called hipGraphDestroy on the source
+  // graph in the meantime, in which case touching OriginalGraph_->getNodes()
+  // would dereference freed memory (Unit_hipGraphLaunch_Negative covers this).
+  if (Compiled_)
+    return;
+  Compiled_ = true;
   ExtractSubGraphs_();
   pruneGraph_();
   logDebug("{} CHIPGraphExec::compile()", (void *)this);

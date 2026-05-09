@@ -1805,6 +1805,10 @@ hipError_t hipGraphLaunch(hipGraphExec_t graphExec, hipStream_t stream) {
 
   if (!graphExec)
     RETURN(hipErrorInvalidValue);
+  // Surface a clean error rather than crashing if the user passes a stale
+  // handle (Unit_hipGraphLaunch_Negative).
+  if (!CHIPGraphExec::isAlive(EXEC(graphExec)))
+    RETURN(hipErrorInvalidValue);
 
   auto ChipQueue = Backend->findQueue(static_cast<chipstar::Queue *>(stream));
 
@@ -1819,7 +1823,10 @@ hipError_t hipGraphExecDestroy(hipGraphExec_t graphExec) {
   CHIPInitialize();
   if (!graphExec)
     RETURN(hipErrorInvalidValue);
-  delete graphExec;
+  // hipGraphExec has no virtual destructor, so deleting through the base
+  // pointer skips ~CHIPGraphExec(). Cast first so the derived destructor
+  // (which removes us from the live registry) actually runs.
+  delete EXEC(graphExec);
   RETURN(hipSuccess);
   CHIP_CATCH
 }

@@ -679,6 +679,9 @@ class CHIPGraphExec : public hipGraphExec {
 protected:
   CHIPGraph *OriginalGraph_;
   CHIPGraph CompiledGraph_;
+  // Set after the first compile() call so that subsequent launches do not
+  // re-traverse OriginalGraph_, which the user may have already destroyed.
+  bool Compiled_ = false;
 
   /**
    * @brief each element in this queue represents represents a sequence of nodes
@@ -711,12 +714,30 @@ public:
       : OriginalGraph_(Graph), /* Copy the pointer to the original graph */
         CompiledGraph_(CHIPGraph(*Graph)) /* invoke the copy constructor to make
                                              a clone of the graph */
-  {}
+  {
+    std::lock_guard<std::mutex> Lk(liveSetMtx());
+    liveSet().insert(this);
+  }
 
-  ~CHIPGraphExec() {}
+  ~CHIPGraphExec() {
+    std::lock_guard<std::mutex> Lk(liveSetMtx());
+    liveSet().erase(this);
+  }
+
+  /// Returns true if @p Exec has not been destroyed via hipGraphExecDestroy.
+  /// Used by the bindings to surface hipErrorInvalidValue when the user
+  /// passes a stale handle instead of dereferencing freed memory.
+  static bool isAlive(const CHIPGraphExec *Exec) {
+    std::lock_guard<std::mutex> Lk(liveSetMtx());
+    return liveSet().count(Exec) != 0;
+  }
 
   void launch(chipstar::Queue *Queue);
 
+private:
+  static std::unordered_set<const CHIPGraphExec *> &liveSet();
+  static std::mutex &liveSetMtx();
+public:
   CHIPGraph *getOriginalGraphPtr() const { return OriginalGraph_; }
   CHIPGraph *getCompiledGraphPtr() { return &CompiledGraph_; }
 
