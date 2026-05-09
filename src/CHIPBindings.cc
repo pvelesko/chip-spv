@@ -2122,6 +2122,24 @@ hipError_t hipGraphExecMemcpyNodeSetParams(hipGraphExec_t hGraphExec,
   if (!hGraphExec || !node || !pNodeParams)
     RETURN(hipErrorInvalidValue);
 
+  // Validate the new 3D memcpy params: at least one src and one dst must be
+  // set. Unit_hipGraphExecMemcpyNodeSetParams_Negative covers all-zero,
+  // src-only, dst-only, and zero-extent inputs and expects
+  // hipErrorInvalidValue.
+  bool HasSrcArr = pNodeParams->srcArray != nullptr;
+  bool HasSrcPtr = pNodeParams->srcPtr.ptr != nullptr;
+  bool HasDstArr = pNodeParams->dstArray != nullptr;
+  bool HasDstPtr = pNodeParams->dstPtr.ptr != nullptr;
+  // Exactly one source and one destination must be set; specifying both an
+  // array and a pitched-pointer for the same end is a HIP-level error.
+  if ((HasSrcArr && HasSrcPtr) || (HasDstArr && HasDstPtr))
+    RETURN(hipErrorInvalidValue);
+  if ((!HasSrcArr && !HasSrcPtr) || (!HasDstArr && !HasDstPtr))
+    RETURN(hipErrorInvalidValue);
+  if (pNodeParams->extent.width == 0 || pNodeParams->extent.height == 0 ||
+      pNodeParams->extent.depth == 0)
+    RETURN(hipErrorInvalidValue);
+
   auto ExecNode =
       EXEC(hGraphExec)->findOrLookupNode(NODE(node));
   if (!ExecNode)
@@ -2552,6 +2570,15 @@ hipError_t hipGraphExecMemsetNodeSetParams(hipGraphExec_t hGraphExec,
     CHIPERR_LOG_AND_THROW("Failed to find the node in hipGraphExec_t",
                           hipErrorInvalidValue);
 
+  // Validate the new memset params up front: a null dst, zero elementSize,
+  // or an unsupported elementSize must report hipErrorInvalidValue
+  // without mutating the node (Unit_hipGraphExecMemsetNodeSetParams_Negative).
+  if (!pNodeParams->dst)
+    RETURN(hipErrorInvalidValue);
+  if (pNodeParams->elementSize != 1 && pNodeParams->elementSize != 2 &&
+      pNodeParams->elementSize != 4)
+    RETURN(hipErrorInvalidValue);
+
   auto CastNode = static_cast<CHIPGraphNodeMemset *>(node);
   if (!CastNode)
     CHIPERR_LOG_AND_THROW("Node provided failed to cast to CHIPGraphNodeMemset",
@@ -2639,6 +2666,15 @@ hipError_t hipGraphExecHostNodeSetParams(hipGraphExec_t hGraphExec,
   CHIP_TRY
   LOCK(ApiMtx);
   CHIPInitialize();
+  if (!hGraphExec || !node || !pNodeParams)
+    RETURN(hipErrorInvalidValue);
+  // A null host callback means there's nothing to invoke at launch — reject
+  // up front so the negative test case
+  // Unit_hipGraphExecHostNodeSetParams_Negative can observe a clean error
+  // rather than a successful no-op.
+  if (!pNodeParams->fn)
+    RETURN(hipErrorInvalidValue);
+
   auto ExecNode =
       EXEC(hGraphExec)->findOrLookupNode(NODE(node));
   if (!ExecNode)
