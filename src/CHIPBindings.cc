@@ -1600,12 +1600,21 @@ hipError_t hipGraphNodeGetDependencies(hipGraphNode_t node,
   if (!pNumDependencies)
     RETURN(hipErrorInvalidValue);
   auto Deps = NODE(node)->getDependencies();
-  *pNumDependencies = Deps.size();
-  if (!pDependencies)
+  if (!pDependencies) {
+    *pNumDependencies = Deps.size();
     RETURN(hipSuccess);
-  for (int i = 0; i < Deps.size(); i++) {
+  }
+  size_t cap = *pNumDependencies;
+  size_t toWrite = std::min(cap, Deps.size());
+  for (size_t i = 0; i < toWrite; i++) {
     pDependencies[i] = Deps[i];
   }
+  // CUDA semantics: if input capacity exceeds actual, null-fill the tail and
+  // report actual count; if smaller, report capacity (truncated count).
+  for (size_t i = toWrite; i < cap; i++) {
+    pDependencies[i] = nullptr;
+  }
+  *pNumDependencies = toWrite;
   RETURN(hipSuccess);
   CHIP_CATCH
 }
@@ -1621,12 +1630,19 @@ hipError_t hipGraphNodeGetDependentNodes(hipGraphNode_t node,
   if (!pNumDependentNodes)
     RETURN(hipErrorInvalidValue);
   auto Deps = NODE(node)->getDependants();
-  *pNumDependentNodes = Deps.size();
-  if (!pDependentNodes)
+  if (!pDependentNodes) {
+    *pNumDependentNodes = Deps.size();
     RETURN(hipSuccess);
-  for (int i = 0; i < Deps.size(); i++) {
+  }
+  size_t cap = *pNumDependentNodes;
+  size_t toWrite = std::min(cap, Deps.size());
+  for (size_t i = 0; i < toWrite; i++) {
     pDependentNodes[i] = Deps[i];
   }
+  for (size_t i = toWrite; i < cap; i++) {
+    pDependentNodes[i] = nullptr;
+  }
+  *pNumDependentNodes = toWrite;
   RETURN(hipSuccess);
   CHIP_CATCH
 }
