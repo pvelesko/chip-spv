@@ -1262,6 +1262,16 @@ hipError_t hipGraphAddDependencies(hipGraph_t graph, const hipGraphNode_t *from,
   CHIP_TRY
   LOCK(ApiMtx);
   CHIPInitialize();
+
+  if (!graph)
+    RETURN(hipErrorInvalidValue);
+
+  if (numDependencies == 0)
+    RETURN(hipSuccess);
+
+  if (!from || !to)
+    RETURN(hipErrorInvalidValue);
+
   for (size_t i = 0; i < numDependencies; i++) {
     CHIPGraphNode *ToNode = GRAPH(graph)->findNode(NODE(to[i]));
     if (!ToNode)
