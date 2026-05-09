@@ -5813,8 +5813,22 @@ hipError_t hipMemset3DAsync(hipPitchedPtr PitchedDevPtr, int Value,
     Stream = Backend->getActiveDevice()->getDefaultQueue();
 
   if (Extent.height > PitchedDevPtr.ysize ||
-      Extent.width > PitchedDevPtr.xsize || Extent.depth > PitchedDevPtr.pitch)
+      Extent.width > PitchedDevPtr.pitch)
     RETURN(hipErrorInvalidValue);
+
+  // The hipPitchedPtr struct does not carry the allocation's depth, so
+  // recover the maximum valid depth from the AllocationTracker. Without
+  // this clamp, an over-sized depth (e.g. SIZE_MAX or "depth+1") falls
+  // through to the backend memset which then segfaults on out-of-bounds
+  // strided writes (Unit_hipMemset3D_Negative_InvalidSizes).
+  auto *AllocTracker = Backend->getActiveDevice()->AllocTracker;
+  auto *AllocInfo = AllocTracker->getAllocInfo(PitchedDevPtr.ptr);
+  if (AllocInfo && PitchedDevPtr.pitch > 0 && PitchedDevPtr.ysize > 0) {
+    size_t Slice = PitchedDevPtr.pitch * PitchedDevPtr.ysize;
+    size_t MaxDepth = (Slice > 0) ? AllocInfo->Size / Slice : 0;
+    if (Extent.depth > MaxDepth)
+      RETURN(hipErrorInvalidValue);
+  }
 
   RETURN(hipMemset3DAsyncInternal(PitchedDevPtr, Value, Extent, Stream));
   CHIP_CATCH
@@ -5830,8 +5844,22 @@ hipError_t hipMemset3D(hipPitchedPtr PitchedDevPtr, int Value,
     RETURN(hipErrorInvalidValue);
 
   if (Extent.height > PitchedDevPtr.ysize ||
-      Extent.width > PitchedDevPtr.xsize || Extent.depth > PitchedDevPtr.pitch)
+      Extent.width > PitchedDevPtr.pitch)
     RETURN(hipErrorInvalidValue);
+
+  // The hipPitchedPtr struct does not carry the allocation's depth, so
+  // recover the maximum valid depth from the AllocationTracker. Without
+  // this clamp, an over-sized depth (e.g. SIZE_MAX or "depth+1") falls
+  // through to the backend memset which then segfaults on out-of-bounds
+  // strided writes (Unit_hipMemset3D_Negative_InvalidSizes).
+  auto *AllocTracker = Backend->getActiveDevice()->AllocTracker;
+  auto *AllocInfo = AllocTracker->getAllocInfo(PitchedDevPtr.ptr);
+  if (AllocInfo && PitchedDevPtr.pitch > 0 && PitchedDevPtr.ysize > 0) {
+    size_t Slice = PitchedDevPtr.pitch * PitchedDevPtr.ysize;
+    size_t MaxDepth = (Slice > 0) ? AllocInfo->Size / Slice : 0;
+    if (Extent.depth > MaxDepth)
+      RETURN(hipErrorInvalidValue);
+  }
 
   auto ChipQueue = Backend->getActiveDevice()->getDefaultQueue();
   auto Res = hipMemset3DAsyncInternal(PitchedDevPtr, Value, Extent, ChipQueue);
