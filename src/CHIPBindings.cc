@@ -750,7 +750,66 @@ hipError_t hipPointerGetAttribute(void *data, hipPointer_attribute attribute,
   if (!ptr)
     RETURN(hipErrorInvalidValue);
 
-  UNIMPLEMENTED(hipErrorNotSupported);
+  chipstar::AllocationInfo *AllocInfo = nullptr;
+  for (auto *Dev : Backend->getDevices()) {
+    AllocInfo = Dev->AllocTracker->getAllocInfo(ptr);
+    if (AllocInfo)
+      break;
+  }
+  if (!AllocInfo)
+    RETURN(hipErrorInvalidValue);
+
+  switch (attribute) {
+  case HIP_POINTER_ATTRIBUTE_MEMORY_TYPE:
+    *static_cast<unsigned int *>(data) =
+        static_cast<unsigned int>(AllocInfo->MemoryType);
+    RETURN(hipSuccess);
+  case HIP_POINTER_ATTRIBUTE_DEVICE_POINTER:
+    if (AllocInfo->MemoryType == hipMemoryTypeHost &&
+        !AllocInfo->Flags.isMapped())
+      RETURN(hipErrorInvalidValue);
+    *static_cast<void **>(data) = AllocInfo->DevPtr;
+    RETURN(hipSuccess);
+  case HIP_POINTER_ATTRIBUTE_HOST_POINTER:
+    if (!AllocInfo->HostPtr || AllocInfo->MemoryType == hipMemoryTypeDevice)
+      RETURN(hipErrorInvalidValue);
+    *static_cast<void **>(data) = AllocInfo->HostPtr;
+    RETURN(hipSuccess);
+  case HIP_POINTER_ATTRIBUTE_BUFFER_ID:
+    *static_cast<uint64_t *>(data) = AllocInfo->BufferId;
+    RETURN(hipSuccess);
+  case HIP_POINTER_ATTRIBUTE_IS_MANAGED:
+    *static_cast<unsigned int *>(data) =
+        (AllocInfo->MemoryType == hipMemoryTypeManaged) ? 1u : 0u;
+    RETURN(hipSuccess);
+  case HIP_POINTER_ATTRIBUTE_DEVICE_ORDINAL:
+    *static_cast<int *>(data) = AllocInfo->Device;
+    RETURN(hipSuccess);
+  case HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR:
+    if (AllocInfo->MemoryType == hipMemoryTypeHost &&
+        !AllocInfo->Flags.isMapped())
+      RETURN(hipErrorInvalidValue);
+    *static_cast<void **>(data) = AllocInfo->DevPtr;
+    RETURN(hipSuccess);
+  case HIP_POINTER_ATTRIBUTE_RANGE_SIZE:
+    *static_cast<size_t *>(data) = AllocInfo->Size;
+    RETURN(hipSuccess);
+  case HIP_POINTER_ATTRIBUTE_MAPPED: {
+    bool Mapped = AllocInfo->MemoryType == hipMemoryTypeDevice ||
+                  AllocInfo->MemoryType == hipMemoryTypeManaged ||
+                  AllocInfo->MemoryType == hipMemoryTypeUnified ||
+                  (AllocInfo->MemoryType == hipMemoryTypeHost &&
+                   AllocInfo->Flags.isMapped());
+    *static_cast<unsigned int *>(data) = Mapped ? 1u : 0u;
+    RETURN(hipSuccess);
+  }
+  case HIP_POINTER_ATTRIBUTE_SYNC_MEMOPS:
+  case HIP_POINTER_ATTRIBUTE_ACCESS_FLAGS:
+    *static_cast<unsigned int *>(data) = 0u;
+    RETURN(hipSuccess);
+  default:
+    RETURN(hipErrorNotSupported);
+  }
   CHIP_CATCH
 }
 
@@ -1903,6 +1962,10 @@ hipError_t hipGraphMemcpyNodeSetParams(hipGraphNode_t node,
   CHIP_TRY
   LOCK(ApiMtx);
   CHIPInitialize();
+
+  if (!node || !pNodeParams)
+    RETURN(hipErrorInvalidValue);
+
   static_cast<CHIPGraphNodeMemcpy *>(node)->setParams(pNodeParams);
   RETURN(hipSuccess);
   CHIP_CATCH
@@ -1914,6 +1977,10 @@ hipError_t hipGraphExecMemcpyNodeSetParams(hipGraphExec_t hGraphExec,
   CHIP_TRY
   LOCK(ApiMtx);
   CHIPInitialize();
+
+  if (!hGraphExec || !node || !pNodeParams)
+    RETURN(hipErrorInvalidValue);
+
   auto ExecNode =
       EXEC(hGraphExec)->getOriginalGraphPtr()->nodeLookup(NODE(node));
   if (!ExecNode)
@@ -2070,6 +2137,10 @@ hipError_t hipGraphMemcpyNodeSetParamsFromSymbol(hipGraphNode_t node, void *dst,
   CHIP_TRY
   LOCK(ApiMtx);
   CHIPInitialize();
+
+  if (!node || !dst || !symbol)
+    RETURN(hipErrorInvalidValue);
+
   static_cast<CHIPGraphNodeMemcpyFromSymbol *>(node)->setParams(
       dst, symbol, count, offset, kind);
   RETURN(hipSuccess);
@@ -2082,6 +2153,10 @@ hipError_t hipGraphExecMemcpyNodeSetParamsFromSymbol(
   CHIP_TRY
   LOCK(ApiMtx);
   CHIPInitialize();
+
+  if (!hGraphExec || !node || !dst || !symbol)
+    RETURN(hipErrorInvalidValue);
+
   // Graph obtained from hipGraphExec_t is a clone of the original
   CHIPGraph *Graph = EXEC(hGraphExec)->getOriginalGraphPtr();
   // KernelNode here is a handle to the original
@@ -2124,6 +2199,10 @@ hipError_t hipGraphMemcpyNodeSetParamsToSymbol(hipGraphNode_t node,
   CHIP_TRY
   LOCK(ApiMtx);
   CHIPInitialize();
+
+  if (!node || !symbol || !src)
+    RETURN(hipErrorInvalidValue);
+
   static_cast<CHIPGraphNodeMemcpyToSymbol *>(node)->setParams(
       const_cast<void *>(src), symbol, count, offset, kind);
   RETURN(hipSuccess);
@@ -2136,6 +2215,10 @@ hipError_t hipGraphExecMemcpyNodeSetParamsToSymbol(
   CHIP_TRY
   LOCK(ApiMtx);
   CHIPInitialize();
+
+  if (!hGraphExec || !node || !symbol || !src)
+    RETURN(hipErrorInvalidValue);
+
   auto ExecNode =
       EXEC(hGraphExec)->getOriginalGraphPtr()->nodeLookup(NODE(node));
   if (!ExecNode)
@@ -2194,6 +2277,10 @@ hipError_t hipGraphMemsetNodeGetParams(hipGraphNode_t node,
   CHIP_TRY
   LOCK(ApiMtx);
   CHIPInitialize();
+
+  if (!node || !pNodeParams)
+    RETURN(hipErrorInvalidValue);
+
   hipMemsetParams Params =
       static_cast<CHIPGraphNodeMemset *>(node)->getParams();
   *pNodeParams = Params;
@@ -2206,6 +2293,20 @@ hipError_t hipGraphMemsetNodeSetParams(hipGraphNode_t node,
   CHIP_TRY
   LOCK(ApiMtx);
   CHIPInitialize();
+
+  if (!node || !pNodeParams)
+    RETURN(hipErrorInvalidValue);
+
+  if (!pNodeParams->dst)
+    RETURN(hipErrorInvalidValue);
+
+  if (pNodeParams->elementSize != 1 && pNodeParams->elementSize != 2 &&
+      pNodeParams->elementSize != 4)
+    RETURN(hipErrorInvalidValue);
+
+  if (pNodeParams->height == 0 || pNodeParams->width == 0)
+    RETURN(hipErrorInvalidValue);
+
   static_cast<CHIPGraphNodeMemset *>(node)->setParams(pNodeParams);
   RETURN(hipSuccess);
   CHIP_CATCH
@@ -2217,6 +2318,10 @@ hipError_t hipGraphExecMemsetNodeSetParams(hipGraphExec_t hGraphExec,
   CHIP_TRY
   LOCK(ApiMtx);
   CHIPInitialize();
+
+  if (!hGraphExec || !node || !pNodeParams)
+    RETURN(hipErrorInvalidValue);
+
   auto ExecNode =
       EXEC(hGraphExec)->getOriginalGraphPtr()->nodeLookup(NODE(node));
   if (!ExecNode)
@@ -3523,14 +3628,21 @@ hipError_t hipSetDeviceFlags(unsigned Flags) {
   LOCK(ApiMtx);
   CHIPInitialize();
 
-  // Invalid flag check
-  if (Flags != hipDeviceScheduleAuto && Flags != hipDeviceScheduleSpin &&
-      Flags != hipDeviceScheduleYield &&
-      Flags != hipDeviceScheduleBlockingSync &&
-      Flags != hipDeviceMapHost) {
+  constexpr unsigned int ValidMask =
+      hipDeviceScheduleMask | hipDeviceMapHost | hipDeviceLmemResizeToMax;
+  if ((Flags & ~ValidMask) != 0)
+    RETURN(hipErrorInvalidValue);
+
+  const unsigned int ScheduleBits = Flags & hipDeviceScheduleMask;
+  if (ScheduleBits != hipDeviceScheduleAuto &&
+      ScheduleBits != hipDeviceScheduleSpin &&
+      ScheduleBits != hipDeviceScheduleYield &&
+      ScheduleBits != hipDeviceScheduleBlockingSync) {
     RETURN(hipErrorInvalidValue);
   }
 
+  // Match ROCm semantics: only schedule bits are persisted.
+  Backend->getActiveDevice()->setDeviceFlags(Flags & hipDeviceScheduleMask);
   RETURN(hipSuccess);
   CHIP_CATCH
 }
@@ -6972,7 +7084,8 @@ hipError_t hipGetDeviceFlags(unsigned int *Flags) {
   if (!Flags)
     RETURN(hipErrorInvalidValue);
 
-  UNIMPLEMENTED(hipErrorNotSupported);
+  *Flags = Backend->getActiveDevice()->getDeviceFlags();
+  RETURN(hipSuccess);
   CHIP_CATCH
 }
 
