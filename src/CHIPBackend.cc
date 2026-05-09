@@ -1599,6 +1599,7 @@ void chipstar::Context::reset() {
   // and post-reset hipMemcpy{To,From}Symbol crashes (sample
   // hipTestSymbolReset).
   Dev->deallocateDeviceVariables();
+
   // Drain every recorded allocation belonging to this device. AllocatedPtrs_
   // was never populated, so snapshot the AllocationTracker via the public
   // visitor and ensure all device pointers handed to the user become

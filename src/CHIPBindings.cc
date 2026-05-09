@@ -5913,7 +5913,9 @@ static inline hipError_t hipMemset2DAsyncInternal(void *Dst, size_t Pitch,
   LOCK(ChipQueue->QueueMtx);
 
   auto *AllocTracker = Backend->getActiveDevice()->AllocTracker;
-  const auto *AllocInfo = AllocTracker->getAllocInfo(Dst);
+  // Use range-aware lookup so pointers offset into a base allocation
+  // (Unit_hipMemset2DASyncMulti) are accepted.
+  const auto *AllocInfo = AllocTracker->getAllocInfoCheckPtrRanges(Dst);
   if (!AllocInfo || !AllocInfo->isDeviceAccessible())
     CHIPERR_LOG_AND_THROW("Invalid destination pointer!", hipErrorInvalidValue);
   if (Width > Pitch)
