@@ -6212,7 +6212,11 @@ static inline hipError_t validateDevicePtrForMemset(hipDeviceptr_t Dst,
   if (!Dst)
     return hipErrorInvalidValue;
   auto *AllocTracker = Backend->getActiveDevice()->AllocTracker;
-  const auto *AI = AllocTracker->getAllocInfo(Dst);
+  // Range-aware lookup so memset on an offset pointer into a tracked
+  // allocation is accepted (Unit_hipMemsetASyncMulti / DASyncMulti).
+  const auto *AI = AllocTracker->getAllocInfoCheckPtrRanges(Dst);
+  if (!AI)
+    AI = AllocTracker->getAllocInfo(Dst);
   if (!AI)
     return hipErrorInvalidValue;
   if (SizeBytes) {
