@@ -1352,6 +1352,10 @@ protected:
   /// Device-scope flags as set by hipSetDeviceFlags / hipCtxCreate.
   unsigned int DeviceFlags_ = hipDeviceScheduleAuto;
 
+  /// Last-set L1/shared cache hint. Recorded so Get/Set round-trips
+  /// match the HIP/CUDA contract; cache behaviour itself is unaffected.
+  hipFuncCache_t CacheConfig_ = hipFuncCachePreferNone;
+
   // only callable from derived classes, because we need to call also init()
   Device(chipstar::Context *Ctx, int DeviceIdx);
   // initializer. may call virtual methods

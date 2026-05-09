@@ -1084,19 +1084,29 @@ int chipstar::Device::getPeerAccess(chipstar::Device *PeerDevice) {
   UNIMPLEMENTED(0);
 }
 
-void chipstar::Device::setCacheConfig(hipFuncCache_t Cfg) { UNIMPLEMENTED(); }
+void chipstar::Device::setCacheConfig(hipFuncCache_t Cfg) {
+  // chipStar doesn't actually steer the L1/shared split per-device — the
+  // backend has no equivalent control — but CUDA/HIP semantics permit
+  // accepting and remembering the hint so the matching get* call returns
+  // what the user set. Real cache behavior is unchanged.
+  CacheConfig_ = Cfg;
+}
 
 void chipstar::Device::setFuncCacheConfig(const void *Func,
                                           hipFuncCache_t Cfg) {
-  UNIMPLEMENTED();
+  // No-op: CUDA/HIP define this as a hint and AMD docs explicitly state
+  // it has no effect. Returning success lets apps that always set a hint
+  // proceed normally.
 }
 
-hipFuncCache_t chipstar::Device::getCacheConfig() {
-  UNIMPLEMENTED(hipFuncCachePreferNone);
-}
+hipFuncCache_t chipstar::Device::getCacheConfig() { return CacheConfig_; }
 
 hipSharedMemConfig chipstar::Device::getSharedMemConfig() {
-  return hipSharedMemBankSizeDefault;
+  // HIP/CUDA semantics on non-Kepler GPUs: the bank-size selector is
+  // ignored and the device reports the natural FourByte mode. Returning
+  // BankSizeDefault made several catch tests fail (they explicitly
+  // require FourByte on non-Kepler). Match the documented behaviour.
+  return hipSharedMemBankSizeFourByte;
 }
 
 void chipstar::Device::removeContext(chipstar::Context *Context) {}
