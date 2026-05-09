@@ -3038,7 +3038,13 @@ hipError_t hipStreamEndCapture(hipStream_t stream, hipGraph_t *pGraph) {
   if (!stream)
     RETURN(hipErrorIllegalState);
 
-  auto ChipQueue = static_cast<chipstar::Queue *>(stream);
+  // The stream pointer may be dangling if the user destroyed it after
+  // BeginCapture (Unit_hipStreamEndCapture_Negative -> "Destroy stream
+  // and try to end capture" expects hipErrorContextIsDestroyed). Use
+  // findQueue to verify the stream is still owned by the backend; it
+  // throws hipErrorContextIsDestroyed when the lookup misses.
+  auto ChipQueue =
+      Backend->findQueue(static_cast<chipstar::Queue *>(stream));
 
   if (!ChipQueue)
     RETURN(hipErrorInvalidValue);
