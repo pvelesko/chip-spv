@@ -4975,26 +4975,77 @@ hipError_t hipMallocArray(hipArray **Array, const hipChannelFormatDesc *Desc,
     RETURN(hipErrorInvalidValue);
   }
 
-  // Valid channel format check
+  // Reject sizes exceeding the device's reported maxTexture* limits. The
+  // catch test Unit_hipMallocArray_MaxTexture_Default expects
+  // hipErrorInvalidValue when width/height are above the values reported in
+  // hipDeviceProp_t::maxTexture1D / maxTexture2D[].
+  {
+    auto *Dev = Backend->getActiveDevice();
+    const auto &Props = Dev->getDeviceProps();
+    if (Height == 0) {
+      // 1D array.
+      if (Props.maxTexture1D > 0 &&
+          Width > static_cast<size_t>(Props.maxTexture1D))
+        RETURN(hipErrorInvalidValue);
+    } else {
+      // 2D array.
+      if (Props.maxTexture2D[0] > 0 &&
+          Width > static_cast<size_t>(Props.maxTexture2D[0]))
+        RETURN(hipErrorInvalidValue);
+      if (Props.maxTexture2D[1] > 0 &&
+          Height > static_cast<size_t>(Props.maxTexture2D[1]))
+        RETURN(hipErrorInvalidValue);
+    }
+  }
+
+  // Valid channel format check.
+  // Tests Unit_hipMallocArray_Negative_InvalidChannelFormat and friends
+  // expect hipErrorUnknown on the SPIRV/non-AMD branch; HIP_CHECK_ERROR
+  // accepts that as the matching error.
   if (Desc->f != hipChannelFormatKindFloat &&
       Desc->f != hipChannelFormatKindUnsigned &&
       Desc->f != hipChannelFormatKindSigned) {
-    CHIPERR_LOG_AND_THROW("Invalid channel format", hipErrorInvalidValue);
+    CHIPERR_LOG_AND_THROW("Invalid channel format", hipErrorUnknown);
   }
 
-  // Valid bit channels check
-  /*if ((Desc->x != 8 && Desc->x != 16 && Desc->x != 32) ||
-      (Desc->y != 8 && Desc->y != 16 && Desc->y != 32) ||
-      (Desc->z != 8 && Desc->z != 16 && Desc->z != 32) ||
-      (Desc->w != 8 && Desc->w != 16 && Desc->w != 32)) {
-    CHIPERR_LOG_AND_THROW("Invalid bit channels", hipErrorInvalidValue);
-  }*/
+  // Bit-width validity (only 8/16/32 channels supported, plus 0 for unused
+  // trailing channels). Tests Unit_hipMallocArray_Negative_BadNumberOfBits
+  // expect hipErrorUnknown for the SPIRV branch.
+  auto IsValidChannelBits = [](int Bits) {
+    return Bits == 0 || Bits == 8 || Bits == 16 || Bits == 32;
+  };
+  if (!IsValidChannelBits(Desc->x) || !IsValidChannelBits(Desc->y) ||
+      !IsValidChannelBits(Desc->z) || !IsValidChannelBits(Desc->w)) {
+    CHIPERR_LOG_AND_THROW("Invalid bit channels", hipErrorUnknown);
+  }
 
-  // Different sizes channels check
-  /*if(Desc->x != Desc->y || Desc->x != Desc->z || Desc->x != Desc->w){
-    CHIPERR_LOG_AND_THROW("Channels of different sizes not supported",
-  hipErrorInvalidValue);
-  }*/
+  // No channel may be present after a zero-size channel
+  // (Unit_hipMallocArray_Negative_ChannelAfterZeroChannel).
+  if ((Desc->x == 0 && (Desc->y != 0 || Desc->z != 0 || Desc->w != 0)) ||
+      (Desc->y == 0 && (Desc->z != 0 || Desc->w != 0)) ||
+      (Desc->z == 0 && Desc->w != 0)) {
+    CHIPERR_LOG_AND_THROW("Channel descriptor has gap", hipErrorUnknown);
+  }
+
+  // All non-zero channels must share the same bit size
+  // (Unit_hipMallocArray_Negative_DifferentChannelSizes).
+  {
+    int RefBits = 0;
+    auto Check = [&RefBits](int Bits) {
+      if (Bits == 0)
+        return true;
+      if (RefBits == 0) {
+        RefBits = Bits;
+        return true;
+      }
+      return Bits == RefBits;
+    };
+    if (!Check(Desc->x) || !Check(Desc->y) || !Check(Desc->z) ||
+        !Check(Desc->w)) {
+      CHIPERR_LOG_AND_THROW("Channels of different sizes not supported",
+                            hipErrorUnknown);
+    }
+  }
 
   // Inappropriate flags check for 1D arrays
   if (Height == 0) {
@@ -5016,17 +5067,20 @@ hipError_t hipMallocArray(hipArray **Array, const hipChannelFormatDesc *Desc,
 
   ERROR_IF((Width == 0), hipErrorInvalidValue);
 
-  // 8-bit float channels check (unsupported)
+  // 8-bit float channels check (unsupported).
+  // Tests Unit_hipMallocArray_Negative_8bitFloat expect hipErrorUnknown for
+  // the SPIRV branch.
   if ((Desc->x == 8 || Desc->y == 8 || Desc->z == 8 || Desc->w == 8) &&
       Desc->f == hipChannelFormatKindFloat) {
     CHIPERR_LOG_AND_THROW("8-bit float channels not supported",
-                          hipErrorInvalidValue);
+                          hipErrorUnknown);
   }
 
-  // creating elements with 3 channels is not supported.
+  // creating elements with 3 channels is not supported
+  // (Unit_hipMallocArray_Negative_3ChannelElement).
   if (Desc->x != 0 && Desc->y != 0 && Desc->z != 0 && Desc->w == 0) {
     CHIPERR_LOG_AND_THROW("Creating elements with 3 channels is not supported",
-                          hipErrorInvalidValue);
+                          hipErrorUnknown);
   }
 
   *Array = new hipArray;
