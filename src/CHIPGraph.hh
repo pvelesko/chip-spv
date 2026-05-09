@@ -284,7 +284,7 @@ public:
 
   hipKernelNodeParams getParams() const { return Params_; }
 
-  void setParams(const hipKernelNodeParams Params) { Params_ = Params; }
+  void setParams(const hipKernelNodeParams Params);
   /**
    * @brief Createa a copy of this node
    * Must copy over all the arguments

@@ -94,6 +94,37 @@ CHIPGraphNode *CHIPGraphNodeKernel::clone() const {
   return NewNode;
 }
 
+void CHIPGraphNodeKernel::setParams(const hipKernelNodeParams Params) {
+  // Update Params_ and rebuild the ExecItem_ so the change reaches launch().
+  // The original implementation only assigned Params_, leaving ExecItem_ —
+  // which is what execute() actually launches — pointing at the old kernel
+  // and the old argument bytes. That made hipGraphExecKernelNodeSetParams
+  // a no-op at runtime.
+  Params_.blockDim = Params.blockDim;
+  Params_.extra = Params.extra;
+  Params_.func = Params.func;
+  Params_.gridDim = Params.gridDim;
+  Params_.sharedMemBytes = Params.sharedMemBytes;
+
+  auto *Dev = Backend->getActiveDevice();
+  chipstar::Kernel *ChipKernel = Dev->findKernel(HostPtr(Params_.func));
+  if (!ChipKernel)
+    CHIPERR_LOG_AND_THROW("Could not find requested kernel",
+                          hipErrorInvalidDeviceFunction);
+
+  ArgList_.clear();
+  ArgData_.clear();
+  copyKernelArgs(ArgList_, ArgData_, Params.kernelParams,
+                 *ChipKernel->getFuncInfo());
+  Params_.kernelParams = ArgList_.data();
+
+  ExecItem_ = Backend->createExecItem(Params_.gridDim, Params_.blockDim,
+                                      Params_.sharedMemBytes, nullptr);
+  ExecItem_->setKernel(ChipKernel);
+  ExecItem_->setArgs(Params.kernelParams);
+  ExecItem_->setupAllArgs();
+}
+
 void CHIPGraphNodeMemset::execute(chipstar::Queue *Queue) const {
   const unsigned int Val = Params_.value;
   size_t Height = std::max<size_t>(1, Params_.height);
