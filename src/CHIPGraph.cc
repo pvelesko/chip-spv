@@ -145,6 +145,13 @@ void CHIPGraphNodeMemcpy::execute(chipstar::Queue *Queue) const {
   }
 }
 void CHIPGraphNodeKernel::execute(chipstar::Queue *Queue) const {
+  // Graph kernel nodes bypass the regular hipLaunchKernel entry point, so
+  // device-side __constant__ / __device__ globals referenced by the kernel
+  // are never allocated. Without this, the OpenCL backend hits
+  // "Internal chipStar error: device global not allocated" when it tries
+  // to bind a hidden DeviceGlobal arg. Mirror what hipLaunchKernelInternal
+  // does up front.
+  Backend->getActiveDevice()->prepareDeviceVariables(HostPtr(Params_.func));
   Queue->launch(ExecItem_);
 }
 

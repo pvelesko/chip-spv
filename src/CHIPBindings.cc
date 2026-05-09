@@ -1946,6 +1946,12 @@ hipError_t hipGraphAddKernelNode(hipGraphNode_t *pGraphNode, hipGraph_t graph,
       RETURN(hipErrorInvalidValue);
   }
 
+  // Resolve __device__/__constant__ globals referenced by this kernel before
+  // the node ctor builds an ExecItem and binds args. Without this, the
+  // OpenCL backend later throws "device global not allocated" while the
+  // graph node is still being constructed (catch tests
+  // Unit_hipGraphAddMemcpyNodeFromSymbol_GlobalMemoryWithKernel and friends).
+  Backend->getActiveDevice()->prepareDeviceVariables(HostPtr(pNodeParams->func));
   CHIPGraphNodeKernel *Node = new CHIPGraphNodeKernel{pNodeParams};
   Node->addDependencies(DECONST_NODES(pDependencies), numDependencies);
   *pGraphNode = Node;
