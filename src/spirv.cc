@@ -1594,6 +1594,38 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
         PodArgsOcl.push_back(I);
     }
 
+    // Heuristic fallback for extern "C" kernels: when demangling produces no
+    // signature (extern "C" symbols have unmangled names and so __cxa_demangle
+    // returns nothing useful), we still need a HIP source-order arg-kind
+    // sequence. Otherwise the legacy fallback emits reflection-ord order
+    // (storage buffers first, then push constants), which mismatches HIP
+    // source order whenever the kernel has both pointer and POD args — the
+    // runtime then calls clSetKernelArgDevicePointerEXT on POD values and
+    // launchImpl fails with CL_INVALID_KERNEL_ARGS.
+    //
+    // Assume the libCEED / common-HIP convention: PODs (scalars, sizes,
+    // flags) come first, then output/input pointers. This matches every
+    // extern "C" kernel exposed by libCEED's hip-ref/hip-shared backends
+    // (Interp, Grad, Weight, *Transpose, *AtPoints, restriction kernels,
+    // etc.) and is the dominant pattern in HIP-tests as well. Kernels
+    // following a different convention will still misbehave under this
+    // fallback — for those a proper SPV-side source-order encoding is
+    // needed (see TODO below).
+    //
+    // TODO: encode HIP source arg-kinds directly in the SPV via the
+    // HIPSPV bridging pass (e.g. as a private global string consumed by
+    // hipspv-inject-reflection and surfaced through the kernel attrs
+    // OpString), so this heuristic isn't needed.
+    if (IsPtrPerHipArg.empty() && !PointerArgsOcl.empty() &&
+        !PodArgsOcl.empty()) {
+      IsPtrPerHipArg.reserve(PodArgsOcl.size() + PointerArgsOcl.size());
+      IsPtrPerHipArg.insert(IsPtrPerHipArg.end(), PodArgsOcl.size(), false);
+      IsPtrPerHipArg.insert(IsPtrPerHipArg.end(), PointerArgsOcl.size(), true);
+      logDebug("Reflect kernel='{}' demangle failed (extern \"C\"?); "
+               "assuming source order = {} PODs then {} pointers",
+               Rec.Name, PodArgsOcl.size(), PointerArgsOcl.size());
+    }
+
     std::vector<SPVArgTypeInfo> ArgInfos;
     ArgInfos.reserve(Rec.Args.size());
 
