@@ -3139,7 +3139,13 @@ hipError_t hipStreamBeginCapture(hipStream_t stream,
       mode != hipStreamCaptureModeRelaxed)
     RETURN(hipErrorInvalidValue);
 
-  auto ChipQueue = static_cast<chipstar::Queue *>(stream);
+  // Resolve hipStreamPerThread / hipStreamLegacy magic pointers via
+  // findQueue; otherwise we dereference a sentinel constant like 0x2 and
+  // segfault (Unit_hipStreamBeginCapture_hipStreamPerThread).
+  auto ChipQueue =
+      Backend->findQueue(static_cast<chipstar::Queue *>(stream));
+  if (!ChipQueue)
+    RETURN(hipErrorInvalidResourceHandle);
 
   if (ChipQueue == Backend->getActiveDevice()->getLegacyDefaultQueue())
     RETURN(hipErrorInvalidValue);
