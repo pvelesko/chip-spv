@@ -4474,6 +4474,11 @@ hipError_t hipStreamWaitEventInternal(hipStream_t Stream, hipEvent_t Event,
     ChipQueue->setCaptureStatus(hipStreamCaptureStatusActive);
     if (auto RecordedId = ChipEvent->getRecordedCaptureId())
       ChipQueue->setCaptureId(RecordedId);
+    // Stream is now in active capture but had no graph yet. Initialize one
+    // so subsequent capture API calls (kernel/memcpy/wait) have somewhere
+    // to deposit graph nodes instead of segfaulting on a null graph.
+    if (!ChipQueue->getCaptureGraph())
+      ChipQueue->initCaptureGraph();
   }
   if (ChipQueue->captureIntoGraph<CHIPGraphNodeWaitEvent>(ChipEvent)) {
     return hipSuccess;
