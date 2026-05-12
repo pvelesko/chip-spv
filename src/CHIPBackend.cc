@@ -2212,6 +2212,13 @@ void chipstar::Queue::updateLastNode(CHIPGraphNode *NewNode) {
   if (LastNode_ != nullptr) {
     NewNode->addDependency(LastNode_);
   }
+  // Consume any fork-in dependencies recorded by hipStreamWaitEvent during
+  // capture so the next node on this stream depends on the join points.
+  for (CHIPGraphNode *Dep : PendingCaptureDeps_) {
+    if (Dep && Dep != LastNode_)
+      NewNode->addDependency(Dep);
+  }
+  PendingCaptureDeps_.clear();
   LastNode_ = NewNode;
 }
 

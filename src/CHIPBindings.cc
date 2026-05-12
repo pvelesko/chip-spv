@@ -3229,6 +3229,10 @@ hipError_t hipStreamEndCapture(hipStream_t stream, hipGraph_t *pGraph) {
       if (Q->getCaptureId() == EndedCaptureId) {
         Q->setCaptureStatus(hipStreamCaptureStatus::hipStreamCaptureStatusNone);
         Q->setCaptureId(0);
+        // Forked queue shared the owning queue's CaptureGraph pointer; the
+        // user is about to take ownership via *pGraph, so just drop our
+        // reference and reset per-stream node bookkeeping.
+        Q->clearCaptureState();
       }
     }
   }
@@ -3237,6 +3241,10 @@ hipError_t hipStreamEndCapture(hipStream_t stream, hipGraph_t *pGraph) {
     *pGraph = ChipQueue->getCaptureGraph();
   else
     RETURN(hipErrorContextIsDestroyed);
+  // Reset the owning stream's per-capture bookkeeping (LastNode_, pending
+  // fork-in deps). The graph pointer was handed off above, so null it out
+  // here to avoid double-ownership on a subsequent BeginCapture.
+  ChipQueue->clearCaptureState();
 
   RETURN(hipSuccess);
   CHIP_CATCH
@@ -4484,13 +4492,38 @@ hipError_t hipStreamWaitEventInternal(hipStream_t Stream, hipEvent_t Event,
     ChipQueue->setCaptureStatus(hipStreamCaptureStatusActive);
     if (auto RecordedId = ChipEvent->getRecordedCaptureId())
       ChipQueue->setCaptureId(RecordedId);
-    // Stream is now in active capture but had no graph yet. Initialize one
-    // so subsequent capture API calls (kernel/memcpy/wait) have somewhere
-    // to deposit graph nodes instead of segfaulting on a null graph.
-    if (!ChipQueue->getCaptureGraph())
-      ChipQueue->initCaptureGraph();
+    // Share the recording stream's CaptureGraph so fork/join work on the
+    // destination stream lands in the same graph (CUDA fork/join model).
+    // We locate it by walking the device's queues for one whose CaptureId
+    // matches the propagated id. Falling back to initCaptureGraph would
+    // create a disconnected per-stream graph and silently drop work.
+    if (!ChipQueue->getCaptureGraph()) {
+      CHIPGraph *SharedGraph = nullptr;
+      if (auto RecordedId = ChipEvent->getRecordedCaptureId()) {
+        for (auto *Q :
+             Backend->getActiveDevice()->getQueuesNoLock()) {
+          if (Q && Q->getCaptureId() == RecordedId && Q->getCaptureGraph()) {
+            SharedGraph = Q->getCaptureGraph();
+            break;
+          }
+        }
+      }
+      if (SharedGraph)
+        ChipQueue->setCaptureGraph(SharedGraph);
+      else
+        ChipQueue->initCaptureGraph();
+    }
   }
-  if (ChipQueue->captureIntoGraph<CHIPGraphNodeWaitEvent>(ChipEvent)) {
+  if (ChipQueue->getCaptureStatus() == hipStreamCaptureStatusActive) {
+    // CUDA semantics: hipStreamWaitEvent inside capture is NOT a graph node;
+    // it produces a cross-stream dependency edge consumed by the next
+    // captured node on the waiting stream. If the source event was recorded
+    // on a capturing stream, it carries a frontier node — register it as a
+    // pending fork-in dep. If the source event has no captured frontier
+    // (recorded outside capture), the wait is a no-op for the graph.
+    if (ChipEvent && ChipEvent->wasRecordedFromCapturingStream()) {
+      ChipQueue->addPendingCaptureDep(ChipEvent->getRecordedCaptureNode());
+    }
     return hipSuccess;
   }
   ERROR_IF((!ChipQueue), hipErrorInvalidResourceHandle);
@@ -4705,7 +4738,14 @@ hipError_t hipEventRecordInternal(hipEvent_t Event, hipStream_t Stream) {
   ChipEvent->setRecordedFromCapturingStream(QueueCapturing);
   ChipEvent->setRecordedCaptureId(QueueCapturing ? ChipQueue->getCaptureId()
                                                   : 0);
-  if (ChipQueue->captureIntoGraph<CHIPGraphNodeEventRecord>(ChipEvent)) {
+  if (QueueCapturing) {
+    // CUDA semantics: hipEventRecord inside a stream capture does NOT add a
+    // node to the graph; it merely snapshots the current "frontier" so a
+    // subsequent hipStreamWaitEvent on another stream can create a fork/join
+    // edge back to whatever work preceded the record. Tests covering this:
+    // Unit_hipStreamBeginCapture_InterStrmEventSync_* (numNodes1 == 1),
+    // _captureEmptyStreams (numNodes == 0), _multiplestrms, _streamReuse.
+    ChipEvent->setRecordedCaptureNode(ChipQueue->getLastNode());
     return hipSuccess;
   }
 

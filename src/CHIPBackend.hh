@@ -730,6 +730,11 @@ protected:
   // when the event was recorded outside of a capture. Propagated to a
   // forked stream via hipStreamWaitEvent so EndCapture can reset that fork.
   unsigned long long RecordedCaptureId_ = 0;
+  // Snapshot of the recording stream's LastNode_ at the moment
+  // hipEventRecord was called inside an active stream capture. A later
+  // hipStreamWaitEvent on a (possibly different) stream uses this to add a
+  // cross-stream dependency edge in the shared capture graph.
+  CHIPGraphNode *RecordedCaptureNode_ = nullptr;
 
   /**
    * @brief Events are always created with a context
@@ -766,6 +771,8 @@ public:
     return RecordedCaptureId_;
   }
   void setRecordedCaptureId(unsigned long long Id) { RecordedCaptureId_ = Id; }
+  CHIPGraphNode *getRecordedCaptureNode() const { return RecordedCaptureNode_; }
+  void setRecordedCaptureNode(CHIPGraphNode *N) { RecordedCaptureNode_ = N; }
   /// @brief Add an event on which this event depends, preventing that event
   /// from getting recycled
   /// @param Event
@@ -2183,6 +2190,12 @@ protected:
   /// @brief  node for creating a dependency chain between subsequent record
   /// events when in graph capture mode
   CHIPGraphNode *LastNode_ = nullptr;
+  /// Cross-stream fork-in dependencies accumulated by hipStreamWaitEvent
+  /// during capture. The next captured node on this stream gains a
+  /// dependency on every node in this list, then the list is cleared.
+  /// Implements CUDA's "wait-event during capture creates a join edge,
+  /// not a graph node" semantics.
+  std::vector<CHIPGraphNode *> PendingCaptureDeps_;
   int Priority_;
   /**
    * @brief Maximum priority that can be had by a queue is 0; Priority range is
@@ -2350,6 +2363,43 @@ public:
   std::thread::id getCaptureThread() const { return CaptureThread_; }
   void setCaptureThread(std::thread::id Id) { CaptureThread_ = Id; }
   CHIPGraph *getCaptureGraph() const;
+
+  /// Adopt another stream's capture graph as our own (e.g. when joining a
+  /// fork created by hipStreamWaitEvent during capture). Does not free the
+  /// existing graph — caller is responsible for ownership semantics.
+  void setCaptureGraph(CHIPGraph *G) {
+    CaptureGraph_ = reinterpret_cast<hipGraph_t>(G);
+  }
+
+  /// Record that the next captured node on this stream must depend on
+  /// @p Node (cross-stream join edge). Called by hipStreamWaitEvent in
+  /// capture mode.
+  void addPendingCaptureDep(CHIPGraphNode *Node) {
+    if (Node)
+      PendingCaptureDeps_.push_back(Node);
+  }
+
+  /// Drain the pending fork-in dependencies; returned by-value and
+  /// internally cleared so the next captured node consumes them once.
+  std::vector<CHIPGraphNode *> takePendingCaptureDeps() {
+    auto V = std::move(PendingCaptureDeps_);
+    PendingCaptureDeps_.clear();
+    return V;
+  }
+
+  CHIPGraphNode *getLastNode() const { return LastNode_; }
+
+  /// Tear down per-stream capture-time bookkeeping. Called at
+  /// hipStreamEndCapture for every queue that participated in the capture,
+  /// so a subsequent hipStreamBeginCapture on the same stream starts from
+  /// a clean slate. The owning queue's CaptureGraph_ pointer is handed off
+  /// to the user; forked queues share the same pointer and must drop it
+  /// here without freeing.
+  void clearCaptureState() {
+    CaptureGraph_ = nullptr;
+    LastNode_ = nullptr;
+    PendingCaptureDeps_.clear();
+  }
 
   chipstar::Device *PerThreadQueueForDevice = nullptr;
 
