@@ -2024,9 +2024,14 @@ void CHIPQueueVulkan::recordEvent(chipstar::Event *Event) {
     (void)vkResetFences(ChipDevice_->getLogicalDevice(), 1, &SignalFence);
   }
 
-  checkVk(vkQueueSubmit(ChipDevice_->getComputeQueue(), 1, &Submit,
-                        SignalFence),
-          "CHIPQueueVulkan::recordEvent: vkQueueSubmit failed", hipErrorTbd);
+  {
+    // External sync required on VkQueue across all streams sharing this
+    // device's compute queue.
+    std::lock_guard<std::mutex> SubmitLock(ChipDevice_->getSubmitMtx());
+    checkVk(vkQueueSubmit(ChipDevice_->getComputeQueue(), 1, &Submit,
+                          SignalFence),
+            "CHIPQueueVulkan::recordEvent: vkQueueSubmit failed", hipErrorTbd);
+  }
 
   IsEmptyQueue_.store(false);
   EvVk->setRecording();
@@ -2739,6 +2744,8 @@ CHIPQueueVulkan::launchImpl(chipstar::ExecItem *ExecItem) {
 void CHIPQueueVulkan::finish() {
   VkQueue Q = ChipDevice_->getComputeQueue();
   if (Q != VK_NULL_HANDLE) {
+    // Per spec, vkQueueWaitIdle requires external sync on the VkQueue.
+    std::lock_guard<std::mutex> SubmitLock(ChipDevice_->getSubmitMtx());
     checkVk(vkQueueWaitIdle(Q),
             "CHIPQueueVulkan::finish: vkQueueWaitIdle failed", hipErrorTbd);
   }
@@ -2960,10 +2967,15 @@ std::shared_ptr<chipstar::Event> CHIPQueueVulkan::submitWithEvent(
     (void)vkResetFences(ChipDevice_->getLogicalDevice(), 1, &SignalFence);
   }
 
-  checkVk(vkQueueSubmit(ChipDevice_->getComputeQueue(), 1, &Submit,
-                        SignalFence),
-          "CHIPQueueVulkan::submitWithEvent: vkQueueSubmit failed",
-          hipErrorTbd);
+  {
+    // External sync required on VkQueue across all streams sharing this
+    // device's compute queue.
+    std::lock_guard<std::mutex> SubmitLock(ChipDevice_->getSubmitMtx());
+    checkVk(vkQueueSubmit(ChipDevice_->getComputeQueue(), 1, &Submit,
+                          SignalFence),
+            "CHIPQueueVulkan::submitWithEvent: vkQueueSubmit failed",
+            hipErrorTbd);
+  }
 
   IsEmptyQueue_.store(false);
   if (SignalVk)

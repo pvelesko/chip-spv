@@ -595,6 +595,13 @@ class CHIPDeviceVulkan : public chipstar::Device {
   std::vector<VkFence> FencePool_;
   std::mutex FencePoolMtx_;
 
+  /// Per-Vulkan-spec: vkQueueSubmit on a VkQueue must be externally
+  /// synchronized. Because every CHIPQueueVulkan stream on this device shares
+  /// the single ComputeQueue_, all submits are serialized through this mutex.
+  /// Mirrors the I6 spike-grade "one VkQueue per device" model; lifts to a
+  /// per-VkQueue mutex when multi-queue support lands.
+  mutable std::mutex SubmitMtx_;
+
   // ----- Per-module feature flags -----
   /// Set on Device construction from feature-detection; consumed by I3
   /// when validating that a module's required capabilities are satisfied.
@@ -641,6 +648,7 @@ public:
     return SubgroupProperties_;
   }
   VmaAllocator getAllocator() const { return Allocator_; }
+  std::mutex &getSubmitMtx() const { return SubmitMtx_; }
   VkPipelineCache getPipelineCache() const { return PipelineCache_; }
   VkCommandPool getCommandPool() const { return CommandPool_; }
   VkQueryPool getTimestampQueryPool() const { return TimestampQueryPool_; }
