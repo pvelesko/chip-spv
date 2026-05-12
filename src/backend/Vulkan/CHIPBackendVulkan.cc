@@ -472,42 +472,46 @@ void EventMonitorVulkan::monitor() {
       }
     }
 
-    // Step 3: Drain one entry from the callback queue per tick. Matches the
-    // Level0 cadence (one entry per 200us); a fully-drained queue is the
-    // common case so this isn't a throughput bottleneck.
+    // Step 3: Drain every ready callback per tick. Tests like
+    // Unit_hipStreamAddCallback_MultipleThreads enqueue ~1000 callbacks
+    // back-to-back; a one-per-200us drain rate cannot keep up before
+    // hipStreamSynchronize returns and the test exits.
     {
-      chipstar::CallbackData *CbData = nullptr;
-      bool Ready = false;
+      std::vector<chipstar::CallbackData *> ToExecute;
       {
         LOCK(Backend->CallbackQueueMtx);
-        if (!Backend->CallbackQueue.empty()) {
-          CbData = Backend->CallbackQueue.front();
+        size_t Pending = Backend->CallbackQueue.size();
+        for (size_t i = 0; i < Pending; ++i) {
+          chipstar::CallbackData *CbData = Backend->CallbackQueue.front();
           Backend->CallbackQueue.pop();
+          bool Ready = false;
           if (CbData && CbData->GpuReady) {
             LOCK(CbData->GpuReady->EventMtx);
             CbData->GpuReady->updateFinishStatus(false);
             Ready = (CbData->GpuReady->getEventStatus() ==
                      EVENT_STATUS_RECORDED);
+          } else if (CbData) {
+            // No GpuReady event attached: treat as immediately ready.
+            Ready = true;
           }
-          if (CbData && !Ready) {
-            // Not ready yet: rotate to the back so other callbacks get a
-            // chance and we retry on the next tick.
+          if (CbData && Ready) {
+            ToExecute.push_back(CbData);
+          } else if (CbData) {
+            // Rotate to the back; retry on the next tick.
             Backend->CallbackQueue.push(CbData);
-            CbData = nullptr;
           }
         }
       }
-      if (CbData && Ready) {
+      // Execute outside the lock so user callbacks that call into HIP
+      // (e.g. hipStreamAddCallback recursion) don't deadlock on
+      // CallbackQueueMtx.
+      for (auto *CbData : ToExecute) {
         CbData->execute(hipSuccess);
         if (CbData->CpuCallbackComplete)
           CbData->CpuCallbackComplete->hostSignal();
         if (CbData->GpuAck)
-          CbData->GpuAck->wait();
-        // NOTE: chipstar::CallbackData has a protected destructor, so the
-        // deletion must happen through a concrete subclass added by I11
-        // (CHIPCallbackDataVulkan — not yet defined; createCallbackData
-        // currently returns nullptr, so this branch is unreachable for the
-        // spike). When I11 lands the subclass, downcast and delete here.
+          CbData->GpuAck->hostSignal();
+        delete static_cast<CHIPCallbackDataVulkan *>(CbData);
       }
     }
 
@@ -2799,6 +2803,30 @@ void CHIPQueueVulkan::finish() {
             "CHIPQueueVulkan::finish: vkQueueWaitIdle failed", hipErrorTbd);
   }
 
+  // Drain any pending stream callbacks on this queue. hipStreamSynchronize's
+  // contract is that all queued work (including callbacks) has completed
+  // before it returns. The EventMonitor runs callbacks asynchronously, so
+  // we have to poll until callbacks bound to this queue have all executed
+  // (their CallbackData entry is delete()d after execution).
+  while (true) {
+    bool HasPending = false;
+    {
+      LOCK(Backend->CallbackQueueMtx);
+      // Walk the queue without modifying ordering; we just check membership.
+      size_t N = Backend->CallbackQueue.size();
+      for (size_t i = 0; i < N; ++i) {
+        chipstar::CallbackData *Cb = Backend->CallbackQueue.front();
+        Backend->CallbackQueue.pop();
+        if (Cb && Cb->ChipQueue == this)
+          HasPending = true;
+        Backend->CallbackQueue.push(Cb);
+      }
+    }
+    if (!HasPending)
+      break;
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+  }
+
   // All GPU work has drained; release cross-queue dep markers and mark the
   // queue empty so the default-stream sync helper can skip it.
   {
@@ -3385,16 +3413,19 @@ CHIPBackendVulkan::createEvent(chipstar::Context *ChipCtx,
 }
 
 // ===== I11: =====
-// hipStreamAddCallback support is out of scope for the spike (no
-// CHIPCallbackDataVulkan declared by H1; the OpenCL backend likewise
-// returns UNIMPLEMENTED here). Returning nullptr surfaces the gap at
-// the HIP API boundary as hipErrorNotSupported once the runtime
-// checks for a null CallbackData allocation.
+// hipStreamAddCallback: build a concrete CHIPCallbackDataVulkan that
+// includes a queue-recorded GpuReady marker. The base addCallback()
+// pushes the returned pointer onto Backend->CallbackQueue; the
+// EventMonitorVulkan loop drains it (poll GpuReady fence → exec user
+// callback → host-signal CpuCallbackComplete + GpuAck → delete via
+// the concrete subclass).
 chipstar::CallbackData *
-CHIPBackendVulkan::createCallbackData(hipStreamCallback_t /*Callback*/,
-                                      void * /*UserData*/,
-                                      chipstar::Queue * /*ChipQ*/) {
-  return nullptr;
+CHIPBackendVulkan::createCallbackData(hipStreamCallback_t Callback,
+                                      void *UserData,
+                                      chipstar::Queue *ChipQ) {
+  if (Callback == nullptr || ChipQ == nullptr)
+    return nullptr;
+  return new CHIPCallbackDataVulkan(Callback, UserData, ChipQ);
 }
 
 // ===== I11: =====
