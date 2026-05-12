@@ -284,6 +284,26 @@ public:
 // the Level0 pattern: a 200us sleep loop until the backend signals stop.
 // Owned by: I9.
 // ============================================================================
+// ============================================================================
+// CHIPCallbackDataVulkan
+// ============================================================================
+//
+// Concrete subclass of chipstar::CallbackData required because
+// chipstar::CallbackData has a protected destructor (only a derived class can
+// delete it). The Vulkan callback flow is simpler than Level0's barrier
+// chain: we just enqueue a marker on the target queue to serve as the
+// "GpuReady" event whose fence the EventMonitor host-waits on before
+// invoking the user callback. GpuAck/CpuCallbackComplete are host-only
+// transitions driven by EventMonitorVulkan::monitor() via hostSignal().
+// Owned by: I11.
+// ============================================================================
+class CHIPCallbackDataVulkan : public chipstar::CallbackData {
+public:
+  CHIPCallbackDataVulkan(hipStreamCallback_t CallbackF, void *CallbackArgs,
+                         chipstar::Queue *ChipQueue);
+  virtual ~CHIPCallbackDataVulkan() override = default;
+};
+
 class EventMonitorVulkan : public chipstar::EventMonitor {
 public:
   EventMonitorVulkan();

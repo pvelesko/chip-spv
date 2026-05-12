@@ -364,16 +364,62 @@ float CHIPEventVulkan::getElapsedTime(chipstar::Event *OtherIn) {
 
 void CHIPEventVulkan::hostSignal() {
   isDeletedSanityCheck();
-  // Vulkan has no direct host-signal-fence primitive. A correct
-  // implementation would wrap a binary semaphore + a host worker that
-  // signals it, but that is out of scope for the H4 spike. Surface
-  // hipErrorNotSupported so callers see a clean failure.
-  CHIPERR_LOG_AND_THROW(
-      "CHIPEventVulkan::hostSignal not supported in the H4 spike "
-      "(Vulkan exposes no host-signal-fence API; semaphore wrapper is a "
-      "Phase-5 follow-up)",
-      hipErrorNotSupported);
+  // Vulkan has no host-signal-fence primitive (no zeEventHostSignal /
+  // clSetUserEventStatus analogue in core 1.2). The chipstar callback path
+  // uses hostSignal() on the "CpuCallbackComplete" event to mark it RECORDED
+  // from the host so any host-side wait() returns. On Vulkan, our callback
+  // chain (EventMonitor below) does not block GPU work on this event — the
+  // monitor host-waits on GpuReady's fence, runs the user callback, then
+  // host-signals CpuCallbackComplete. Marking the event RECORDED here is
+  // sufficient to unblock concurrent wait() callers and the EventMonitor's
+  // recycle pass. wait() short-circuits on EVENT_STATUS_RECORDED before
+  // touching the (unsignaled) fence.
+  LOCK(EventMtx);
+  EventStatus_ = EVENT_STATUS_RECORDED;
+  HostTimestamp_ = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
 }
+// ============================================================================
+// ===== I11: CHIPCallbackDataVulkan
+// ============================================================================
+//
+// Build the GpuReady/CpuCallbackComplete/GpuAck triplet the EventMonitor
+// callback drainer expects. Unlike Level0, the Vulkan flow does not chain
+// the CPU/GPU ack through a GPU-side barrier (Vulkan has no
+// vkCommandBufferAppendBarrier-on-binary-event primitive that participates
+// in submit ordering). Instead the EventMonitor host-waits on GpuReady's
+// fence, runs the user callback, host-signals CpuCallbackComplete, and
+// host-signals GpuAck. The "GpuAck" semantics still work because nothing
+// in the spike currently uses GpuAck as a wait-dep for a GPU operation;
+// it only blocks the EventMonitor's per-callback drain step.
+
+CHIPCallbackDataVulkan::CHIPCallbackDataVulkan(hipStreamCallback_t CallbackF,
+                                                void *CallbackArgs,
+                                                chipstar::Queue *ChipQueue)
+    : chipstar::CallbackData(CallbackF, CallbackArgs, ChipQueue) {
+  auto *Ctx = ChipQueue->getContext();
+  auto *BVk = static_cast<CHIPBackendVulkan *>(Backend);
+
+  // GpuReady: marker enqueued on the queue. Its fence signals when the
+  // command stream reaches the callback insertion point.
+  GpuReady = ChipQueue->enqueueMarkerImpl();
+  if (GpuReady) {
+    GpuReady->Msg = "CallbackGpuReady";
+    // Track so the EventMonitor's recycle pass leaves it alive until the
+    // callback drains; the drain step erases via the CallbackQueue path.
+    Backend->trackEvent(GpuReady);
+  }
+
+  // CpuCallbackComplete + GpuAck: host-only signaling events. Created
+  // through the backend so they participate in the same fence-pool /
+  // tracking infrastructure as GPU events.
+  CpuCallbackComplete = BVk->createEventShared(Ctx, chipstar::EventFlags(),
+                                                "CallbackCpuComplete");
+  GpuAck = BVk->createEventShared(Ctx, chipstar::EventFlags(), "CallbackGpuAck");
+}
+
 // ============================================================================
 // ===== I9: EventMonitorVulkan
 // ============================================================================
