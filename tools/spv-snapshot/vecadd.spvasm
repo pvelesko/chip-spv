@@ -1,0 +1,153 @@
+; SPIR-V
+; Version: 1.4
+; Generator: LLVM LLVM SPIR-V Backend; 23
+; Bound: 194
+; Schema: 0
+               OpCapability Shader
+               OpCapability Int8
+               OpExtension "SPV_KHR_non_semantic_info"
+        %176 = OpExtInstImport "NonSemantic.ClspvReflection.5"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %_Z12VecAddKernelPKfS0_Pfi "_Z12VecAddKernelPKfS0_Pfi" %_Z12VecAddKernelPKfS0_Pfi_0 %__spirv_BuiltInWorkgroupId %__spirv_BuiltInLocalInvocationId %_Z12VecAddKernelPKfS0_Pfi_1 %_hipspv_pcs__Z12VecAddKernelPKfS0_Pfi_1 %_Z12VecAddKernelPKfS0_Pfi_2
+               OpExecutionModeId %_Z12VecAddKernelPKfS0_Pfi LocalSizeId %190 %191 %192
+        %177 = OpString ""
+        %178 = OpString "_Z12VecAddKernelPKfS0_Pfi"
+               OpSource OpenCL_C 100000
+               OpName %_Z12VecAddKernelPKfS0_Pfi "_Z12VecAddKernelPKfS0_Pfi"
+               OpName %_hipspv_argname_0__Z12VecAddKernelPKfS0_Pfi ".hipspv.argname.0._Z12VecAddKernelPKfS0_Pfi"
+               OpName %_hipspv_argname_1__Z12VecAddKernelPKfS0_Pfi ".hipspv.argname.1._Z12VecAddKernelPKfS0_Pfi"
+               OpName %_hipspv_argname_2__Z12VecAddKernelPKfS0_Pfi ".hipspv.argname.2._Z12VecAddKernelPKfS0_Pfi"
+               OpName %_hipspv_pcs__Z12VecAddKernelPKfS0_Pfi_1 ".hipspv.pcs._Z12VecAddKernelPKfS0_Pfi.1"
+               OpName %add_reg2mem "add.reg2mem"
+               OpName %_Z12VecAddKernelPKfS0_Pfi_pcs "_Z12VecAddKernelPKfS0_Pfi.pcs"
+               OpName %__spirv_BuiltInWorkgroupId "__spirv_BuiltInWorkgroupId"
+               OpName %__spirv_BuiltInLocalInvocationId "__spirv_BuiltInLocalInvocationId"
+               OpName %entry "entry"
+               OpName %_Z12VecAddKernelPKfS0_Pfi_0 "_Z12VecAddKernelPKfS0_Pfi.0"
+               OpName %_Z12VecAddKernelPKfS0_Pfi_1 "_Z12VecAddKernelPKfS0_Pfi.1"
+               OpName %_Z12VecAddKernelPKfS0_Pfi_2 "_Z12VecAddKernelPKfS0_Pfi.2"
+               OpName %spirv_VulkanBuffer "spirv.VulkanBuffer"
+               OpName %if_then "if.then"
+               OpName %if_end "if.end"
+               OpDecorate %_Z12VecAddKernelPKfS0_Pfi_pcs Block
+               OpDecorate %190 SpecId 0
+               OpDecorate %191 SpecId 1
+               OpDecorate %192 SpecId 2
+               OpDecorate %gl_WorkGroupSize BuiltIn WorkgroupSize
+               OpMemberDecorate %_Z12VecAddKernelPKfS0_Pfi_pcs 0 Offset 0
+               OpDecorate %__spirv_BuiltInWorkgroupId BuiltIn WorkgroupId
+               OpDecorate %__spirv_BuiltInLocalInvocationId BuiltIn LocalInvocationId
+               OpDecorate %_Z12VecAddKernelPKfS0_Pfi_0 DescriptorSet 0
+               OpDecorate %_Z12VecAddKernelPKfS0_Pfi_0 Binding 0
+               OpDecorate %_Z12VecAddKernelPKfS0_Pfi_1 DescriptorSet 0
+               OpDecorate %_Z12VecAddKernelPKfS0_Pfi_1 Binding 1
+               OpDecorate %_Z12VecAddKernelPKfS0_Pfi_2 DescriptorSet 0
+               OpDecorate %_Z12VecAddKernelPKfS0_Pfi_2 Binding 2
+               OpDecorate %_runtimearr_float ArrayStride 4
+               OpMemberDecorate %_struct_10 0 Offset 0
+               OpDecorate %_struct_10 Block
+       %void = OpTypeVoid
+          %5 = OpTypeFunction %void
+      %float = OpTypeFloat 32
+%_ptr_StorageBuffer_float = OpTypePointer StorageBuffer %float
+       %uint = OpTypeInt 32 0
+%_runtimearr_float = OpTypeRuntimeArray %float
+ %_struct_10 = OpTypeStruct %_runtimearr_float
+%spirv_VulkanBuffer = OpTypePointer StorageBuffer %_struct_10
+       %bool = OpTypeBool
+%_ptr_PushConstant_uint = OpTypePointer PushConstant %uint
+%_Z12VecAddKernelPKfS0_Pfi_pcs = OpTypeStruct %uint
+%_ptr_Function_uint = OpTypePointer Function %uint
+      %uchar = OpTypeInt 8 0
+    %uint_28 = OpConstant %uint 28
+%_arr_uchar_uint_28 = OpTypeArray %uchar %uint_28
+%_ptr_PushConstant__Z12VecAddKernelPKfS0_Pfi_pcs = OpTypePointer PushConstant %_Z12VecAddKernelPKfS0_Pfi_pcs
+%_ptr_Function__arr_uchar_uint_28 = OpTypePointer Function %_arr_uchar_uint_28
+     %uint_0 = OpConstant %uint 0
+     %v3uint = OpTypeVector %uint 3
+%_ptr_Input_v3uint = OpTypePointer Input %v3uint
+    %uchar_0 = OpConstant %uchar 0
+   %uchar_46 = OpConstant %uchar 46
+  %uchar_105 = OpConstant %uchar 105
+   %uchar_48 = OpConstant %uchar 48
+   %uchar_83 = OpConstant %uchar 83
+  %uchar_102 = OpConstant %uchar 102
+   %uchar_80 = OpConstant %uchar 80
+  %uchar_108 = OpConstant %uchar 108
+  %uchar_110 = OpConstant %uchar 110
+  %uchar_114 = OpConstant %uchar 114
+   %uchar_75 = OpConstant %uchar 75
+  %uchar_100 = OpConstant %uchar 100
+   %uchar_65 = OpConstant %uchar 65
+   %uchar_99 = OpConstant %uchar 99
+  %uchar_101 = OpConstant %uchar 101
+   %uchar_86 = OpConstant %uchar 86
+   %uchar_50 = OpConstant %uchar 50
+   %uchar_49 = OpConstant %uchar 49
+   %uchar_90 = OpConstant %uchar 90
+   %uchar_95 = OpConstant %uchar 95
+%_hipspv_pcs__Z12VecAddKernelPKfS0_Pfi_1 = OpVariable %_ptr_PushConstant__Z12VecAddKernelPKfS0_Pfi_pcs PushConstant
+         %45 = OpConstantComposite %_arr_uchar_uint_28 %uchar_95 %uchar_90 %uchar_49 %uchar_50 %uchar_86 %uchar_101 %uchar_99 %uchar_65 %uchar_100 %uchar_100 %uchar_75 %uchar_101 %uchar_114 %uchar_110 %uchar_101 %uchar_108 %uchar_80 %uchar_75 %uchar_102 %uchar_83 %uchar_48 %uchar_95 %uchar_80 %uchar_102 %uchar_105 %uchar_46 %uchar_48 %uchar_0
+         %46 = OpConstantComposite %_arr_uchar_uint_28 %uchar_95 %uchar_90 %uchar_49 %uchar_50 %uchar_86 %uchar_101 %uchar_99 %uchar_65 %uchar_100 %uchar_100 %uchar_75 %uchar_101 %uchar_114 %uchar_110 %uchar_101 %uchar_108 %uchar_80 %uchar_75 %uchar_102 %uchar_83 %uchar_48 %uchar_95 %uchar_80 %uchar_102 %uchar_105 %uchar_46 %uchar_49 %uchar_0
+         %47 = OpConstantComposite %_arr_uchar_uint_28 %uchar_95 %uchar_90 %uchar_49 %uchar_50 %uchar_86 %uchar_101 %uchar_99 %uchar_65 %uchar_100 %uchar_100 %uchar_75 %uchar_101 %uchar_114 %uchar_110 %uchar_101 %uchar_108 %uchar_80 %uchar_75 %uchar_102 %uchar_83 %uchar_48 %uchar_95 %uchar_80 %uchar_102 %uchar_105 %uchar_46 %uchar_50 %uchar_0
+%__spirv_BuiltInWorkgroupId = OpVariable %_ptr_Input_v3uint Input
+%__spirv_BuiltInLocalInvocationId = OpVariable %_ptr_Input_v3uint Input
+%_Z12VecAddKernelPKfS0_Pfi_2 = OpVariable %spirv_VulkanBuffer StorageBuffer
+%_Z12VecAddKernelPKfS0_Pfi_1 = OpVariable %spirv_VulkanBuffer StorageBuffer
+%_Z12VecAddKernelPKfS0_Pfi_0 = OpVariable %spirv_VulkanBuffer StorageBuffer
+     %uint_4 = OpConstant %uint 4
+   %uint_0_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+     %uint_2 = OpConstant %uint 2
+     %uint_3 = OpConstant %uint 3
+        %190 = OpSpecConstant %uint 1
+        %191 = OpSpecConstant %uint 1
+        %192 = OpSpecConstant %uint 1
+%gl_WorkGroupSize = OpSpecConstantComposite %v3uint %190 %191 %192
+%_Z12VecAddKernelPKfS0_Pfi = OpFunction %void DontInline %5
+      %entry = OpLabel
+%add_reg2mem = OpVariable %_ptr_Function_uint Function
+%_hipspv_argname_0__Z12VecAddKernelPKfS0_Pfi = OpVariable %_ptr_Function__arr_uchar_uint_28 Function %45
+%_hipspv_argname_1__Z12VecAddKernelPKfS0_Pfi = OpVariable %_ptr_Function__arr_uchar_uint_28 Function %46
+%_hipspv_argname_2__Z12VecAddKernelPKfS0_Pfi = OpVariable %_ptr_Function__arr_uchar_uint_28 Function %47
+         %59 = OpInBoundsAccessChain %_ptr_PushConstant_uint %_hipspv_pcs__Z12VecAddKernelPKfS0_Pfi_1 %uint_0
+         %60 = OpLoad %uint %59
+         %61 = OpLoad %v3uint %__spirv_BuiltInWorkgroupId
+         %62 = OpCompositeExtract %uint %61 0
+         %64 = OpCompositeExtract %uint %gl_WorkGroupSize 0
+         %65 = OpIMul %uint %62 %64
+         %66 = OpLoad %v3uint %__spirv_BuiltInLocalInvocationId
+         %67 = OpCompositeExtract %uint %66 0
+         %68 = OpIAdd %uint %65 %67
+               OpStore %add_reg2mem %68
+         %69 = OpLoad %uint %add_reg2mem
+         %70 = OpSLessThan %bool %69 %60
+               OpSelectionMerge %if_end None
+               OpBranchConditional %70 %if_then %if_end
+    %if_then = OpLabel
+         %71 = OpLoad %uint %add_reg2mem
+         %72 = OpCopyObject %spirv_VulkanBuffer %_Z12VecAddKernelPKfS0_Pfi_0
+         %73 = OpIAdd %uint %uint_0 %71
+         %74 = OpAccessChain %_ptr_StorageBuffer_float %72 %uint_0 %73
+         %75 = OpLoad %float %74
+         %76 = OpLoad %uint %add_reg2mem
+         %77 = OpCopyObject %spirv_VulkanBuffer %_Z12VecAddKernelPKfS0_Pfi_1
+         %78 = OpIAdd %uint %uint_0 %76
+         %79 = OpAccessChain %_ptr_StorageBuffer_float %77 %uint_0 %78
+         %80 = OpLoad %float %79
+         %81 = OpFAdd %float %75 %80
+         %82 = OpLoad %uint %add_reg2mem
+         %83 = OpCopyObject %spirv_VulkanBuffer %_Z12VecAddKernelPKfS0_Pfi_2
+         %84 = OpIAdd %uint %uint_0 %82
+         %85 = OpAccessChain %_ptr_StorageBuffer_float %83 %uint_0 %84
+               OpStore %85 %81
+               OpBranch %if_end
+     %if_end = OpLabel
+               OpReturn
+               OpFunctionEnd
+        %179 = OpExtInst %void %176 Kernel %_Z12VecAddKernelPKfS0_Pfi %178 %uint_4 %uint_0_0 %177
+        %182 = OpExtInst %void %176 ArgumentStorageBuffer %179 %uint_0_0 %uint_0_0 %uint_0_0
+        %184 = OpExtInst %void %176 ArgumentStorageBuffer %179 %uint_1 %uint_0_0 %uint_1
+        %186 = OpExtInst %void %176 ArgumentStorageBuffer %179 %uint_2 %uint_0_0 %uint_2
+        %188 = OpExtInst %void %176 ArgumentPodPushConstant %179 %uint_3 %uint_0_0 %uint_4
+
