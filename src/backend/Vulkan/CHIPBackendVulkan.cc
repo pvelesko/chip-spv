@@ -2271,6 +2271,7 @@ inline VkBuffer i8LookupVkBuffer(CHIPContextVulkan *Ctx, const void *Ptr,
   return i8LookupVkBuffer(Ctx, Ptr, IsMappedAlloc, IgnoredOffset,
                           IgnoredBase);
 }
+
 // Begin recording on a primary command buffer obtained from the queue's
 // ring (I6 owns acquireCmdBuffer). VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT
 // matches the per-submit lifecycle the ring enforces.
@@ -2335,13 +2336,22 @@ CHIPQueueVulkan::memCopyAsyncImpl(void *Dst, const void *Src, size_t Size,
   // No-op fast path matching the HIP / OpenCL contract for Dst == Src.
   if (Dst == Src || Size == 0) {
     logTrace("CHIPQueueVulkan::memCopyAsync no-op (Dst==Src or Size==0)");
-    return submitWithEvent(i8BeginCmdBuffer(this), {});
+    {
+      VkCommandBuffer EmptyCmd = i8BeginCmdBuffer(this);
+      i8EndCmdBuffer(EmptyCmd);
+      return submitWithEvent(EmptyCmd, {});
+    }
   }
 
   // Resolve both endpoints; auto-detect Kind from the registry when Default.
   bool DstIsMapped = false, SrcIsMapped = false;
-  VkBuffer DstBuf = i8LookupVkBuffer(Ctx, Dst, DstIsMapped);
-  VkBuffer SrcBuf = i8LookupVkBuffer(Ctx, Src, SrcIsMapped);
+  VkDeviceSize DstOffset = 0, SrcOffset = 0;
+  const void *DstMappedBase = nullptr;
+  const void *SrcMappedBase = nullptr;
+  VkBuffer DstBuf = i8LookupVkBuffer(Ctx, Dst, DstIsMapped, DstOffset,
+                                     DstMappedBase);
+  VkBuffer SrcBuf = i8LookupVkBuffer(Ctx, Src, SrcIsMapped, SrcOffset,
+                                     SrcMappedBase);
 
   if (Kind == hipMemcpyDefault) {
     if (DstBuf != VK_NULL_HANDLE && SrcBuf != VK_NULL_HANDLE)
@@ -2363,7 +2373,11 @@ CHIPQueueVulkan::memCopyAsyncImpl(void *Dst, const void *Src, size_t Size,
     logTrace("CHIPQueueVulkan::memCopyAsync host-side memcpy {} -> {} / {} B",
              Src, Dst, Size);
     std::memcpy(Dst, Src, Size);
-    return submitWithEvent(i8BeginCmdBuffer(this), {});
+    {
+      VkCommandBuffer EmptyCmd = i8BeginCmdBuffer(this);
+      i8EndCmdBuffer(EmptyCmd);
+      return submitWithEvent(EmptyCmd, {});
+    }
   }
 
   // Validate endpoints for each non-host kind.
@@ -2395,8 +2409,8 @@ CHIPQueueVulkan::memCopyAsyncImpl(void *Dst, const void *Src, size_t Size,
   // D2D: direct buffer-to-buffer copy, no staging involved.
   if (Kind == hipMemcpyDeviceToDevice) {
     VkBufferCopy Region{};
-    Region.srcOffset = 0;
-    Region.dstOffset = 0;
+    Region.srcOffset = SrcOffset;
+    Region.dstOffset = DstOffset;
     Region.size = Size;
     vkCmdCopyBuffer(Cmd, SrcBuf, DstBuf, 1, &Region);
     i8EndCmdBuffer(Cmd);
@@ -2428,7 +2442,7 @@ CHIPQueueVulkan::memCopyAsyncImpl(void *Dst, const void *Src, size_t Size,
     std::memcpy(StagingMapped, Src, Size);
     VkBufferCopy Region{};
     Region.srcOffset = 0;
-    Region.dstOffset = 0;
+    Region.dstOffset = DstOffset;
     Region.size = Size;
     vkCmdCopyBuffer(Cmd, Staging, DstBuf, 1, &Region);
     i8EndCmdBuffer(Cmd);
@@ -2445,7 +2459,7 @@ CHIPQueueVulkan::memCopyAsyncImpl(void *Dst, const void *Src, size_t Size,
   // host needs the data immediately on return).
   {
     VkBufferCopy Region{};
-    Region.srcOffset = 0;
+    Region.srcOffset = SrcOffset;
     Region.dstOffset = 0;
     Region.size = Size;
     vkCmdCopyBuffer(Cmd, SrcBuf, Staging, 1, &Region);
@@ -2500,30 +2514,44 @@ CHIPQueueVulkan::memFillAsyncImpl(void *Dst, size_t Size, const void *Pattern,
                           hipErrorInvalidValue);
 
   bool DstIsMapped = false;
-  VkBuffer DstBuf = i8LookupVkBuffer(Ctx, Dst, DstIsMapped);
+  VkDeviceSize DstOffset = 0;
+  const void *DstMappedBase = nullptr;
+  VkBuffer DstBuf = i8LookupVkBuffer(Ctx, Dst, DstIsMapped, DstOffset,
+                                     DstMappedBase);
 
-  // Host-side fallback for mapped/host-only pointers.
+  // Host-side fallback for mapped/host-only pointers. Note: for mapped
+  // device-side allocations the HIP pointer's virtual address IS the
+  // host-visible mapping, so writing through `Dst` directly is correct
+  // even when Dst is an offset within the alloc.
   if (DstBuf == VK_NULL_HANDLE || DstIsMapped) {
     logTrace("CHIPQueueVulkan::memFillAsync host-side fill {} / {} B (pat {})",
              Dst, Size, PatternSize);
     i8TilePattern(Dst, Size, Pattern, PatternSize);
-    return submitWithEvent(i8BeginCmdBuffer(this), {});
+    {
+      VkCommandBuffer EmptyCmd = i8BeginCmdBuffer(this);
+      i8EndCmdBuffer(EmptyCmd);
+      return submitWithEvent(EmptyCmd, {});
+    }
   }
 
   if (Size == 0)
-    return submitWithEvent(i8BeginCmdBuffer(this), {});
+    {
+      VkCommandBuffer EmptyCmd = i8BeginCmdBuffer(this);
+      i8EndCmdBuffer(EmptyCmd);
+      return submitWithEvent(EmptyCmd, {});
+    }
 
   VkCommandBuffer Cmd = i8BeginCmdBuffer(this);
 
-  // Fast path: 4-byte pattern with a 4-aligned size goes straight through
-  // vkCmdFillBuffer. Spec note: the size argument to vkCmdFillBuffer must
-  // be a multiple of 4 (or VK_WHOLE_SIZE); we conservatively require
-  // 4-alignment on Size here. Non-aligned trailing bytes are uncommon for
-  // the spike's use cases and would fall through to the staging path.
-  if (PatternSize == 4 && (Size % 4) == 0) {
+  // Fast path: 4-byte pattern with a 4-aligned destination offset and
+  // 4-aligned size goes straight through vkCmdFillBuffer. Spec note: the
+  // dstOffset AND size args to vkCmdFillBuffer must each be a multiple of 4
+  // (size may be VK_WHOLE_SIZE). When offset/size aren't 4-aligned we fall
+  // through to the staging path which has no such restriction.
+  if (PatternSize == 4 && (Size % 4) == 0 && (DstOffset % 4) == 0) {
     uint32_t Value = 0;
     std::memcpy(&Value, Pattern, sizeof(Value));
-    vkCmdFillBuffer(Cmd, DstBuf, /*dstOffset=*/0, Size, Value);
+    vkCmdFillBuffer(Cmd, DstBuf, DstOffset, Size, Value);
     i8EndCmdBuffer(Cmd);
     auto Ev = submitWithEvent(Cmd, {});
     logTrace(
@@ -2549,7 +2577,7 @@ CHIPQueueVulkan::memFillAsyncImpl(void *Dst, size_t Size, const void *Pattern,
   i8TilePattern(StagingMapped, Size, Pattern, PatternSize);
   VkBufferCopy Region{};
   Region.srcOffset = 0;
-  Region.dstOffset = 0;
+  Region.dstOffset = DstOffset;
   Region.size = Size;
   vkCmdCopyBuffer(Cmd, Staging, DstBuf, 1, &Region);
   i8EndCmdBuffer(Cmd);
@@ -2566,10 +2594,10 @@ CHIPQueueVulkan::memFillAsyncImpl(void *Dst, size_t Size, const void *Pattern,
 // ----------------------------------------------------------------------------
 //
 // 2D pitched copy: `Height` rows of `Width` bytes each, with DPitch /
-// SPitch stride between rows. Implemented as a loop of 1D memCopyAsyncImpl
-// calls (one per row); only the last call's event is returned, matching
-// the OpenCL backend's pattern. Future polish (Phase 5) could batch all
-// rows into a single VkBufferCopy[] region array under one cmd buffer.
+// SPitch stride between rows. Batches all rows into a single vkQueueSubmit
+// with `Height` VkBufferCopy regions, eliminating the per-row submit
+// cascade (which previously produced flaky results under load due to the
+// large number of in-flight staging buffers / fence churn).
 // ----------------------------------------------------------------------------
 std::shared_ptr<chipstar::Event> CHIPQueueVulkan::memCopy2DAsyncImpl(
     void *Dst, size_t DPitch, const void *Src, size_t SPitch, size_t Width,
