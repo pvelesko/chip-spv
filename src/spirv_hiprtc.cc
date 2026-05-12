@@ -260,18 +260,14 @@ static void getLoweredNameExpressions(chipstar::Program &Program,
 
 // Compiles sources stored in 'chipstar::Program'. Uses 'WorkingDirectory' for
 // temporary compilation I/O.
-static hiprtcResult compile(chipstar::Program &Program, int NumRawOptions,
-                            const char* const* RawOptions,
+static hiprtcResult compile(chipstar::Program &Program,
+                            const CompileOptions &ProcessedOptions,
                             fs::path WorkingDirectory) {
   // Create source and header files.
   auto SourceFile = WorkingDirectory / "program.hip";
   auto OutputFile = WorkingDirectory / "program.o";
   auto LoweredNamesFile = WorkingDirectory / "lowerednames.txt";
   auto CompileLogFile = WorkingDirectory / "compile.log";
-
-  CompileOptions ProcessedOptions;
-  if (processOptions(Program, NumRawOptions, RawOptions, ProcessedOptions))
-    return HIPRTC_ERROR_INVALID_INPUT;
 
   if (!createHeaderFiles(Program, WorkingDirectory)) {
     logError("hiprtc: could not create user header files.");
@@ -468,6 +464,13 @@ hiprtcResult hiprtcCompileProgram(hiprtcProgram Prog, int NumOptions,
   try {
     auto &Program = *(chipstar::Program *)Prog;
 
+    // Process options up front so "warning: ignored option ..." entries
+    // are appended to the program log regardless of cache hit/miss
+    // (TestHiprtcOptions exercises this).
+    CompileOptions ProcessedOptions;
+    if (processOptions(Program, NumOptions, Options, ProcessedOptions))
+      return HIPRTC_ERROR_INVALID_INPUT;
+
     // Check HIPRTC output cache before invoking clang.
     auto cacheKey = computeHiprtcCacheKey(Program, NumOptions, Options);
     auto t0 = std::chrono::steady_clock::now();
@@ -487,7 +490,7 @@ hiprtcResult hiprtcCompileProgram(hiprtcProgram Prog, int NumOptions,
     }
 
     logDebug("hiprtc: Temp directory: '{}'", TmpDir->string());
-    hiprtcResult Result = compile(Program, NumOptions, Options, *TmpDir);
+    hiprtcResult Result = compile(Program, ProcessedOptions, *TmpDir);
 
     if (!ChipEnvVars.getSaveTemps()) {
       assert(!TmpDir->empty() && *TmpDir != TmpDir->root_path() &&
