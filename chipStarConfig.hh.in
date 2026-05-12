@@ -71,6 +71,8 @@
 
 #cmakedefine HAVE_LEVEL0 @HAVE_LEVEL0@
 
+#cmakedefine HAVE_VULKAN @HAVE_VULKAN@
+
 #cmakedefine SPDLOG_ACTIVE_LEVEL @SPDLOG_ACTIVE_LEVEL@
 
 #endif

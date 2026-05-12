@@ -161,8 +161,18 @@ endif()
 message(STATUS "OpenCL_LIBRARY: ${OpenCL_LIBRARY}")
 message(STATUS "LevelZero_LIBRARY: ${LevelZero_LIBRARY}")
 
-if(NOT OpenCL_LIBRARY AND NOT LevelZero_LIBRARY)
-  message(FATAL_ERROR "At least one of OpenCL,Level0 libraries must be available")
+# Native Vulkan backend (optional). The Vulkan backend consumes the same
+# SPIR-V the LLVM HIPSPV pipeline emits and replaces the OpenCL->clvk->Vulkan
+# detour with a direct VkInstance/VkDevice/VkComputePipeline path.
+find_package(Vulkan 1.2)
+if(Vulkan_FOUND)
+  message(STATUS "Vulkan_LIBRARY: ${Vulkan_LIBRARY}")
+else()
+  message(STATUS "Vulkan not found")
+endif()
+
+if(NOT OpenCL_LIBRARY AND NOT LevelZero_LIBRARY AND NOT Vulkan_FOUND)
+  message(FATAL_ERROR "At least one of OpenCL,Level0,Vulkan libraries must be available")
 endif()
 
 set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
@@ -210,6 +220,11 @@ endif()
 if(LevelZero_LIBRARY)
   list(APPEND CHIP_SRC
     src/backend/Level0/CHIPBackendLevel0.cc)
+endif()
+
+if(Vulkan_FOUND)
+  list(APPEND CHIP_SRC
+    src/backend/Vulkan/CHIPBackendVulkan.cc)
 endif()
 
 set(CHIP_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR} CACHE INTERNAL "chipStar source directory")
@@ -268,6 +283,8 @@ option(CHIP_BUILD_TESTS "Enable build_tests target" ON)
 option(CHIP_BUILD_SAMPLES "Build samples" ON)
 option(CHIP_USE_EXTERNAL_HIP_TESTS "Use Catch2 tests from the hip-tests submodule" OFF)
 option(CHIP_USE_INTEL_USM "When enabled, cl_intel_unified_shared_memory extension, when available, will be used for HIP allocations in the OpenCL backend" ON)
+option(CHIP_USE_VMA "Use Vulkan Memory Allocator in the native Vulkan backend" ON)
+option(CHIP_VK_VALIDATION "Enable Vulkan validation layers at runtime when the Vulkan backend is active" OFF)
 option(CATCH2_DISCOVER_TESTS_COMPILE_TIME "Discover the tests at compile time" ON)
 option(CHIP_SKIP_TESTS_WITH_DOUBLES "Skip tests where kernels use doubles." OFF)
 
@@ -418,6 +435,11 @@ endif()
 if(LevelZero_LIBRARY)
   set(HAVE_LEVEL0 1)
   list(PREPEND CHIP_INTERFACE_LIBS ${LevelZero_LIBRARY})
+endif()
+
+if(Vulkan_FOUND)
+  set(HAVE_VULKAN 1)
+  list(PREPEND CHIP_INTERFACE_LIBS ${Vulkan_LIBRARIES})
 endif()
 
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
@@ -619,6 +641,15 @@ target_include_directories(CHIP
   "${CMAKE_SOURCE_DIR}/include"
   "${CMAKE_BINARY_DIR}/bitcode"
 )
+
+# Vulkan Memory Allocator (header-only) is consumed only by the Vulkan
+# backend translation unit. Adding it PRIVATE here keeps it off the public
+# include surface so non-Vulkan consumers don't accidentally pick up its
+# Vulkan-typed declarations.
+if(Vulkan_FOUND)
+  target_include_directories(CHIP PRIVATE
+    "${CMAKE_SOURCE_DIR}/thirdparty/vma")
+endif()
 
 # For cucc tool which uses HIP_PATH for locating headers.
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/include")

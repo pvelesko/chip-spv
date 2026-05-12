@@ -174,7 +174,7 @@ public:
 
 class BackendType {
 public:
-  enum Type { OpenCL, Level0, Default };
+  enum Type { OpenCL, Level0, Vulkan, Default };
 
 private:
   Type Type_;
@@ -195,6 +195,12 @@ public:
       assert(!"Invalid chipStar Backend Selected. This chipStar "
               "was not compiled with Level Zero backend");
 #endif
+    } else if (StrIn == "vulkan") {
+      Type_ = BackendType::Vulkan;
+#ifndef HAVE_VULKAN
+      assert(!"Invalid chipStar Backend Selected. This chipStar "
+              "was not compiled with Vulkan backend");
+#endif
     } else if (StrIn == "" || StrIn == "default") {
       // Empty string or "default": auto-select the best available backend.
       Type_ = BackendType::Default;
@@ -209,6 +215,8 @@ public:
       return "opencl";
     case Level0:
       return "level0";
+    case Vulkan:
+      return "vulkan";
     case Default:
       return "default";
     default:
