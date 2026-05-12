@@ -2602,17 +2602,164 @@ CHIPQueueVulkan::memFillAsyncImpl(void *Dst, size_t Size, const void *Pattern,
 std::shared_ptr<chipstar::Event> CHIPQueueVulkan::memCopy2DAsyncImpl(
     void *Dst, size_t DPitch, const void *Src, size_t SPitch, size_t Width,
     size_t Height, hipMemcpyKind Kind) {
-  std::shared_ptr<chipstar::Event> Last;
-  for (size_t Row = 0; Row < Height; ++Row) {
-    void *DstRow = static_cast<uint8_t *>(Dst) + Row * DPitch;
-    const void *SrcRow = static_cast<const uint8_t *>(Src) + Row * SPitch;
-    Last = memCopyAsyncImpl(DstRow, SrcRow, Width, Kind);
-  }
+  CHIPContextVulkan *Ctx = getContext();
+  CHIPDeviceVulkan *Dev = getVulkanDevice();
+  VkDevice VkDev = Dev ? Dev->getLogicalDevice() : VK_NULL_HANDLE;
+  VmaAllocator Allocator = Dev ? Dev->getAllocator() : VK_NULL_HANDLE;
+  i8DrainCompletedStagings(VkDev);
+
   // Empty-rectangle case: still return a tracked event so the runtime can
   // wait on / pass through the result.
-  if (!Last)
-    Last = submitWithEvent(i8BeginCmdBuffer(this), {});
-  return Last;
+  if (Height == 0 || Width == 0) {
+    VkCommandBuffer EmptyCmd = i8BeginCmdBuffer(this);
+    i8EndCmdBuffer(EmptyCmd);
+    return submitWithEvent(EmptyCmd, {});
+  }
+
+  IsEmptyQueue_.store(false);
+
+  // Resolve endpoints once (range-aware so offset pointers work).
+  bool DstIsMapped = false, SrcIsMapped = false;
+  VkDeviceSize DstOffset = 0, SrcOffset = 0;
+  const void *DstMappedBase = nullptr;
+  const void *SrcMappedBase = nullptr;
+  VkBuffer DstBuf =
+      i8LookupVkBuffer(Ctx, Dst, DstIsMapped, DstOffset, DstMappedBase);
+  VkBuffer SrcBuf =
+      i8LookupVkBuffer(Ctx, Src, SrcIsMapped, SrcOffset, SrcMappedBase);
+
+  if (Kind == hipMemcpyDefault) {
+    if (DstBuf != VK_NULL_HANDLE && SrcBuf != VK_NULL_HANDLE)
+      Kind = hipMemcpyDeviceToDevice;
+    else if (DstBuf != VK_NULL_HANDLE)
+      Kind = hipMemcpyHostToDevice;
+    else if (SrcBuf != VK_NULL_HANDLE)
+      Kind = hipMemcpyDeviceToHost;
+    else
+      Kind = hipMemcpyHostToHost;
+  }
+
+  // Host-only & mapped-alloc short-circuits — do the row-by-row memcpy on
+  // the host. Mapped HIP pointers ARE the host-visible VA so writes go
+  // straight through.
+  if (Kind == hipMemcpyHostToHost ||
+      (Kind == hipMemcpyHostToDevice && DstIsMapped) ||
+      (Kind == hipMemcpyDeviceToHost && SrcIsMapped) ||
+      (Kind == hipMemcpyDeviceToDevice && DstIsMapped && SrcIsMapped)) {
+    for (size_t Row = 0; Row < Height; ++Row) {
+      void *DstRow = static_cast<uint8_t *>(Dst) + Row * DPitch;
+      const void *SrcRow = static_cast<const uint8_t *>(Src) + Row * SPitch;
+      std::memcpy(DstRow, SrcRow, Width);
+    }
+    VkCommandBuffer EmptyCmd = i8BeginCmdBuffer(this);
+    i8EndCmdBuffer(EmptyCmd);
+    return submitWithEvent(EmptyCmd, {});
+  }
+
+  // Build per-row region list once.
+  std::vector<VkBufferCopy> Regions;
+  Regions.reserve(Height);
+
+  VkCommandBuffer Cmd = i8BeginCmdBuffer(this);
+
+  if (Kind == hipMemcpyDeviceToDevice) {
+    if (DstBuf == VK_NULL_HANDLE || SrcBuf == VK_NULL_HANDLE)
+      CHIPERR_LOG_AND_THROW("memCopy2DAsync D2D: both pointers must be device",
+                            hipErrorInvalidValue);
+    for (size_t Row = 0; Row < Height; ++Row) {
+      VkBufferCopy R{};
+      R.srcOffset = SrcOffset + Row * SPitch;
+      R.dstOffset = DstOffset + Row * DPitch;
+      R.size = Width;
+      Regions.push_back(R);
+    }
+    vkCmdCopyBuffer(Cmd, SrcBuf, DstBuf, static_cast<uint32_t>(Regions.size()),
+                    Regions.data());
+    i8EndCmdBuffer(Cmd);
+    return submitWithEvent(Cmd, {});
+  }
+
+  // H2D / D2H: single staging buffer for the entire rectangle, packed
+  // contiguously (Width*Height bytes), then copied to/from the device
+  // buffer at the per-row pitched offsets.
+  if (Allocator == VK_NULL_HANDLE)
+    CHIPERR_LOG_AND_THROW("memCopy2DAsync: VMA allocator not initialized",
+                          hipErrorRuntimeMemory);
+
+  const size_t StagingSize = Width * Height;
+  VkBuffer Staging = VK_NULL_HANDLE;
+  VmaAllocation StagingAlloc = VK_NULL_HANDLE;
+  void *StagingMapped = nullptr;
+  VkBufferUsageFlags UsageFlags = (Kind == hipMemcpyHostToDevice)
+                                      ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                                      : VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  if (!i8AllocateStagingBuffer(Allocator, StagingSize, UsageFlags, Staging,
+                               StagingAlloc, StagingMapped))
+    CHIPERR_LOG_AND_THROW(
+        "memCopy2DAsync: failed to allocate host-visible staging buffer",
+        hipErrorOutOfMemory);
+
+  if (Kind == hipMemcpyHostToDevice) {
+    if (DstBuf == VK_NULL_HANDLE)
+      CHIPERR_LOG_AND_THROW("memCopy2DAsync H2D: destination is not a device "
+                            "pointer registered with this context",
+                            hipErrorInvalidValue);
+    // Pack host rows into the staging buffer.
+    for (size_t Row = 0; Row < Height; ++Row) {
+      const void *SrcRow = static_cast<const uint8_t *>(Src) + Row * SPitch;
+      std::memcpy(static_cast<uint8_t *>(StagingMapped) + Row * Width, SrcRow,
+                  Width);
+      VkBufferCopy R{};
+      R.srcOffset = Row * Width;
+      R.dstOffset = DstOffset + Row * DPitch;
+      R.size = Width;
+      Regions.push_back(R);
+    }
+    vkCmdCopyBuffer(Cmd, Staging, DstBuf, static_cast<uint32_t>(Regions.size()),
+                    Regions.data());
+    i8EndCmdBuffer(Cmd);
+    auto Ev = submitWithEvent(Cmd, {});
+    i8RecordPendingStaging(Allocator, Staging, StagingAlloc, Ev);
+    return Ev;
+  }
+
+  // D2H: single contiguous staging buffer, vkCmdCopyBuffer per-row, host wait,
+  // then memcpy staging -> host with per-row pitches.
+  if (SrcBuf == VK_NULL_HANDLE)
+    CHIPERR_LOG_AND_THROW("memCopy2DAsync D2H: source is not a device pointer "
+                          "registered with this context",
+                          hipErrorInvalidValue);
+  for (size_t Row = 0; Row < Height; ++Row) {
+    VkBufferCopy R{};
+    R.srcOffset = SrcOffset + Row * SPitch;
+    R.dstOffset = Row * Width;
+    R.size = Width;
+    Regions.push_back(R);
+  }
+  vkCmdCopyBuffer(Cmd, SrcBuf, Staging, static_cast<uint32_t>(Regions.size()),
+                  Regions.data());
+  i8EndCmdBuffer(Cmd);
+  auto Ev = submitWithEvent(Cmd, {});
+
+  auto *EvVk = static_cast<CHIPEventVulkan *>(Ev.get());
+  VkFence F = EvVk ? EvVk->getFence() : VK_NULL_HANDLE;
+  if (F != VK_NULL_HANDLE && VkDev != VK_NULL_HANDLE) {
+    VkResult WaitRes = vkWaitForFences(VkDev, 1, &F, VK_TRUE, UINT64_MAX);
+    if (WaitRes != VK_SUCCESS)
+      CHIPERR_LOG_AND_THROW(
+          std::string("memCopy2DAsync D2H: vkWaitForFences failed VkResult=") +
+              std::to_string(static_cast<int>(WaitRes)),
+          hipErrorRuntimeMemory);
+  }
+  // Unpack staging into the host destination with per-row destination pitch.
+  for (size_t Row = 0; Row < Height; ++Row) {
+    void *DstRow = static_cast<uint8_t *>(Dst) + Row * DPitch;
+    std::memcpy(DstRow,
+                static_cast<const uint8_t *>(StagingMapped) + Row * Width,
+                Width);
+  }
+  vmaDestroyBuffer(Allocator, Staging, StagingAlloc);
+  return Ev;
 }
 
 // ----------------------------------------------------------------------------
@@ -2622,21 +2769,170 @@ std::shared_ptr<chipstar::Event> CHIPQueueVulkan::memCopy2DAsyncImpl(
 // 3D pitched copy. Depth slices of Height rows of Width bytes each:
 //   slice stride = DSPitch (Dst) / SSPitch (Src)
 //   row stride   = DPitch  (Dst) / SPitch  (Src)
-// Implemented as Depth * Height sequential 1D memCopyAsyncImpl calls. Only
-// the last call's event is returned, mirroring the OpenCL pattern.
+// Batches all Depth*Height rows into a single vkQueueSubmit, mirroring the
+// 2D path.
 // ----------------------------------------------------------------------------
 std::shared_ptr<chipstar::Event> CHIPQueueVulkan::memCopy3DAsyncImpl(
     void *Dst, size_t DPitch, size_t DSPitch, const void *Src, size_t SPitch,
     size_t SSPitch, size_t Width, size_t Height, size_t Depth,
     hipMemcpyKind Kind) {
-  std::shared_ptr<chipstar::Event> Last;
-  for (size_t Slice = 0; Slice < Depth; ++Slice) {
-    auto *DstSlice = static_cast<uint8_t *>(Dst) + Slice * DSPitch;
-    const auto *SrcSlice = static_cast<const uint8_t *>(Src) + Slice * SSPitch;
-    for (size_t Row = 0; Row < Height; ++Row) {
-      void *DstRow = DstSlice + Row * DPitch;
-      const void *SrcRow = SrcSlice + Row * SPitch;
-      Last = memCopyAsyncImpl(DstRow, SrcRow, Width, Kind);
+  CHIPContextVulkan *Ctx = getContext();
+  CHIPDeviceVulkan *Dev = getVulkanDevice();
+  VkDevice VkDev = Dev ? Dev->getLogicalDevice() : VK_NULL_HANDLE;
+  VmaAllocator Allocator = Dev ? Dev->getAllocator() : VK_NULL_HANDLE;
+  i8DrainCompletedStagings(VkDev);
+
+  if (Depth == 0 || Height == 0 || Width == 0) {
+    VkCommandBuffer EmptyCmd = i8BeginCmdBuffer(this);
+    i8EndCmdBuffer(EmptyCmd);
+    return submitWithEvent(EmptyCmd, {});
+  }
+  IsEmptyQueue_.store(false);
+
+  bool DstIsMapped = false, SrcIsMapped = false;
+  VkDeviceSize DstOffset = 0, SrcOffset = 0;
+  const void *DstMappedBase = nullptr;
+  const void *SrcMappedBase = nullptr;
+  VkBuffer DstBuf =
+      i8LookupVkBuffer(Ctx, Dst, DstIsMapped, DstOffset, DstMappedBase);
+  VkBuffer SrcBuf =
+      i8LookupVkBuffer(Ctx, Src, SrcIsMapped, SrcOffset, SrcMappedBase);
+
+  if (Kind == hipMemcpyDefault) {
+    if (DstBuf != VK_NULL_HANDLE && SrcBuf != VK_NULL_HANDLE)
+      Kind = hipMemcpyDeviceToDevice;
+    else if (DstBuf != VK_NULL_HANDLE)
+      Kind = hipMemcpyHostToDevice;
+    else if (SrcBuf != VK_NULL_HANDLE)
+      Kind = hipMemcpyDeviceToHost;
+    else
+      Kind = hipMemcpyHostToHost;
+  }
+
+  if (Kind == hipMemcpyHostToHost ||
+      (Kind == hipMemcpyHostToDevice && DstIsMapped) ||
+      (Kind == hipMemcpyDeviceToHost && SrcIsMapped) ||
+      (Kind == hipMemcpyDeviceToDevice && DstIsMapped && SrcIsMapped)) {
+    for (size_t S = 0; S < Depth; ++S)
+      for (size_t R = 0; R < Height; ++R) {
+        void *DstRow =
+            static_cast<uint8_t *>(Dst) + S * DSPitch + R * DPitch;
+        const void *SrcRow =
+            static_cast<const uint8_t *>(Src) + S * SSPitch + R * SPitch;
+        std::memcpy(DstRow, SrcRow, Width);
+      }
+    VkCommandBuffer EmptyCmd = i8BeginCmdBuffer(this);
+    i8EndCmdBuffer(EmptyCmd);
+    return submitWithEvent(EmptyCmd, {});
+  }
+
+  const size_t NumRows = Depth * Height;
+  std::vector<VkBufferCopy> Regions;
+  Regions.reserve(NumRows);
+  VkCommandBuffer Cmd = i8BeginCmdBuffer(this);
+
+  if (Kind == hipMemcpyDeviceToDevice) {
+    if (DstBuf == VK_NULL_HANDLE || SrcBuf == VK_NULL_HANDLE)
+      CHIPERR_LOG_AND_THROW("memCopy3DAsync D2D: both pointers must be device",
+                            hipErrorInvalidValue);
+    for (size_t S = 0; S < Depth; ++S)
+      for (size_t R = 0; R < Height; ++R) {
+        VkBufferCopy Reg{};
+        Reg.srcOffset = SrcOffset + S * SSPitch + R * SPitch;
+        Reg.dstOffset = DstOffset + S * DSPitch + R * DPitch;
+        Reg.size = Width;
+        Regions.push_back(Reg);
+      }
+    vkCmdCopyBuffer(Cmd, SrcBuf, DstBuf, static_cast<uint32_t>(Regions.size()),
+                    Regions.data());
+    i8EndCmdBuffer(Cmd);
+    return submitWithEvent(Cmd, {});
+  }
+
+  if (Allocator == VK_NULL_HANDLE)
+    CHIPERR_LOG_AND_THROW("memCopy3DAsync: VMA allocator not initialized",
+                          hipErrorRuntimeMemory);
+
+  const size_t StagingSize = Width * NumRows;
+  VkBuffer Staging = VK_NULL_HANDLE;
+  VmaAllocation StagingAlloc = VK_NULL_HANDLE;
+  void *StagingMapped = nullptr;
+  VkBufferUsageFlags UsageFlags = (Kind == hipMemcpyHostToDevice)
+                                      ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                                      : VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  if (!i8AllocateStagingBuffer(Allocator, StagingSize, UsageFlags, Staging,
+                               StagingAlloc, StagingMapped))
+    CHIPERR_LOG_AND_THROW(
+        "memCopy3DAsync: failed to allocate host-visible staging buffer",
+        hipErrorOutOfMemory);
+
+  if (Kind == hipMemcpyHostToDevice) {
+    if (DstBuf == VK_NULL_HANDLE)
+      CHIPERR_LOG_AND_THROW("memCopy3DAsync H2D: destination is not a device "
+                            "pointer registered with this context",
+                            hipErrorInvalidValue);
+    size_t Idx = 0;
+    for (size_t S = 0; S < Depth; ++S)
+      for (size_t R = 0; R < Height; ++R, ++Idx) {
+        const void *SrcRow =
+            static_cast<const uint8_t *>(Src) + S * SSPitch + R * SPitch;
+        std::memcpy(static_cast<uint8_t *>(StagingMapped) + Idx * Width, SrcRow,
+                    Width);
+        VkBufferCopy Reg{};
+        Reg.srcOffset = Idx * Width;
+        Reg.dstOffset = DstOffset + S * DSPitch + R * DPitch;
+        Reg.size = Width;
+        Regions.push_back(Reg);
+      }
+    vkCmdCopyBuffer(Cmd, Staging, DstBuf, static_cast<uint32_t>(Regions.size()),
+                    Regions.data());
+    i8EndCmdBuffer(Cmd);
+    auto Ev = submitWithEvent(Cmd, {});
+    i8RecordPendingStaging(Allocator, Staging, StagingAlloc, Ev);
+    return Ev;
+  }
+
+  // D2H
+  if (SrcBuf == VK_NULL_HANDLE)
+    CHIPERR_LOG_AND_THROW("memCopy3DAsync D2H: source is not a device pointer "
+                          "registered with this context",
+                          hipErrorInvalidValue);
+  size_t Idx = 0;
+  for (size_t S = 0; S < Depth; ++S)
+    for (size_t R = 0; R < Height; ++R, ++Idx) {
+      VkBufferCopy Reg{};
+      Reg.srcOffset = SrcOffset + S * SSPitch + R * SPitch;
+      Reg.dstOffset = Idx * Width;
+      Reg.size = Width;
+      Regions.push_back(Reg);
+    }
+  vkCmdCopyBuffer(Cmd, SrcBuf, Staging, static_cast<uint32_t>(Regions.size()),
+                  Regions.data());
+  i8EndCmdBuffer(Cmd);
+  auto Ev = submitWithEvent(Cmd, {});
+  auto *EvVk = static_cast<CHIPEventVulkan *>(Ev.get());
+  VkFence F = EvVk ? EvVk->getFence() : VK_NULL_HANDLE;
+  if (F != VK_NULL_HANDLE && VkDev != VK_NULL_HANDLE) {
+    VkResult WaitRes = vkWaitForFences(VkDev, 1, &F, VK_TRUE, UINT64_MAX);
+    if (WaitRes != VK_SUCCESS)
+      CHIPERR_LOG_AND_THROW(
+          std::string("memCopy3DAsync D2H: vkWaitForFences failed VkResult=") +
+              std::to_string(static_cast<int>(WaitRes)),
+          hipErrorRuntimeMemory);
+  }
+  Idx = 0;
+  for (size_t S = 0; S < Depth; ++S)
+    for (size_t R = 0; R < Height; ++R, ++Idx) {
+      void *DstRow = static_cast<uint8_t *>(Dst) + S * DSPitch + R * DPitch;
+      std::memcpy(DstRow,
+                  static_cast<const uint8_t *>(StagingMapped) + Idx * Width,
+                  Width);
+    }
+  vmaDestroyBuffer(Allocator, Staging, StagingAlloc);
+  return Ev;
+}
+
+// ----------------------------------------------------------------------------
     }
   }
   if (!Last)
