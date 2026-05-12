@@ -1009,6 +1009,7 @@ void CHIPExecItemVulkan::setKernel(chipstar::Kernel *Kernel) {
     PushConstantBlob_.assign(Refl->PushConstantBlockSize, 0);
     BufferBindings_.assign(Refl->MaxDescriptorBinding + 1, VK_NULL_HANDLE);
     BufferRanges_.assign(Refl->MaxDescriptorBinding + 1, VK_WHOLE_SIZE);
+    BufferOffsets_.assign(Refl->MaxDescriptorBinding + 1, 0);
   }
 }
 
@@ -1048,18 +1049,44 @@ void CHIPExecItemVulkan::setupAllArgs() {
       }
       BufferBindings_[Buf.Binding] = DGE->Buffer;
       BufferRanges_[Buf.Binding] = DGE->Size;
+      BufferOffsets_[Buf.Binding] = 0;
       continue;
     }
     void *HipPtr = *reinterpret_cast<void **>(Args_[Buf.Ordinal]);
-    const auto *Entry = Ctx->getDevPtrEntry(HipPtr);
+    // Range-based lookup: accept pointers into the middle of a hipMalloc'd
+    // region (e.g. `kernel<<<...>>>(&Hmm[N], ...)` for managed memory). The
+    // descriptor's offset is set so the kernel sees the same byte view the
+    // caller had on the host pointer.
+    size_t Offset = 0;
+    const auto *Entry = Ctx->getDevPtrEntryContaining(HipPtr, Offset);
     if (Entry == nullptr) {
       std::string Msg = "ExecItem::setupAllArgs: unregistered device pointer "
                         "for kernel arg at ordinal " +
                         std::to_string(Buf.Ordinal);
       CHIPERR_LOG_AND_THROW(Msg, hipErrorInvalidDevicePointer);
     }
+    // Storage buffer descriptors require offsets to be a multiple of
+    // VkPhysicalDeviceLimits::minStorageBufferOffsetAlignment. Non-aligned
+    // pointers escape the spike's offset-aware path and would silently
+    // misbind; flag them as invalid so the failure is visible.
+    if (Offset != 0) {
+      const auto &Limits = Dev->getProperties().limits;
+      VkDeviceSize Align = Limits.minStorageBufferOffsetAlignment;
+      if (Align > 0 && (Offset % Align) != 0) {
+        std::string Msg =
+            "ExecItem::setupAllArgs: kernel arg pointer offset " +
+            std::to_string(Offset) +
+            " is not a multiple of minStorageBufferOffsetAlignment " +
+            std::to_string(Align);
+        CHIPERR_LOG_AND_THROW(Msg, hipErrorInvalidValue);
+      }
+    }
     BufferBindings_[Buf.Binding] = Entry->Buffer;
-    BufferRanges_[Buf.Binding] = Entry->Size;
+    // Range is the remaining byte count from the descriptor offset to the
+    // end of the underlying buffer.
+    BufferRanges_[Buf.Binding] =
+        (Entry->Size > Offset) ? (Entry->Size - Offset) : 0;
+    BufferOffsets_[Buf.Binding] = static_cast<VkDeviceSize>(Offset);
   }
   for (const auto &Pc : Refl->PushConst) {
     std::memcpy(PushConstantBlob_.data() + Pc.Offset, Args_[Pc.Ordinal],
@@ -2622,9 +2649,10 @@ CHIPQueueVulkan::launchImpl(chipstar::ExecItem *ExecItem) {
   // ---- Populate the descriptor set from the (binding, VkBuffer) list. ----
   const auto &Bindings = VkExecItem->getBufferBindings();
   const auto &Ranges = VkExecItem->getBufferRanges();
-  if (Bindings.size() != Ranges.size())
+  const auto &Offsets = VkExecItem->getBufferOffsets();
+  if (Bindings.size() != Ranges.size() || Bindings.size() != Offsets.size())
     CHIPERR_LOG_AND_THROW(
-        "CHIPQueueVulkan::launchImpl: BufferBindings/Ranges size mismatch",
+        "CHIPQueueVulkan::launchImpl: BufferBindings/Ranges/Offsets size mismatch",
         hipErrorInvalidValue);
 
   std::vector<VkDescriptorBufferInfo> BufInfos;
@@ -2640,7 +2668,7 @@ CHIPQueueVulkan::launchImpl(chipstar::ExecItem *ExecItem) {
                 // strict-mode polish can flip this to a hard error.
     VkDescriptorBufferInfo &BI = BufInfos.emplace_back();
     BI.buffer = Buf;
-    BI.offset = 0;
+    BI.offset = Offsets[I];
     BI.range = Ranges[I] == 0 ? VK_WHOLE_SIZE : Ranges[I];
 
     VkWriteDescriptorSet &W = Writes.emplace_back();

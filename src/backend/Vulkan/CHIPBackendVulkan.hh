@@ -452,6 +452,14 @@ class CHIPExecItemVulkan : public chipstar::ExecItem {
   /// the AllocationInfo::Size of BufferBindings_[i] or VK_WHOLE_SIZE.
   std::vector<VkDeviceSize> BufferRanges_;
 
+  /// Per-binding byte offset into BufferBindings_[i]. Non-zero when the user
+  /// passed a pointer into the middle of a hipMalloc'd region (e.g.
+  /// `kernel<<<...>>>(&Hmm[k * NUM_ELMS], ...)` for managed memory). Driven
+  /// by getDevPtrEntryContaining() in setupAllArgs and consumed by
+  /// launchImpl's VkDescriptorBufferInfo::offset. Must respect the device's
+  /// minStorageBufferOffsetAlignment limit; non-aligned offsets are rejected
+  /// at setupAllArgs time.
+  std::vector<VkDeviceSize> BufferOffsets_;
 public:
   CHIPExecItemVulkan(dim3 GridDim, dim3 BlockDim, size_t SharedMem,
                      hipStream_t ChipQueue);
@@ -469,6 +477,7 @@ public:
   const std::vector<uint8_t> &getPushConstantBlob() const { return PushConstantBlob_; }
   const std::vector<VkBuffer> &getBufferBindings() const { return BufferBindings_; }
   const std::vector<VkDeviceSize> &getBufferRanges() const { return BufferRanges_; }
+  const std::vector<VkDeviceSize> &getBufferOffsets() const { return BufferOffsets_; }
 };
 
 // ============================================================================
