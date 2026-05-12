@@ -2229,17 +2229,21 @@ hipError_t hipGraphMemcpyNodeSetParams1D(hipGraphNode_t node, void *dst,
     RETURN(hipErrorInvalidValue);
   // Self-copy and forward-overlapping copies are illegal (Catch test
   // Unit_hipGraphMemcpyNodeSetParams1D_Negative). A backward overlap (src
-  // ahead of dst) is permitted by HIP.
+  // ahead of dst) is permitted by HIP. Overlap only applies when src and
+  // dst belong to the *same* allocation - distinct allocations may happen
+  // to be adjacent in the virtual address space but are not aliasing.
   if (dst == src)
     RETURN(hipErrorInvalidValue);
-  if (dst > src && static_cast<const char *>(src) + count >
-                       static_cast<const char *>(dst))
+  auto *AllocTracker = Backend->getActiveDevice()->AllocTracker;
+  auto *DstAI = AllocTracker->getAllocInfo(dst);
+  auto *SrcAI = AllocTracker->getAllocInfo(src);
+  if (DstAI && SrcAI && DstAI == SrcAI && dst > src &&
+      static_cast<const char *>(src) + count >
+          static_cast<const char *>(dst))
     RETURN(hipErrorInvalidValue);
   // Reject copies that exceed any tracked allocation's size.
   {
-    auto *AllocTracker = Backend->getActiveDevice()->AllocTracker;
-    auto checkSize = [&](const void *Ptr) -> bool {
-      auto *AI = AllocTracker->getAllocInfo(Ptr);
+    auto checkSize = [&](const void *Ptr, chipstar::AllocationInfo *AI) -> bool {
       if (!AI)
         return true; // Untracked (host malloc) - skip the size check.
       auto BaseAddr = reinterpret_cast<uintptr_t>(AI->DevPtr ? AI->DevPtr
@@ -2247,7 +2251,7 @@ hipError_t hipGraphMemcpyNodeSetParams1D(hipGraphNode_t node, void *dst,
       auto Offset = reinterpret_cast<uintptr_t>(Ptr) - BaseAddr;
       return (Offset + count) <= AI->Size;
     };
-    if (!checkSize(dst) || !checkSize(src))
+    if (!checkSize(dst, DstAI) || !checkSize(src, SrcAI))
       RETURN(hipErrorInvalidValue);
   }
   auto CastNode = static_cast<CHIPGraphNodeMemcpy *>(node);
