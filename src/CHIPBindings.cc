@@ -4863,6 +4863,9 @@ static inline hipError_t hipHostMallocInternal(void **Ptr, size_t Size,
   }
 
   auto *ActiveDev = Backend->getActiveDevice();
+  // Preserve the user's requested flags. hipHostGetFlags must return exactly
+  // these (HIP API contract), not the runtime-augmented set we use internally.
+  unsigned int RequestedFlagsRaw = Flags;
   if (ActiveDev->hasUnifiedVirtualAddressing()) {
     // UVA implies hipHostMallocMapped and hipHostMallocPortable.
     // [https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__UNIFIED.html]
@@ -4874,6 +4877,11 @@ static inline hipError_t hipHostMallocInternal(void **Ptr, size_t Size,
   void *RetVal = ActiveDev->getContext()->allocate(
       Size, 0x1000, hipMemoryType::hipMemoryTypeHost, FlagsParsed);
   ERROR_IF((!RetVal), hipErrorMemoryAllocation);
+
+  // Override the requested-flag record with the user's original input so that
+  // hipHostGetFlags(ptr) returns the strict input flags.
+  if (auto *AI = ActiveDev->AllocTracker->getAllocInfo(RetVal))
+    AI->RequestedFlags = chipstar::HostAllocFlags(RequestedFlagsRaw);
 
   int PageLockSuccess = mlock(RetVal, Size);
   if (PageLockSuccess != 0) {
@@ -5167,10 +5175,14 @@ hipError_t hipHostGetFlags(unsigned int *FlagsPtr, void *HostPtr) {
   if (!AllocInfo)
     RETURN(hipErrorInvalidValue);
 
-  if (!AllocInfo->IsHostRegistered)
+  // hipHostGetFlags is valid for memory obtained via hipHostMalloc /
+  // hipHostRegister / hipHostAlloc. Pure-device hipMalloc memory is not.
+  if (AllocInfo->MemoryType != hipMemoryTypeHost &&
+      AllocInfo->MemoryType != hipMemoryTypeManaged &&
+      !AllocInfo->IsHostRegistered)
     RETURN(hipErrorInvalidValue);
 
-  *FlagsPtr = AllocInfo->Flags.getRaw();
+  *FlagsPtr = AllocInfo->RequestedFlags.getRaw();
 
   RETURN(hipSuccess);
   CHIP_CATCH

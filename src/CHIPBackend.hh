@@ -477,6 +477,10 @@ struct AllocationInfo {
   void *HostPtr;
   size_t Size;
   chipstar::HostAllocFlags Flags;
+  /// Flags originally requested by the user (without UVA / mapping bits the
+  /// runtime adds for its own bookkeeping). Returned by hipHostGetFlags so
+  /// that tests checking strict equality against the requested flag set pass.
+  chipstar::HostAllocFlags RequestedFlags;
   hipDevice_t Device;
   bool Managed = false;
   enum hipMemoryType MemoryType;

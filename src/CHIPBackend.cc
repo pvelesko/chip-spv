@@ -208,7 +208,7 @@ void chipstar::AllocationTracker::recordAllocation(
     void *DevPtr, void *HostPtr, hipDevice_t Device, size_t Size,
     chipstar::HostAllocFlags Flags, hipMemoryType MemoryType) {
   chipstar::AllocationInfo *AllocInfo = new chipstar::AllocationInfo{
-      DevPtr, HostPtr, Size, Flags, Device, false, MemoryType};
+      DevPtr, HostPtr, Size, Flags, Flags, Device, false, MemoryType};
   // Assign a process-unique buffer id used by
   // hipPointerGetAttribute(HIP_POINTER_ATTRIBUTE_BUFFER_ID).
   static std::atomic<uint64_t> NextBufferId{1};
