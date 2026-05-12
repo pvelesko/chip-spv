@@ -1085,12 +1085,12 @@ void *CHIPContextVulkan::allocateImpl(size_t Size, size_t Alignment,
   if (!Dev)
     CHIPERR_LOG_AND_THROW("CHIPContextVulkan::allocateImpl: no device bound "
                           "to context",
-                          hipErrorTbd);
+                          hipErrorInvalidContext);
   VmaAllocator Allocator = Dev->getAllocator();
   if (Allocator == VK_NULL_HANDLE)
     CHIPERR_LOG_AND_THROW("CHIPContextVulkan::allocateImpl: VMA allocator is "
                           "not initialized (I1 owns construction)",
-                          hipErrorTbd);
+                          hipErrorInvalidContext);
 
   // Buffer usage common to every HIP allocation: the buffer must be usable as
   // a kernel-side StorageBuffer descriptor and as both source/destination of
