@@ -188,6 +188,7 @@ endif()
 # chipStar CMAKE VARIABLBLES/OPTIONS
 set(CHIP_SRC
   src/spirv.cc
+  src/SPVReflection.cc
   src/spirv_hiprtc.cc
   src/spirv_to_vulkan.cpp
   src/CHIPDriver.cc
