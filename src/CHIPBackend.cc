@@ -258,14 +258,20 @@ chipstar::AllocationTracker::getAllocInfoCheckPtrRanges(void *DevPtr) {
 
   // upper_bound gives the first entry with key > DevPtr; step back one to get
   // the candidate whose start address is <= DevPtr, then range-check it.
+  // PtrToAllocInfo_ may contain both DevPtr- and HostPtr-keyed entries for
+  // the same allocation; the key we stepped back to is the actual base
+  // address of the range we have to check against (not blindly
+  // AllocInfo->DevPtr, which may belong to an unrelated mapping).
   const auto It = PtrToAllocInfo_.upper_bound(DevPtr);
   if (It == PtrToAllocInfo_.cbegin())
     return nullptr;
 
-  chipstar::AllocationInfo *AllocInfo = std::prev(It)->second;
-  void *End = (char*) AllocInfo->DevPtr + AllocInfo->Size;
+  auto PrevIt = std::prev(It);
+  void *Base = PrevIt->first;
+  chipstar::AllocationInfo *AllocInfo = PrevIt->second;
+  void *End = static_cast<char *>(Base) + AllocInfo->Size;
 
-  if (DevPtr < End)
+  if (DevPtr >= Base && DevPtr < End)
     return AllocInfo;
 
   return nullptr;
