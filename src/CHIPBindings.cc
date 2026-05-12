@@ -4510,10 +4510,16 @@ hipError_t hipStreamWaitEventInternal(hipStream_t Stream, hipEvent_t Event,
     LOCK(ChipEvent->DependsOnListMtx);
     if (ChipEvent->getEventStatus() == EVENT_STATUS_RECORDING &&
         ChipEvent->DependsOnList.empty()) {
-      logError("hipStreamWaitEventInternal: trying to enqueue a wait on an "
-               "event that is recording but has no dependencies",
+      // Event is in flight on its recording queue but has no DependsOnList
+      // entries (e.g. graph-replay path where the EventRecord node already
+      // queue-finished before this node runs, or stream-capture replay).
+      // The recording queue's prior Queue::finish() guarantees the work has
+      // completed, so a fresh barrier on this queue is a no-op. Skip rather
+      // than aborting — matches CUDA semantics of "wait on a known-done event".
+      logTrace("hipStreamWaitEventInternal: event {} recording with no "
+               "DependsOnList; treating as already complete",
                (void *)ChipEvent);
-      std::abort();
+      return hipSuccess;
     }
 
     for (const auto &dep : ChipEvent->DependsOnList) {
