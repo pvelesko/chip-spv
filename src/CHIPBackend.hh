@@ -2167,7 +2167,7 @@ class Queue : public ihipStream_t {
 protected:
   hipStreamCaptureStatus CaptureStatus_ = hipStreamCaptureStatusNone;
   hipStreamCaptureMode CaptureMode_ = hipStreamCaptureModeGlobal;
-  hipGraph_t CaptureGraph_;
+  hipGraph_t CaptureGraph_ = nullptr;
   /// Unique non-zero capture sequence ID assigned at hipStreamBeginCapture
   /// and cleared (to 0) at hipStreamEndCapture. Reported by
   /// hipStreamGetCaptureInfo / hipStreamGetCaptureInfo_v2.
@@ -2317,7 +2317,6 @@ public:
    */
   template <class GraphNodeType, class... ArgTypes>
   bool captureIntoGraph(ArgTypes... ArgsPack) {
-    return false; // TODO: fix this in graphs refactor
     if (getCaptureStatus() == hipStreamCaptureStatusActive) {
       auto Graph = getCaptureGraph();
       auto Node = new GraphNodeType(ArgsPack...);
