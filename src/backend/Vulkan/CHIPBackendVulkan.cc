@@ -3114,10 +3114,23 @@ void CHIPQueueVulkan::memFillAsync3D(hipPitchedPtr PitchedDevPtr, int Value,
     uint32_t Word = static_cast<uint32_t>(Byte);
     Word |= Word << 8;
     Word |= Word << 16;
-    for (size_t S = 0; S < Depth; ++S)
-      for (size_t R = 0; R < Height; ++R)
-        vkCmdFillBuffer(Cmd, DstBuf,
-                        DstOffset + S * SlicePitch + R * Pitch, Width, Word);
+    // If consecutive rows in a slice are contiguous (Pitch == Width), fold
+    // into a single per-slice fill. Similarly if SlicePitch == Pitch*Height
+    // the whole volume is contiguous and we can issue one giant fill.
+    const bool RowsContig = (Pitch == Width);
+    const bool SlicesContig = RowsContig && (SlicePitch == Height * Pitch);
+    if (SlicesContig) {
+      vkCmdFillBuffer(Cmd, DstBuf, DstOffset, Width * Height * Depth, Word);
+    } else if (RowsContig) {
+      for (size_t S = 0; S < Depth; ++S)
+        vkCmdFillBuffer(Cmd, DstBuf, DstOffset + S * SlicePitch,
+                        Width * Height, Word);
+    } else {
+      for (size_t S = 0; S < Depth; ++S)
+        for (size_t R = 0; R < Height; ++R)
+          vkCmdFillBuffer(Cmd, DstBuf,
+                          DstOffset + S * SlicePitch + R * Pitch, Width, Word);
+    }
     i8EndCmdBuffer(Cmd);
     auto Ev = submitWithEvent(Cmd, {});
     Ev->Msg = "memFillAsync3D";
