@@ -1368,6 +1368,21 @@ void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
       kernelCreationEnd - kernelCreationStart;
   logTrace("clCreateKernelsInProgram took {} microseconds",
            kernelCreationDuration.count());
+  // The cl.hpp wrapper returns its OpenCL error via the local `Err` variable,
+  // but CHIPERR_CHECK_LOG_AND_THROW_TABLE inspects the thread-local
+  // `clStatus`. Without the assignment below, a failure here (e.g. CL_-30
+  // when clvk rejects an oversized PushConstant block from the HIPSPV
+  // bridging pass — see #FIXME in HIPSPVLowerToHLSLShape.cpp Phase 3c)
+  // silently produces an empty Kernels vector and the user sees
+  // "Failed to find kernel via kernel name" later, masking the real cause.
+  if (Err != CL_SUCCESS) {
+    logError("clCreateKernelsInProgram (via cl::Program::createKernels) "
+             "failed: {} (0x{:x}); 0 kernels added to module. Likely "
+             "cause: kernel's push-constant block exceeds the device's "
+             "maxPushConstantsSize (commonly 128B on Intel/clvk).",
+             Err, (unsigned)Err);
+    clStatus = Err;
+  }
   CHIPERR_CHECK_LOG_AND_THROW_TABLE(clCreateKernelsInProgram);
 
   logTrace("Kernels in CHIPModuleOpenCL: {} \n", Kernels.size());
