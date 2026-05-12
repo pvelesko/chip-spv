@@ -227,9 +227,12 @@ bool CHIPEventVulkan::wait() {
 
   auto *VkCtx = static_cast<CHIPContextVulkan *>(ChipContext_);
   auto *Dev = VkCtx ? VkCtx->getVulkanDevice() : nullptr;
-  if (!Dev || Fence_ == VK_NULL_HANDLE) {
+  if (!Dev || Fence_ == VK_NULL_HANDLE ||
+      EventStatus_ == EVENT_STATUS_INIT) {
     // No fence to wait on (e.g. INIT-state user event with no GPU work).
     // Mark RECORDED to match Level0/OpenCL behavior for empty events.
+    // Critically, if the event is still in INIT (never recorded against a
+    // queue) the fence is unsignaled and vkWaitForFences would hang.
     LOCK(EventMtx);
     EventStatus_ = EVENT_STATUS_RECORDED;
     return true;

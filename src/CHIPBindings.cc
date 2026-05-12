@@ -7090,6 +7090,8 @@ static inline hipError_t hipLaunchKernelInternal(const void *HostFunction,
                                                  void **Args, size_t SharedMem,
                                                  hipStream_t Stream) {
   auto ChipQueue = Backend->findQueue(static_cast<chipstar::Queue *>(Stream));
+  auto *Device = Backend->getActiveDevice();
+  Device->prepareDeviceVariables(HostPtr(HostFunction));
   if (ChipQueue->captureIntoGraph<CHIPGraphNodeKernel>(
           HostFunction, GridDim, BlockDim, Args, SharedMem)) {
     return hipSuccess;
