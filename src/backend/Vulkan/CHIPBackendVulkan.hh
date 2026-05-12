@@ -200,15 +200,23 @@ class EventMonitorVulkan;
 //     (Vulkan 1.2 spec-min is 128 B; the toolchain may emit up to 256 B).
 // ============================================================================
 struct VulkanStorageBufferArg {
-  uint32_t Ordinal = 0;    ///< Kernel-arg index (post-bridging-pass).
+  uint32_t Ordinal = 0;    ///< Kernel-arg index (post-bridging-pass / OCL ord).
   uint32_t Set = 0;        ///< Descriptor set (always 0 in the H4 path).
   uint32_t Binding = 0;    ///< Binding within the descriptor set.
+  /// HIP source-order position in Args_[]. The HIP runtime passes its
+  /// kernel-args array in source order; the SPV reflection ord (Ordinal
+  /// above) is post-clspv-reorder (pointers before PODs). We must index
+  /// Args_[] with the source-order position, not the reflection ord.
+  /// -1 for hidden device-global descriptors that consume no Args_ slot.
+  int32_t HipSourceIndex = -1;
 };
 
 struct VulkanPushConstantArg {
-  uint32_t Ordinal = 0;    ///< Kernel-arg index.
+  uint32_t Ordinal = 0;    ///< Kernel-arg index (post-clspv-reorder / OCL ord).
   uint32_t Offset = 0;     ///< Byte offset within the push-constant block.
   uint32_t Size = 0;       ///< Size in bytes (4, 8, 16, ...).
+  /// HIP source-order position in Args_[]; see VulkanStorageBufferArg above.
+  int32_t HipSourceIndex = -1;
 };
 
 struct VulkanKernelReflection {

@@ -676,15 +676,31 @@ void CHIPModuleVulkan::compile(chipstar::Device *ChipDev) {
     uint32_t NextBinding = 0;
     uint32_t PCRunningOffset = 0;
     uint32_t MaxPCEnd = 0;
+    // Track HIP source-order position. visitKernelArgs walks ArgTypeInfo_,
+    // which is in HIP source order; hidden device-global args appended by
+    // the reflection remap do NOT consume a ClientArgList slot and so do
+    // not advance the HIP-source index.
+    int32_t HipSrcIdx = 0;
     FInfo->visitKernelArgs([&](const SPVFuncInfo::KernelArg &A) {
       const uint32_t Ord = static_cast<uint32_t>(A.Index);
       switch (A.Kind) {
-      case SPVTypeKind::Pointer:
+      case SPVTypeKind::Pointer: {
+        VulkanStorageBufferArg Buf;
+        Buf.Ordinal = Ord;
+        Buf.Set = 0;
+        Buf.Binding = NextBinding++;
+        Buf.HipSourceIndex = HipSrcIdx++;
+        Refl.Buffers.push_back(Buf);
+        if (Buf.Binding > Refl.MaxDescriptorBinding)
+          Refl.MaxDescriptorBinding = Buf.Binding;
+        break;
+      }
       case SPVTypeKind::DeviceGlobalHidden: {
         VulkanStorageBufferArg Buf;
         Buf.Ordinal = Ord;
         Buf.Set = 0;
         Buf.Binding = NextBinding++;
+        Buf.HipSourceIndex = -1; // Bound from per-symbol DG table, not Args_.
         Refl.Buffers.push_back(Buf);
         if (Buf.Binding > Refl.MaxDescriptorBinding)
           Refl.MaxDescriptorBinding = Buf.Binding;
@@ -698,6 +714,7 @@ void CHIPModuleVulkan::compile(chipstar::Device *ChipDev) {
         PCRunningOffset += Pc.Size;
         if (Pc.Offset + Pc.Size > MaxPCEnd)
           MaxPCEnd = Pc.Offset + Pc.Size;
+        Pc.HipSourceIndex = HipSrcIdx++;
         Refl.PushConst.push_back(Pc);
         break;
       }
@@ -1105,7 +1122,12 @@ void CHIPExecItemVulkan::setupAllArgs() {
       BufferOffsets_[Buf.Binding] = 0;
       continue;
     }
-    void *HipPtr = *reinterpret_cast<void **>(Args_[Buf.Ordinal]);
+    // Index Args_ in HIP source order, not the reflection (OCL) ord.
+    // clspv reorders kernel args (pointers before PODs), so Buf.Ordinal
+    // is post-reorder. The HIP runtime fills Args_ in source order.
+    int32_t ArgsIdx =
+        Buf.HipSourceIndex >= 0 ? Buf.HipSourceIndex : (int32_t)Buf.Ordinal;
+    void *HipPtr = *reinterpret_cast<void **>(Args_[ArgsIdx]);
     // Range-based lookup: accept pointers into the middle of a hipMalloc'd
     // region (e.g. `kernel<<<...>>>(&Hmm[N], ...)` for managed memory). The
     // descriptor's offset is set so the kernel sees the same byte view the
@@ -1142,8 +1164,9 @@ void CHIPExecItemVulkan::setupAllArgs() {
     BufferOffsets_[Buf.Binding] = static_cast<VkDeviceSize>(Offset);
   }
   for (const auto &Pc : Refl->PushConst) {
-    std::memcpy(PushConstantBlob_.data() + Pc.Offset, Args_[Pc.Ordinal],
-                Pc.Size);
+    int32_t ArgsIdx =
+        Pc.HipSourceIndex >= 0 ? Pc.HipSourceIndex : (int32_t)Pc.Ordinal;
+    std::memcpy(PushConstantBlob_.data() + Pc.Offset, Args_[ArgsIdx], Pc.Size);
   }
   this->ArgsSetup = true;
 }
