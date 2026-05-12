@@ -7097,9 +7097,6 @@ static inline hipError_t hipLaunchKernelInternal(const void *HostFunction,
     return hipSuccess;
   }
 
-  auto *Device = Backend->getActiveDevice();
-  Device->prepareDeviceVariables(HostPtr(HostFunction));
-
   auto *ChipKernel = Device->findKernel(HostPtr(HostFunction));
   if (!ChipKernel)
     CHIPERR_LOG_AND_THROW("Unexpected error: could not find a kernel.",
