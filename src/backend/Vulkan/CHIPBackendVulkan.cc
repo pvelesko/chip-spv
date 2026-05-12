@@ -1796,9 +1796,9 @@ void CHIPDeviceVulkan::populateDevicePropertiesImpl() {
 // bound to this device. Priority is forwarded verbatim; I6's ctor maps
 // it onto VkDeviceQueueCreateInfo::pQueuePriorities if/when multi-queue
 // support lands in Phase 5.
-chipstar::Queue *CHIPDeviceVulkan::createQueue(chipstar::QueueFlags /*Flags*/,
+chipstar::Queue *CHIPDeviceVulkan::createQueue(chipstar::QueueFlags Flags,
                                                int Priority) {
-  return new CHIPQueueVulkan(this, Priority);
+  return new CHIPQueueVulkan(this, Flags, Priority);
 }
 
 // ===== I11: =====
@@ -1946,8 +1946,9 @@ void CHIPDeviceVulkan::releaseTimestampSlot(int32_t Slot) {
 // shared event already setRecording()'d.
 // ----------------------------------------------------------------------------
 
-CHIPQueueVulkan::CHIPQueueVulkan(chipstar::Device *ChipDevice, int Priority)
-    : chipstar::Queue(ChipDevice, chipstar::QueueFlags(), Priority),
+CHIPQueueVulkan::CHIPQueueVulkan(chipstar::Device *ChipDevice,
+                                 chipstar::QueueFlags Flags, int Priority)
+    : chipstar::Queue(ChipDevice, Flags, Priority),
       ChipDevice_(static_cast<CHIPDeviceVulkan *>(ChipDevice)),
       CmdBufferRing_(RingCapacity_, VK_NULL_HANDLE) {
   VkDevice Dev = ChipDevice_->getLogicalDevice();
@@ -3971,7 +3972,7 @@ CHIPBackendVulkan::createCHIPQueue(chipstar::Device *ChipDev) {
   // same purpose. Vulkan exposes a [0.0,1.0] float priority via
   // VkDeviceQueueCreateInfo; mapping the integer here is I6's
   // responsibility.
-  return new CHIPQueueVulkan(ChipDev, /*Priority=*/0);
+  return new CHIPQueueVulkan(ChipDev, chipstar::QueueFlags(), /*Priority=*/0);
 }
 
 // ===== I11: =====

@@ -772,7 +772,8 @@ protected:
 public:
   CHIPQueueVulkan() = delete;
   CHIPQueueVulkan(const CHIPQueueVulkan &) = delete;
-  CHIPQueueVulkan(chipstar::Device *ChipDevice, int Priority);
+  CHIPQueueVulkan(chipstar::Device *ChipDevice, chipstar::QueueFlags Flags,
+                  int Priority);
   virtual ~CHIPQueueVulkan() override;
 
   // chipstar::Queue pure virtuals.
