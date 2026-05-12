@@ -5964,9 +5964,10 @@ static inline hipError_t hipMemset2DAsyncInternal(void *Dst, size_t Pitch,
                                                   int Value, size_t Width,
                                                   size_t Height,
                                                   hipStream_t Stream) {
-  if (!Stream || !Dst)
+  if (!Dst)
     RETURN(hipErrorInvalidValue);
 
+  // Null stream uses the default/per-thread queue per HIP semantics.
   auto ChipQueue = Backend->findQueue(static_cast<chipstar::Queue *>(Stream));
   LOCK(ChipQueue->QueueMtx);
 
@@ -5974,17 +5975,35 @@ static inline hipError_t hipMemset2DAsyncInternal(void *Dst, size_t Pitch,
   // Use range-aware lookup so pointers offset into a base allocation
   // (Unit_hipMemset2DASyncMulti) are accepted.
   const auto *AllocInfo = AllocTracker->getAllocInfoCheckPtrRanges(Dst);
+  if (!AllocInfo)
+    AllocInfo = AllocTracker->getAllocInfo(Dst);
   if (!AllocInfo || !AllocInfo->isDeviceAccessible())
     CHIPERR_LOG_AND_THROW("Invalid destination pointer!", hipErrorInvalidValue);
   if (Width > Pitch)
     CHIPERR_LOG_AND_THROW("Width exceeds pitch value!", hipErrorInvalidValue);
-  int size = Pitch * Height - Pitch - Width;
-  if (size > int(AllocInfo->Size))
-    CHIPERR_LOG_AND_THROW("Out of bounds 2D memset!", hipErrorInvalidValue);
-  int TrueHeight = AllocInfo->Size / Pitch;
-  if (Height > TrueHeight)
-    CHIPERR_LOG_AND_THROW("Height requested exceeds allocations!",
-                          hipErrorInvalidValue);
+  // Bounds-check the 2D region against the containing allocation. The
+  // tracker may key on DevPtr or HostPtr (deviceMalloc vs hostMalloc /
+  // hipHostRegister); pick whichever base actually contains Dst.
+  {
+    uintptr_t DstAddr = reinterpret_cast<uintptr_t>(Dst);
+    uintptr_t Base = 0;
+    auto Try = [&](void *Ptr) -> bool {
+      if (!Ptr) return false;
+      auto B = reinterpret_cast<uintptr_t>(Ptr);
+      if (DstAddr < B || DstAddr - B >= AllocInfo->Size)
+        return false;
+      Base = B;
+      return true;
+    };
+    (void)(Try(AllocInfo->DevPtr) || Try(AllocInfo->HostPtr));
+    if (Base) {
+      size_t Offset = DstAddr - Base;
+      size_t LastByte = (Height > 0) ? (Height - 1) * Pitch + Width : 0;
+      if (Offset + LastByte > AllocInfo->Size)
+        CHIPERR_LOG_AND_THROW("Out of bounds 2D memset!",
+                              hipErrorInvalidValue);
+    }
+  }
 
   const hipMemsetParams Params = {
       /* Dst */ Dst,
@@ -6247,16 +6266,26 @@ static inline hipError_t validateDevicePtrForMemset(hipDeviceptr_t Dst,
   auto *AllocTracker = Backend->getActiveDevice()->AllocTracker;
   // Range-aware lookup so memset on an offset pointer into a tracked
   // allocation is accepted (Unit_hipMemsetASyncMulti / DASyncMulti).
+  // The range-check inside getAllocInfoCheckPtrRanges uses whichever base
+  // (DevPtr or HostPtr) is the actual key in the tracker map, so we can
+  // rely on it alone for both correctness and the size check.
   const auto *AI = AllocTracker->getAllocInfoCheckPtrRanges(Dst);
   if (!AI)
     AI = AllocTracker->getAllocInfo(Dst);
   if (!AI)
     return hipErrorInvalidValue;
   if (SizeBytes) {
-    auto BaseAddr = reinterpret_cast<uintptr_t>(AI->DevPtr ? AI->DevPtr
-                                                            : AI->HostPtr);
-    auto Offset = reinterpret_cast<uintptr_t>(Dst) - BaseAddr;
-    if (Offset + SizeBytes > AI->Size)
+    // Compute offset against whichever base (DevPtr / HostPtr) actually
+    // contains Dst. Picking the wrong base produces a wildly out-of-range
+    // offset (underflow on unsigned subtraction) and bogus range failures
+    // on hostMalloc allocations whose DevPtr and HostPtr are distinct.
+    uintptr_t DstAddr = reinterpret_cast<uintptr_t>(Dst);
+    auto InRange = [&](void *Base) {
+      if (!Base) return false;
+      auto B = reinterpret_cast<uintptr_t>(Base);
+      return DstAddr >= B && (DstAddr - B) + SizeBytes <= AI->Size;
+    };
+    if (!InRange(AI->DevPtr) && !InRange(AI->HostPtr))
       return hipErrorInvalidValue;
   }
   return hipSuccess;
