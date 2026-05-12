@@ -784,6 +784,14 @@ public:
   memCopy3DAsyncImpl(void *Dst, size_t DPitch, size_t DSPitch, const void *Src,
                      size_t SPitch, size_t SSPitch, size_t Width, size_t Height,
                      size_t Depth, hipMemcpyKind Kind) override;      // I8
+  // Vulkan overrides the base row-loop implementations to batch the entire
+  // 2D/3D fill into a single vkQueueSubmit (one staging buffer, N region
+  // descriptors). This avoids the per-row submit cascade which has caused
+  // flaky / partial fills under load.
+  virtual void memFillAsync2D(void *Dst, size_t Pitch, int Value, size_t Width,
+                              size_t Height) override;                // I8
+  virtual void memFillAsync3D(hipPitchedPtr PitchedDevPtr, int Value,
+                              hipExtent Extent) override;             // I8
   virtual std::shared_ptr<chipstar::Event>
   launchImpl(chipstar::ExecItem *ExecItem) override;                  // I7
   virtual void finish() override;                                     // I6

@@ -2933,11 +2933,204 @@ std::shared_ptr<chipstar::Event> CHIPQueueVulkan::memCopy3DAsyncImpl(
 }
 
 // ----------------------------------------------------------------------------
+// I8: memFillAsync2D (override)
+// ----------------------------------------------------------------------------
+//
+// 2D pitched fill: `Height` rows of `Width` bytes each at stride `Pitch`,
+// using the byte `Value`. The base implementation issues `Height` separate
+// memFillAsyncImpl calls which under heavy load (e.g. Width=Height=256)
+// triggers a per-row submit cascade plus per-row staging allocations.
+//
+// Vulkan-side strategy:
+//   * vkCmdFillBuffer only supports 4-byte patterns, and the test value is
+//     a single byte. We broadcast the byte into a 4-byte word
+//     `vvvvvvvv` and use vkCmdFillBuffer when both Width and Pitch are
+//     4-aligned (so each row's destination offset and size satisfy the
+//     spec). Each row is one fill command on the same cmd buffer.
+//   * Otherwise stage one Width-byte tiled-pattern buffer and issue
+//     `Height` vkCmdCopyBuffer regions against it -- single submit.
+// ----------------------------------------------------------------------------
+void CHIPQueueVulkan::memFillAsync2D(void *Dst, size_t Pitch, int Value,
+                                     size_t Width, size_t Height) {
+  if (Width == 0 || Height == 0)
+    return;
+
+  CHIPContextVulkan *Ctx = getContext();
+  CHIPDeviceVulkan *Dev = getVulkanDevice();
+  VkDevice VkDev = Dev ? Dev->getLogicalDevice() : VK_NULL_HANDLE;
+  VmaAllocator Allocator = Dev ? Dev->getAllocator() : VK_NULL_HANDLE;
+  i8DrainCompletedStagings(VkDev);
+  IsEmptyQueue_.store(false);
+
+  bool DstIsMapped = false;
+  VkDeviceSize DstOffset = 0;
+  const void *DstMappedBase = nullptr;
+  VkBuffer DstBuf = i8LookupVkBuffer(Ctx, Dst, DstIsMapped, DstOffset,
+                                     DstMappedBase);
+
+  // Host-side fill (mapped or unregistered host pointer).
+  if (DstBuf == VK_NULL_HANDLE || DstIsMapped) {
+    unsigned char Byte = static_cast<unsigned char>(Value);
+    for (size_t R = 0; R < Height; ++R) {
+      void *Row = static_cast<uint8_t *>(Dst) + R * Pitch;
+      std::memset(Row, Byte, Width);
     }
+    VkCommandBuffer EmptyCmd = i8BeginCmdBuffer(this);
+    i8EndCmdBuffer(EmptyCmd);
+    auto Ev = submitWithEvent(EmptyCmd, {});
+    Ev->Msg = "memFillAsync2D";
+    return;
   }
-  if (!Last)
-    Last = submitWithEvent(i8BeginCmdBuffer(this), {});
-  return Last;
+
+  VkCommandBuffer Cmd = i8BeginCmdBuffer(this);
+
+  // Fast path: broadcast byte into uint32 and fire vkCmdFillBuffer per row
+  // when Width and per-row dst offsets are 4-aligned. The dst offset is
+  // DstOffset + R*Pitch; the alignment of all of these depends on
+  // DstOffset%4, Pitch%4, Width%4 all being 0.
+  if ((Width % 4) == 0 && (Pitch % 4) == 0 && (DstOffset % 4) == 0) {
+    unsigned char Byte = static_cast<unsigned char>(Value);
+    uint32_t Word = static_cast<uint32_t>(Byte);
+    Word |= Word << 8;
+    Word |= Word << 16;
+    for (size_t R = 0; R < Height; ++R)
+      vkCmdFillBuffer(Cmd, DstBuf, DstOffset + R * Pitch, Width, Word);
+    i8EndCmdBuffer(Cmd);
+    auto Ev = submitWithEvent(Cmd, {});
+    Ev->Msg = "memFillAsync2D";
+    return;
+  }
+
+  // General path: one Width-byte staging buffer with the tiled pattern,
+  // copied into each row with `Height` VkBufferCopy regions.
+  if (Allocator == VK_NULL_HANDLE)
+    CHIPERR_LOG_AND_THROW("memFillAsync2D: VMA allocator not initialized",
+                          hipErrorRuntimeMemory);
+
+  VkBuffer Staging = VK_NULL_HANDLE;
+  VmaAllocation StagingAlloc = VK_NULL_HANDLE;
+  void *StagingMapped = nullptr;
+  if (!i8AllocateStagingBuffer(Allocator, Width,
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT, Staging,
+                               StagingAlloc, StagingMapped))
+    CHIPERR_LOG_AND_THROW("memFillAsync2D: failed to allocate staging buffer",
+                          hipErrorOutOfMemory);
+  unsigned char Byte = static_cast<unsigned char>(Value);
+  std::memset(StagingMapped, Byte, Width);
+
+  std::vector<VkBufferCopy> Regions;
+  Regions.reserve(Height);
+  for (size_t R = 0; R < Height; ++R) {
+    VkBufferCopy Reg{};
+    Reg.srcOffset = 0;
+    Reg.dstOffset = DstOffset + R * Pitch;
+    Reg.size = Width;
+    Regions.push_back(Reg);
+  }
+  vkCmdCopyBuffer(Cmd, Staging, DstBuf, static_cast<uint32_t>(Regions.size()),
+                  Regions.data());
+  i8EndCmdBuffer(Cmd);
+  auto Ev = submitWithEvent(Cmd, {});
+  i8RecordPendingStaging(Allocator, Staging, StagingAlloc, Ev);
+  Ev->Msg = "memFillAsync2D";
+}
+
+// ----------------------------------------------------------------------------
+// I8: memFillAsync3D (override)
+// ----------------------------------------------------------------------------
+//
+// 3D pitched fill. PitchedDevPtr provides the base, row pitch, and slice
+// y-stride. Same strategy as memFillAsync2D, batched across Depth*Height
+// rows.
+// ----------------------------------------------------------------------------
+void CHIPQueueVulkan::memFillAsync3D(hipPitchedPtr PitchedDevPtr, int Value,
+                                     hipExtent Extent) {
+  const size_t Width = Extent.width;
+  const size_t Height = Extent.height;
+  const size_t Depth = Extent.depth;
+  if (Width == 0 || Height == 0 || Depth == 0)
+    return;
+
+  void *Dst = PitchedDevPtr.ptr;
+  const size_t Pitch = PitchedDevPtr.pitch;
+  const size_t SlicePitch = Pitch * PitchedDevPtr.ysize;
+
+  CHIPContextVulkan *Ctx = getContext();
+  CHIPDeviceVulkan *Dev = getVulkanDevice();
+  VkDevice VkDev = Dev ? Dev->getLogicalDevice() : VK_NULL_HANDLE;
+  VmaAllocator Allocator = Dev ? Dev->getAllocator() : VK_NULL_HANDLE;
+  i8DrainCompletedStagings(VkDev);
+  IsEmptyQueue_.store(false);
+
+  bool DstIsMapped = false;
+  VkDeviceSize DstOffset = 0;
+  const void *DstMappedBase = nullptr;
+  VkBuffer DstBuf = i8LookupVkBuffer(Ctx, Dst, DstIsMapped, DstOffset,
+                                     DstMappedBase);
+
+  if (DstBuf == VK_NULL_HANDLE || DstIsMapped) {
+    unsigned char Byte = static_cast<unsigned char>(Value);
+    for (size_t S = 0; S < Depth; ++S)
+      for (size_t R = 0; R < Height; ++R) {
+        void *Row = static_cast<uint8_t *>(Dst) + S * SlicePitch + R * Pitch;
+        std::memset(Row, Byte, Width);
+      }
+    VkCommandBuffer EmptyCmd = i8BeginCmdBuffer(this);
+    i8EndCmdBuffer(EmptyCmd);
+    auto Ev = submitWithEvent(EmptyCmd, {});
+    Ev->Msg = "memFillAsync3D";
+    return;
+  }
+
+  VkCommandBuffer Cmd = i8BeginCmdBuffer(this);
+
+  if ((Width % 4) == 0 && (Pitch % 4) == 0 && (DstOffset % 4) == 0 &&
+      (SlicePitch % 4) == 0) {
+    unsigned char Byte = static_cast<unsigned char>(Value);
+    uint32_t Word = static_cast<uint32_t>(Byte);
+    Word |= Word << 8;
+    Word |= Word << 16;
+    for (size_t S = 0; S < Depth; ++S)
+      for (size_t R = 0; R < Height; ++R)
+        vkCmdFillBuffer(Cmd, DstBuf,
+                        DstOffset + S * SlicePitch + R * Pitch, Width, Word);
+    i8EndCmdBuffer(Cmd);
+    auto Ev = submitWithEvent(Cmd, {});
+    Ev->Msg = "memFillAsync3D";
+    return;
+  }
+
+  if (Allocator == VK_NULL_HANDLE)
+    CHIPERR_LOG_AND_THROW("memFillAsync3D: VMA allocator not initialized",
+                          hipErrorRuntimeMemory);
+
+  VkBuffer Staging = VK_NULL_HANDLE;
+  VmaAllocation StagingAlloc = VK_NULL_HANDLE;
+  void *StagingMapped = nullptr;
+  if (!i8AllocateStagingBuffer(Allocator, Width,
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT, Staging,
+                               StagingAlloc, StagingMapped))
+    CHIPERR_LOG_AND_THROW("memFillAsync3D: failed to allocate staging buffer",
+                          hipErrorOutOfMemory);
+  unsigned char Byte = static_cast<unsigned char>(Value);
+  std::memset(StagingMapped, Byte, Width);
+
+  std::vector<VkBufferCopy> Regions;
+  Regions.reserve(Depth * Height);
+  for (size_t S = 0; S < Depth; ++S)
+    for (size_t R = 0; R < Height; ++R) {
+      VkBufferCopy Reg{};
+      Reg.srcOffset = 0;
+      Reg.dstOffset = DstOffset + S * SlicePitch + R * Pitch;
+      Reg.size = Width;
+      Regions.push_back(Reg);
+    }
+  vkCmdCopyBuffer(Cmd, Staging, DstBuf, static_cast<uint32_t>(Regions.size()),
+                  Regions.data());
+  i8EndCmdBuffer(Cmd);
+  auto Ev = submitWithEvent(Cmd, {});
+  i8RecordPendingStaging(Allocator, Staging, StagingAlloc, Ev);
+  Ev->Msg = "memFillAsync3D";
 }
 
 // ============================================================================
