@@ -1339,6 +1339,34 @@ CHIPContextVulkan::getDevPtrEntry(const void *DevPtr) const {
   return It == DevPtrToEntry_.end() ? nullptr : &It->second;
 }
 
+const CHIPContextVulkan::DevPtrEntry *
+CHIPContextVulkan::getDevPtrEntryContaining(const void *DevPtr,
+                                            size_t &OutOffset) const {
+  OutOffset = 0;
+  if (!DevPtr)
+    return nullptr;
+  // Fast path: exact base.
+  auto It = DevPtrToEntry_.find(DevPtr);
+  if (It != DevPtrToEntry_.end()) {
+    OutOffset = 0;
+    return &It->second;
+  }
+  // Slow path: linear scan for the entry that contains this pointer. The
+  // DevPtrToEntry_ map is keyed on the base pointer; we scan all entries.
+  // The HIP test workloads have ~tens to hundreds of live allocations at
+  // most, so O(N) per lookup is acceptable for the spike. A sorted address
+  // map could be introduced in Phase 5 if profiling shows hot lookups.
+  const auto *Bytes = static_cast<const uint8_t *>(DevPtr);
+  for (const auto &Kv : DevPtrToEntry_) {
+    const auto *BaseBytes = static_cast<const uint8_t *>(Kv.first);
+    if (Bytes >= BaseBytes && Bytes < BaseBytes + Kv.second.Size) {
+      OutOffset = static_cast<size_t>(Bytes - BaseBytes);
+      return &Kv.second;
+    }
+  }
+  return nullptr;
+}
+
 CHIPDeviceVulkan *CHIPContextVulkan::getVulkanDevice() const {
   return static_cast<CHIPDeviceVulkan *>(ChipDevice_);
 }
@@ -2202,25 +2230,47 @@ inline void i8TilePattern(void *Dst, size_t TotalSize, const void *Pattern,
     DstBytes[i] = PatBytes[i % PatternSize];
 }
 
-// Resolve a HIP pointer to its VkBuffer (VK_NULL_HANDLE means the pointer
-// is host-side / not registered). For the spike the allocator returns one
-// VkBuffer per hipMalloc with no sub-allocation, so the buffer offset is
-// always 0 (callers pass the exact pointer returned from hipMalloc).
+// Resolve a HIP pointer to its VkBuffer + byte offset (VK_NULL_HANDLE means
+// the pointer is host-side / not registered). Accepts pointers into the
+// middle of a hipMalloc'd region: getDevPtrEntryContaining() returns the
+// owning entry and the offset of Ptr from the entry's base.
 // `IsMappedAlloc` is set when the HIP pointer is itself a host-visible
 // mapping (managed / host-visible-device-local) -- in that case the I8 path
 // can short-circuit to a plain memcpy without a staging buffer.
+// `OffsetOut` receives the byte offset within the returned VkBuffer (0 for
+// the common case of callers passing the exact pointer from hipMalloc).
+// `MappedBaseOut` is set to the host-visible base pointer when IsMappedAlloc
+// is true (so callers can compute Ptr - MappedBase for in-place writes).
 inline VkBuffer i8LookupVkBuffer(CHIPContextVulkan *Ctx, const void *Ptr,
-                                 bool &IsMappedAlloc) {
+                                 bool &IsMappedAlloc, VkDeviceSize &OffsetOut,
+                                 const void *&MappedBaseOut) {
   IsMappedAlloc = false;
+  OffsetOut = 0;
+  MappedBaseOut = nullptr;
   if (!Ctx || !Ptr)
     return VK_NULL_HANDLE;
-  const auto *Entry = Ctx->getDevPtrEntry(Ptr);
+  size_t Offset = 0;
+  const auto *Entry = Ctx->getDevPtrEntryContaining(Ptr, Offset);
   if (!Entry)
     return VK_NULL_HANDLE;
-  IsMappedAlloc = Entry->AllocInfo.pMappedData == Ptr;
+  OffsetOut = static_cast<VkDeviceSize>(Offset);
+  if (Entry->AllocInfo.pMappedData) {
+    // Pointer falls inside a host-visible mapped allocation.
+    IsMappedAlloc = true;
+    MappedBaseOut = Entry->AllocInfo.pMappedData;
+  }
   return Entry->Buffer;
 }
 
+// Backward-compatible 2-arg form for call sites that don't yet care about
+// offsets (and that will continue to work for exact-base pointers).
+inline VkBuffer i8LookupVkBuffer(CHIPContextVulkan *Ctx, const void *Ptr,
+                                 bool &IsMappedAlloc) {
+  VkDeviceSize IgnoredOffset = 0;
+  const void *IgnoredBase = nullptr;
+  return i8LookupVkBuffer(Ctx, Ptr, IsMappedAlloc, IgnoredOffset,
+                          IgnoredBase);
+}
 // Begin recording on a primary command buffer obtained from the queue's
 // ring (I6 owns acquireCmdBuffer). VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT
 // matches the per-submit lifecycle the ring enforces.

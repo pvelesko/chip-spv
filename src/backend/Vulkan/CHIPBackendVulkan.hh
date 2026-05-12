@@ -544,9 +544,16 @@ public:
   /// if the pointer was not allocated through this context.
   VkBuffer translateDevPtrToBuffer(const void *DevPtr) const;
   /// Look up the full DevPtrEntry (buffer, size, allocation) for a pointer.
-  /// Returns nullptr if not found.
+  /// Returns nullptr if not found. Performs an exact-base lookup only.
   const DevPtrEntry *getDevPtrEntry(const void *DevPtr) const;
 
+  /// Range-based lookup: finds the DevPtrEntry whose [base, base+Size) range
+  /// contains DevPtr. On success, returns the entry and writes the byte offset
+  /// of DevPtr from the entry's base into OutOffset. Used by H2D/D2H/D2D
+  /// memcpy and memFill paths which must accept pointers into the middle of
+  /// a hipMalloc'd region (e.g. `hipMemset(devPtr + N, ...)`).
+  const DevPtrEntry *getDevPtrEntryContaining(const void *DevPtr,
+                                              size_t &OutOffset) const;
   /// Convenience: return the device this context is bound to as the
   /// concrete CHIPDeviceVulkan*. Sugar over chipstar::Context::getDevice().
   CHIPDeviceVulkan *getVulkanDevice() const;
