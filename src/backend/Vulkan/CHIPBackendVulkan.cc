@@ -2209,6 +2209,7 @@ void CHIPQueueVulkan::recordEvent(chipstar::Event *Event) {
   if (EvVk == nullptr)
     CHIPERR_LOG_AND_THROW("CHIPQueueVulkan::recordEvent: null event",
                           hipErrorInvalidValue);
+  auto CmdLock = lockCmdRecord();
 
   // Acquire a timestamp slot for this event. -1 means the device-level pool
   // is exhausted or not yet wired (I1/I5) — fall back to host-only timing.
@@ -2490,6 +2491,7 @@ inline void i8EndCmdBuffer(VkCommandBuffer Cmd) {
 std::shared_ptr<chipstar::Event>
 CHIPQueueVulkan::memCopyAsyncImpl(void *Dst, const void *Src, size_t Size,
                                   hipMemcpyKind Kind) {
+  auto CmdLock = lockCmdRecord();
   CHIPContextVulkan *Ctx = getContext();
   CHIPDeviceVulkan *Dev = getVulkanDevice();
   VkDevice VkDev = Dev ? Dev->getLogicalDevice() : VK_NULL_HANDLE;
@@ -2666,6 +2668,7 @@ CHIPQueueVulkan::memCopyAsyncImpl(void *Dst, const void *Src, size_t Size,
 std::shared_ptr<chipstar::Event>
 CHIPQueueVulkan::memFillAsyncImpl(void *Dst, size_t Size, const void *Pattern,
                                   size_t PatternSize) {
+  auto CmdLock = lockCmdRecord();
   CHIPContextVulkan *Ctx = getContext();
   CHIPDeviceVulkan *Dev = getVulkanDevice();
   VkDevice VkDev = Dev ? Dev->getLogicalDevice() : VK_NULL_HANDLE;
@@ -2767,6 +2770,7 @@ CHIPQueueVulkan::memFillAsyncImpl(void *Dst, size_t Size, const void *Pattern,
 std::shared_ptr<chipstar::Event> CHIPQueueVulkan::memCopy2DAsyncImpl(
     void *Dst, size_t DPitch, const void *Src, size_t SPitch, size_t Width,
     size_t Height, hipMemcpyKind Kind) {
+  auto CmdLock = lockCmdRecord();
   CHIPContextVulkan *Ctx = getContext();
   CHIPDeviceVulkan *Dev = getVulkanDevice();
   VkDevice VkDev = Dev ? Dev->getLogicalDevice() : VK_NULL_HANDLE;
@@ -2941,6 +2945,7 @@ std::shared_ptr<chipstar::Event> CHIPQueueVulkan::memCopy3DAsyncImpl(
     void *Dst, size_t DPitch, size_t DSPitch, const void *Src, size_t SPitch,
     size_t SSPitch, size_t Width, size_t Height, size_t Depth,
     hipMemcpyKind Kind) {
+  auto CmdLock = lockCmdRecord();
   CHIPContextVulkan *Ctx = getContext();
   CHIPDeviceVulkan *Dev = getVulkanDevice();
   VkDevice VkDev = Dev ? Dev->getLogicalDevice() : VK_NULL_HANDLE;
@@ -3120,6 +3125,7 @@ void CHIPQueueVulkan::memFillAsync2D(void *Dst, size_t Pitch, int Value,
   if (Width == 0 || Height == 0)
     return;
 
+  auto CmdLock = lockCmdRecord();
   CHIPContextVulkan *Ctx = getContext();
   CHIPDeviceVulkan *Dev = getVulkanDevice();
   VkDevice VkDev = Dev ? Dev->getLogicalDevice() : VK_NULL_HANDLE;
@@ -3216,6 +3222,7 @@ void CHIPQueueVulkan::memFillAsync3D(hipPitchedPtr PitchedDevPtr, int Value,
   if (Width == 0 || Height == 0 || Depth == 0)
     return;
 
+  auto CmdLock = lockCmdRecord();
   void *Dst = PitchedDevPtr.ptr;
   const size_t Pitch = PitchedDevPtr.pitch;
   const size_t SlicePitch = Pitch * PitchedDevPtr.ysize;
@@ -3396,6 +3403,7 @@ CHIPQueueVulkan::launchImpl(chipstar::ExecItem *ExecItem) {
   // The framework (chipstar::Queue::launchKernel in src/CHIPBackend.cc and
   // related call sites) has already invoked ExecItem->setupAllArgs() before
   // we get here, so PushConstantBlob_ and BufferBindings_ are populated.
+  auto CmdLock = lockCmdRecord();
   if (!ExecItem)
     CHIPERR_LOG_AND_THROW("CHIPQueueVulkan::launchImpl received null ExecItem",
                           hipErrorInvalidValue);
@@ -3614,6 +3622,7 @@ std::shared_ptr<chipstar::Event> CHIPQueueVulkan::enqueueBarrierImpl(
   // see submitWithEvent commentary). Then record an all-commands pipeline
   // barrier on a fresh cmd buffer so the returned event signals after the
   // barrier completes.
+  auto CmdLock = lockCmdRecord();
   for (auto &E : EventsToWaitFor) {
     auto *Ev = static_cast<CHIPEventVulkan *>(E.get());
     if (Ev && Ev->getFence() != VK_NULL_HANDLE) {
@@ -3657,6 +3666,7 @@ std::shared_ptr<chipstar::Event> CHIPQueueVulkan::enqueueMarkerImpl() {
   // An "empty" marker is a submit with a recorded-but-empty command buffer.
   // The signal pair (timeline + event-fence) provides the marker semantics
   // expected by HIP (downstream waiters synchronize on this event).
+  auto CmdLock = lockCmdRecord();
   VkCommandBuffer Cb = acquireCmdBuffer();
   VkCommandBufferBeginInfo BI{};
   BI.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;

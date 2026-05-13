@@ -783,6 +783,22 @@ class CHIPQueueVulkan : public chipstar::Queue {
   /// can be split if profiling shows contention.
   std::mutex QueueOpMtx_;
 
+  /// Serialises acquire->record->submit on this queue. Without this, two
+  /// threads running e.g. hipMemset2DAsync on the same stream race on the
+  /// cmd-buffer ring: thread A acquires slot K (rotating QueueOpMtx_),
+  /// thread B then acquires slot K' and may rotate back to K before A
+  /// submits. Tests like Unit_hipMemset2DAsync_MultiThread and
+  /// Unit_hipMemset3DAsync_ConcurrencyMthread exercise this pattern.
+  std::mutex CmdRecordMtx_;
+
+public:
+  /// RAII helper for top-level command-recorders (memFill*, memCopy*,
+  /// launchImpl, etc.) to wrap the entire acquire->record->submit window.
+  /// submitWithEvent's internal QueueOpMtx_ acquisition is unaffected.
+  std::unique_lock<std::mutex> lockCmdRecord() {
+    return std::unique_lock<std::mutex>(CmdRecordMtx_);
+  }
+
 protected:
   virtual void storeCrossQueueDeps(
       std::vector<std::shared_ptr<chipstar::Event>> Markers) override;
