@@ -224,6 +224,12 @@ struct VulkanKernelReflection {
   std::vector<VulkanStorageBufferArg> Buffers;   ///< set=0 bindings.
   std::vector<VulkanPushConstantArg>  PushConst; ///< Push-constant slots.
   std::vector<SPVKernelDeviceGlobalArg> HiddenDGArgs; ///< Per-kernel device-global binds.
+  /// Phase Z3 (BDA): byte offsets within the PC block where 8-byte Buffer
+  /// Device Address slots live. After setupAllArgs' PC memcpy, the runtime
+  /// reads the 8 bytes at each offset (a raw HIP pointer set by the user),
+  /// looks up the backing VkBuffer, and overwrites with
+  /// vkGetBufferDeviceAddress(buffer). Empty for non-BDA kernels.
+  std::vector<uint32_t> BDAPointerSlotOffsets;
   uint32_t PushConstantBlockSize = 0;            ///< Total bytes used by all PushConst entries (rounded up).
   uint32_t MaxDescriptorBinding = 0;             ///< Highest binding used in set=0.
 };
@@ -645,6 +651,11 @@ class CHIPDeviceVulkan : public chipstar::Device {
   bool HasShader16BitStorage_ = false;
   bool HasShaderClock_ = false;
   bool HasShaderAtomicFloat_ = false;
+  /// Phase Z3: bufferDeviceAddress feature (Vulkan 1.2 core). When true, the
+  /// runtime is allowed to allocate VMA buffers with the
+  /// VMA_ALLOCATION_CREATE_DEVICE_ADDRESS_BIT flag and call
+  /// vkGetBufferDeviceAddress on them to satisfy push-constant BDA slots.
+  bool HasBufferDeviceAddress_ = false;
 
   // Only constructable through `create()`; mirrors the OpenCL/Level0 pattern
   // so chipstar::Device::init()'s virtual dispatch into populateDevicePropertiesImpl()
@@ -693,6 +704,7 @@ public:
   bool hasShader16BitStorage() const { return HasShader16BitStorage_; }
   bool hasShaderClock() const { return HasShaderClock_; }
   bool hasShaderAtomicFloat() const { return HasShaderAtomicFloat_; }
+  bool hasBufferDeviceAddress() const { return HasBufferDeviceAddress_; }
 
   // ----- Pool helpers (owned by I1 / I5 / I6) -----
   /// Acquire a fence from the recycle pool, creating a new one if empty.

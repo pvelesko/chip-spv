@@ -739,6 +739,13 @@ void CHIPModuleVulkan::compile(chipstar::Device *ChipDev) {
     if (DGIt != Info.HiddenDGArgsByKernel.end())
       Refl.HiddenDGArgs = DGIt->second;
 
+    // Phase Z3: plumb BDA push-constant slot offsets through to the reflection
+    // record so setupAllArgs can substitute the raw HIP pointer at each slot
+    // with vkGetBufferDeviceAddress(buffer).
+    auto BdaIt = Info.BDAPointerSlotOffsetsByKernel.find(Name);
+    if (BdaIt != Info.BDAPointerSlotOffsetsByKernel.end())
+      Refl.BDAPointerSlotOffsets = BdaIt->second;
+
     Reflection_.emplace(Name, std::move(Refl));
   }
 
