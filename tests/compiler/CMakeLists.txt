@@ -154,7 +154,7 @@ add_shell_test(TestHipcc945MacroSpace.bash)
 add_shell_test(TestHipccArgOrder.bash)
 # Separate compilation uses clang-offload-bundler which calls llvm-objcopy
 # with options not supported on MachO (macOS).
-if(NOT APPLE)
+if(NOT APPLE AND NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
   add_shell_test(TestSeparateCompilation.bash)
 endif()
 add_subdirectory(rdcLink)
