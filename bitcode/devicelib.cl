@@ -158,36 +158,25 @@ EXPORT unsigned int __chip_usad(unsigned int x, unsigned int y,
   return result + z;
 }
 
-// optimization tries to use llvm intrinsics here, but we don't want that
-EXPORT NOOPT unsigned int __chip_brev(unsigned int a) {
-  unsigned int m;
-  a = (a >> 16) | (a << 16); // swap halfwords
-  m = 0x00FF00FFU;
-  a = ((a >> 8) & m) | ((a << 8) & ~m); // swap bytes
-  m = m ^ (m << 4);
-  a = ((a >> 4) & m) | ((a << 4) & ~m); // swap nibbles
-  m = m ^ (m << 2);
-  a = ((a >> 2) & m) | ((a << 2) & ~m);
-  m = m ^ (m << 1);
-  a = ((a >> 1) & m) | ((a << 1) & ~m);
-  return a;
+// Portable 5-stage bit reversal. Both the OpenCL/clvk and Vulkan SPIR-V
+// backends translate llvm.bitreverse to OpBitReverse, so we no longer
+// suppress optimization here.
+EXPORT unsigned int __chip_brev(unsigned int a) {
+  a = ((a >> 1) & 0x55555555u) | ((a & 0x55555555u) << 1);
+  a = ((a >> 2) & 0x33333333u) | ((a & 0x33333333u) << 2);
+  a = ((a >> 4) & 0x0F0F0F0Fu) | ((a & 0x0F0F0F0Fu) << 4);
+  a = ((a >> 8) & 0x00FF00FFu) | ((a & 0x00FF00FFu) << 8);
+  return (a >> 16) | (a << 16);
 }
 
-EXPORT NOOPT unsigned /* long */ long int
+EXPORT unsigned /* long */ long int
 __chip_brevll(unsigned /* long */ long int a) {
-  unsigned /* long */ long int m;
-  a = (a >> 32) | (a << 32); // swap words
-  m = 0x0000FFFF0000FFFFUL;
-  a = ((a >> 16) & m) | ((a << 16) & ~m); // swap halfwords
-  m = m ^ (m << 8);
-  a = ((a >> 8) & m) | ((a << 8) & ~m); // swap bytes
-  m = m ^ (m << 4);
-  a = ((a >> 4) & m) | ((a << 4) & ~m); // swap nibbles
-  m = m ^ (m << 2);
-  a = ((a >> 2) & m) | ((a << 2) & ~m);
-  m = m ^ (m << 1);
-  a = ((a >> 1) & m) | ((a << 1) & ~m);
-  return a;
+  a = ((a >> 1) & 0x5555555555555555UL) | ((a & 0x5555555555555555UL) << 1);
+  a = ((a >> 2) & 0x3333333333333333UL) | ((a & 0x3333333333333333UL) << 2);
+  a = ((a >> 4) & 0x0F0F0F0F0F0F0F0FUL) | ((a & 0x0F0F0F0F0F0F0F0FUL) << 4);
+  a = ((a >> 8) & 0x00FF00FF00FF00FFUL) | ((a & 0x00FF00FF00FF00FFUL) << 8);
+  a = ((a >> 16) & 0x0000FFFF0000FFFFUL) | ((a & 0x0000FFFF0000FFFFUL) << 16);
+  return (a >> 32) | (a << 32);
 }
 
 struct ucharHolder {
@@ -223,23 +212,23 @@ EXPORT unsigned int __chip_byte_perm(unsigned int x, unsigned int y,
 }
 
 EXPORT unsigned int __chip_ffs(unsigned int input) {
-  return (input == 0 ? -1 : ctz(input)) + 1;
+  // __ffs in CUDA/HIP: returns position of the first set bit (1-based),
+  // or 0 if input is 0. clang lowers __builtin_ctz to llvm.cttz which both
+  // backends lower correctly (Vulkan via spv_firstbitlow, clvk natively).
+  return input == 0 ? 0 : (unsigned int)__builtin_ctz(input) + 1u;
 }
 
 EXPORT int __chip_ctzll(/* long */ long int x) {
   if (x == 0) {
     return sizeof(/* long */ long int) * 8;
   }
-  int count = 0;
-  while ((x & 1LL) == 0) {
-    x >>= 1;
-    count++;
-  }
-  return count;
+  return __builtin_ctzll((unsigned long long)x);
 }
 
 EXPORT unsigned int __chip_ffsll(/* long */ long int input) {
-  return (input == 0 ? -1 : __chip_ctzll(input)) + 1;
+  return input == 0 ? 0
+                    : (unsigned int)__builtin_ctzll((unsigned long long)input) +
+                          1u;
 }
 
 EXPORT unsigned int __lastbit_u32_u64(unsigned /* long */ long input) {
@@ -280,31 +269,31 @@ EXPORT ulong __chip_bitinsert_u64(ulong src0, ulong src1, ulong raw_offset,
 EXPORT unsigned int __chip_funnelshift_l(unsigned int lo, unsigned int hi,
                                          unsigned int shift) {
   unsigned /* long */ long concat = ((unsigned /* long */ long)hi << 32) | lo;
-  unsigned int shifted = concat << (shift & 31);
-  return shifted >> 32;
+  unsigned /* long */ long shifted = concat << (shift & 31);
+  return (unsigned int)(shifted >> 32);
 }
 
 EXPORT unsigned int __chip_funnelshift_lc(unsigned int lo, unsigned int hi,
                                           unsigned int shift) {
-  unsigned /* long */ long concat = ((unsigned /* long */ long)hi << 32) | lo;
-  unsigned int shifted = concat << (shift & 31);
   unsigned int clamped_shift = shift < 32 ? shift : 32;
-  return shifted >> (32 - clamped_shift);
+  unsigned /* long */ long concat = ((unsigned /* long */ long)hi << 32) | lo;
+  unsigned /* long */ long shifted = concat << clamped_shift;
+  return (unsigned int)(shifted >> 32);
 }
 
 EXPORT unsigned int __chip_funnelshift_r(unsigned int lo, unsigned int hi,
                                          unsigned int shift) {
   unsigned /* long */ long concat = ((unsigned /* long */ long)hi << 32) | lo;
-  unsigned int shifted = concat >> (shift & 31);
-  return shifted;
+  unsigned /* long */ long shifted = concat >> (shift & 31);
+  return (unsigned int)shifted;
 }
 
 EXPORT unsigned int __chip_funnelshift_rc(unsigned int lo, unsigned int hi,
                                           unsigned int shift) {
-  unsigned /* long */ long concat = ((unsigned /* long */ long)hi << 32) | lo;
-  unsigned int shifted = concat >> (shift & 31);
   unsigned int clamped_shift = shift < 32 ? shift : 32;
-  return shifted << (32 - clamped_shift);
+  unsigned /* long */ long concat = ((unsigned /* long */ long)hi << 32) | lo;
+  unsigned /* long */ long shifted = concat >> clamped_shift;
+  return (unsigned int)shifted;
 }
 
 EXPORT float __chip_saturate_f32(float x) {
