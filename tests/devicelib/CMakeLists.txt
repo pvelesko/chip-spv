@@ -26,9 +26,15 @@
 add_hip_test(implicitCasts.cpp)
 
 # Add this as a hipcc otherwise the `make all` will fail which is not convenient indicator for test failure
-add_test(NAME "deviceMallocCompile"
-  COMMAND ${CMAKE_BINARY_DIR}/bin/hipcc
-  ${CMAKE_CURRENT_SOURCE_DIR}/deviceMallocCompile.cpp)
+# Device-side new/delete/malloc compiles into pointer-cast patterns the in-tree
+# LLVM SPIR-V backend cannot legalize (SPIRVLegalizePointerCast asserts on
+# aggregate loads). Vulkan compute also cannot support device-side malloc.
+# Skip under CHIP_USE_NATIVE_VULKAN_SPIRV.
+if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
+  add_test(NAME "deviceMallocCompile"
+    COMMAND ${CMAKE_BINARY_DIR}/bin/hipcc
+    ${CMAKE_CURRENT_SOURCE_DIR}/deviceMallocCompile.cpp)
+endif()
 
 add_hip_test(sincospifSpotTest.cc)
 add_hip_test(shfl_sync.cpp)
