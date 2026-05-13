@@ -102,7 +102,12 @@ add_hipcc_test(TestHipComplexInclude.hip HIPCC_OPTIONS)
 add_hipcc_test(TestHipccAcceptCcFiles.cc HIPCC_OPTIONS)
 add_hipcc_test(TestHipccAcceptCppFiles.cpp HIPCC_OPTIONS)
 
-add_hipcc_test(Test513Regression.hip HIPCC_OPTIONS)
+# Test513Regression hits SPIRVLegalizePointerCast aggregate-store assertions
+# in the in-tree LLVM SPIR-V backend (handled by legacy llvm-spirv translator).
+# Skip under CHIP_USE_NATIVE_VULKAN_SPIRV.
+if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
+  add_hipcc_test(Test513Regression.hip HIPCC_OPTIONS)
+endif()
 
 add_test(NAME "TestHipccNeedsDashO"
   COMMAND ${CMAKE_BINARY_DIR}/bin/hipcc
@@ -159,7 +164,11 @@ add_hipcc_test(TestAlignAttr.hip HIPCC_OPTIONS -fsyntax-only)
 # using it are not hiding errors.
 add_hipcc_test(TestFastMath.hip HIPCC_OPTIONS -fsyntax-only -ffast-math)
 add_hipcc_test(TestDim3Cast.hip HIPCC_OPTIONS -fsyntax-only)
-add_hipcc_test(TestPlacement.hip)
+# TestPlacement triggers SPIRVLegalizePointerCast aggregate-load assertions
+# in the in-tree LLVM SPIR-V backend. Skip under CHIP_USE_NATIVE_VULKAN_SPIRV.
+if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
+  add_hipcc_test(TestPlacement.hip)
+endif()
 
 # Test for math header conflicts between system cmath and HIP device math
 add_hipcc_test(TestMathHeaderConsolidated.hip HIPCC_OPTIONS -fsyntax-only)
