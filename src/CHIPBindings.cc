@@ -2857,6 +2857,16 @@ hipError_t hipGraphExecChildGraphNodeSetParams(hipGraphExec_t hGraphExec,
   }
 
   CastNode->setGraph(NewG);
+
+  // The user handle 'node' lives in the original graph; CompiledGraph_ owns
+  // a clone of that wrapper (different pointer). Without also mutating the
+  // clone, ExtractSubGraphs_ at launch time would still inline the old
+  // child graph. Resolve to the executable's clone and update it too.
+  auto *Exec = static_cast<CHIPGraphExec *>(hGraphExec);
+  if (auto *ClonedNode = Exec->findOrLookupNode(NODE(node))) {
+    if (ClonedNode->getType() == hipGraphNodeTypeGraph)
+      static_cast<CHIPGraphNodeGraph *>(ClonedNode)->setGraph(NewG);
+  }
   RETURN(hipSuccess);
   CHIP_CATCH
 }
