@@ -735,6 +735,24 @@ void CHIPModuleVulkan::compile(chipstar::Device *ChipDev) {
     // Vulkan requires push-constant ranges to be 4-byte aligned.
     Refl.PushConstantBlockSize = (MaxPCEnd + 3u) & ~3u;
 
+    // Z6 guard: vkCmdPushConstants is UB (and observed to segfault inside
+    // the Intel ANV driver) when the runtime asks to push more bytes than
+    // VkPhysicalDeviceLimits::maxPushConstantsSize. Until the bridging pass
+    // grows a UBO-spill path for >maxPushConstantsSize PC blocks, mark the
+    // kernel as unlaunchable so launchImpl can refuse the dispatch with a
+    // clean hipErrorNotSupported instead of crashing the process.
+    if (ChipDevice_ != nullptr) {
+      const auto &Limits = ChipDevice_->getProperties().limits;
+      if (Refl.PushConstantBlockSize > Limits.maxPushConstantsSize) {
+        logError("CHIPModuleVulkan::compile: kernel '{}' push-constant block "
+                 "({} bytes) exceeds VkPhysicalDeviceLimits::"
+                 "maxPushConstantsSize ({}); marking kernel unlaunchable",
+                 Name, Refl.PushConstantBlockSize,
+                 Limits.maxPushConstantsSize);
+        Refl.OversizedPushConstants = true;
+      }
+    }
+
     auto DGIt = Info.HiddenDGArgsByKernel.find(Name);
     if (DGIt != Info.HiddenDGArgsByKernel.end())
       Refl.HiddenDGArgs = DGIt->second;
@@ -941,7 +959,10 @@ CHIPModuleVulkan::getOrCreatePipelineLayout(const std::string &KernelName) {
     DSLayouts_[KernelName] = DSL;
 
   VkPipelineLayout Layout =
-      buildPipelineLayout(Dev, DSL, Refl->PushConstantBlockSize);
+      buildPipelineLayout(Dev, DSL,
+                          Refl->OversizedPushConstants
+                              ? 0u
+                              : Refl->PushConstantBlockSize);
   PipelineLayouts_[KernelName] = Layout;
   return Layout;
 }
@@ -982,7 +1003,10 @@ VkPipeline CHIPModuleVulkan::getOrCreatePipeline(const std::string &KernelName,
   auto PLIt = PipelineLayouts_.find(KernelName);
   VkPipelineLayout PLayout =
       (PLIt == PipelineLayouts_.end())
-          ? buildPipelineLayout(Dev, DSL, Refl->PushConstantBlockSize)
+          ? buildPipelineLayout(Dev, DSL,
+                                Refl->OversizedPushConstants
+                                    ? 0u
+                                    : Refl->PushConstantBlockSize)
           : PLIt->second;
   if (PLIt == PipelineLayouts_.end())
     PipelineLayouts_[KernelName] = PLayout;
@@ -3397,6 +3421,16 @@ CHIPQueueVulkan::launchImpl(chipstar::ExecItem *ExecItem) {
         "CHIPQueueVulkan::launchImpl: no reflection record for kernel",
         hipErrorInvalidValue);
 
+  // Z6: refuse oversized push-constant launches cleanly. Bypassing this
+  // guard (e.g. by stripping the flag) drops the dispatch into UB inside
+  // VkCmdPushConstants and segfaults the driver. Lowering the spill to a
+  // UBO is a future bridging-pass feature.
+  if (Refl->OversizedPushConstants)
+    CHIPERR_LOG_AND_THROW(
+        "CHIPQueueVulkan::launchImpl: kernel push-constant block exceeds "
+        "VkPhysicalDeviceLimits::maxPushConstantsSize; UBO spill not yet "
+        "implemented",
+        hipErrorNotSupported);
   dim3 Grid = VkExecItem->getGrid();
   dim3 Block = VkExecItem->getBlock();
   VkPipeline Pipeline = Module->getOrCreatePipeline(KernelName, Block);

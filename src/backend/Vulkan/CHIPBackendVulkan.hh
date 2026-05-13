@@ -232,6 +232,12 @@ struct VulkanKernelReflection {
   std::vector<uint32_t> BDAPointerSlotOffsets;
   uint32_t PushConstantBlockSize = 0;            ///< Total bytes used by all PushConst entries (rounded up).
   uint32_t MaxDescriptorBinding = 0;             ///< Highest binding used in set=0.
+  /// Phase Z6: set true at module-compile time when
+  /// PushConstantBlockSize > VkPhysicalDeviceLimits::maxPushConstantsSize so
+  /// launchImpl can refuse the dispatch cleanly instead of crashing the
+  /// driver via an oversized vkCmdPushConstants. Lowering >max PC blocks to
+  /// a UBO is a future bridging-pass feature.
+  bool OversizedPushConstants = false;
 };
 
 // ============================================================================
