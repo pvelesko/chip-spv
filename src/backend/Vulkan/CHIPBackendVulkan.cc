@@ -2030,10 +2030,38 @@ CHIPQueueVulkan::CHIPQueueVulkan(chipstar::Device *ChipDevice,
 }
 
 CHIPQueueVulkan::~CHIPQueueVulkan() {
+  // Z7: Teardown synchronization for detached threads.
+  //
+  // This dtor runs in two distinct contexts:
+  //   1. Normal teardown on the main thread (Backend uninitialize destroys
+  //      explicit user queues), with VkDevice still live.
+  //   2. thread_local cleanup on detached worker threads exiting after main
+  //      has already returned, in which case CHIPBackendVulkan::uninitialize
+  //      may have already destroyed the VkDevice. Calling vkQueueWaitIdle /
+  //      vkDestroyCommandPool against destroyed handles trips Vulkan
+  //      validation and ultimately SIGABRTs the process at exit
+  //      (Unit_TestThreadDetachCleanup).
+  //
+  // Serialize against CHIPBackendVulkan::uninitialize() via TeardownMtx_: if
+  // we acquire the lock first the queue is fully torn down before the
+  // backend can destroy its VkDevice; if uninitialize() acquired it first
+  // ShuttingDown_ is true and we skip every Vulkan call. Either way the OS
+  // reclaims the handles on process exit, so leaking them here is safe.
+  std::lock_guard<std::recursive_mutex> TeardownLock(
+      CHIPBackendVulkan::TeardownMtx_);
+
   VkDevice Dev =
       ChipDevice_ ? ChipDevice_->getLogicalDevice() : VK_NULL_HANDLE;
   if (Dev == VK_NULL_HANDLE)
     return;
+  if (CHIPBackendVulkan::ShuttingDown_.load(std::memory_order_acquire)) {
+    // VkDevice is about to be (or has already been) destroyed by the
+    // backend's uninitialize(). Drop our handles without calling Vulkan.
+    FinishFence_ = VK_NULL_HANDLE;
+    TimelineSemaphore_ = VK_NULL_HANDLE;
+    CommandPool_ = VK_NULL_HANDLE;
+    return;
+  }
 
   VkQueue Q = ChipDevice_->getComputeQueue();
   if (Q != VK_NULL_HANDLE) {
@@ -3677,6 +3705,11 @@ void CHIPQueueVulkan::storeCrossQueueDeps(
 // ===== I11: CHIPBackendVulkan (factories)
 // ============================================================================
 
+// Z7: Teardown synchronization for detached threads. Defined out-of-line so
+// the static members live in the backend translation unit alongside the
+// destructor logic that reads them.
+std::atomic<bool> CHIPBackendVulkan::ShuttingDown_{false};
+std::recursive_mutex CHIPBackendVulkan::TeardownMtx_;
 CHIPBackendVulkan::CHIPBackendVulkan() = default;
 
 CHIPBackendVulkan::~CHIPBackendVulkan() {
@@ -3936,6 +3969,22 @@ void CHIPBackendVulkan::initializeFromNative(const uintptr_t * /*NH*/,
 void CHIPBackendVulkan::uninitialize() {
   logTrace("CHIPBackendVulkan::uninitialize");
 
+  // Z7: Detached worker threads may still be inside HIP API calls (e.g.
+  // hipMemcpyAsync on hipStreamPerThread) when the main thread reaches
+  // process exit — Unit_TestThreadDetachCleanup spawns 1000 of them and
+  // returns from main without joining. Block here until those threads
+  // have left the HIP runtime so we can safely destroy the VkDevice +
+  // command pools they reference. Mirrors the Level0 backend's pattern
+  // (CHIPBackendLevel0.cc:2114).
+  waitForThreadExit();
+
+  // Announce shutdown so any CHIPQueueVulkan dtors that fire from
+  // thread_local cleanup after this point stop touching Vulkan handles,
+  // then take TeardownMtx_ to drain any ~Queue already in flight. Order
+  // matters: setting the flag first guarantees that a queue dtor blocked
+  // on TeardownMtx_ will observe ShuttingDown_ when it eventually runs.
+  ShuttingDown_.store(true, std::memory_order_release);
+  std::lock_guard<std::recursive_mutex> TeardownLock(TeardownMtx_);
   // Stop and join the event monitor before destroying anything it might
   // reference (matches the Level0 ordering: signal Stop then join). The
   // EventMonitor destructor is protected; the base class owns lifetime.

@@ -873,6 +873,21 @@ public:
   CHIPBackendVulkan();
   virtual ~CHIPBackendVulkan() override;
 
+  /// Teardown synchronization for detached threads (Z7).
+  ///
+  /// `ShuttingDown_` is set true at the start of `uninitialize()`. Per-thread
+  /// queue destructors (CHIPQueueVulkan::~CHIPQueueVulkan), which run from
+  /// thread_local cleanup in worker threads, check this flag under
+  /// `TeardownMtx_` and skip every Vulkan API call when shutdown is in
+  /// progress — the VkDevice/VkCommandPool they reference is about to be
+  /// destroyed by the main thread and the OS will reclaim the handles.
+  ///
+  /// The mutex serializes ~CHIPQueueVulkan against uninitialize(): a thread
+  /// already mid-dtor either completes (lock held by ~Queue) before
+  /// uninitialize() acquires the lock, or it sees ShuttingDown_=true and
+  /// skips its Vulkan calls.
+  static std::atomic<bool> ShuttingDown_;
+  static std::recursive_mutex TeardownMtx_;
   // chipstar::Backend pure virtuals.
   virtual chipstar::ExecItem *createExecItem(dim3 GridDim, dim3 BlockDim,
                                              size_t SharedMem,
