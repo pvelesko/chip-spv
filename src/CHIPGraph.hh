@@ -153,6 +153,19 @@ public:
   }
 
   /**
+   * @brief Remove a dependant from a node (best-effort; no-op if absent).
+   * Used when inlining a child-graph wrapper to detach edges before the
+   * wrapper is dropped.
+   */
+  void removeDependant(CHIPGraphNode *TheNode) {
+    auto FoundNode =
+        std::find(Dependendants_.begin(), Dependendants_.end(), TheNode);
+    if (FoundNode != Dependendants_.end()) {
+      Dependendants_.erase(FoundNode);
+    }
+  }
+
+  /**
    * @brief  Add a dependency from a node.
    *
    * Visualizing the graph, add an edge going down.

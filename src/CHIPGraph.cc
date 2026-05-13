@@ -280,7 +280,7 @@ std::vector<CHIPGraphNode *> CHIPGraph::getLeafNodes() {
 }
 
 void CHIPGraphExec::pruneGraph_() {
-  std::vector<CHIPGraphNode *> LeafNodes_ = OriginalGraph_->getLeafNodes();
+  std::vector<CHIPGraphNode *> LeafNodes_ = CompiledGraph_.getLeafNodes();
 
   for (auto LeafNode : LeafNodes_) {
     // Generate all paths from leaf to root
@@ -362,8 +362,13 @@ void CHIPGraphExec::compile() {
   ExtractSubGraphs_();
   pruneGraph_();
   logDebug("{} CHIPGraphExec::compile()", (void *)this);
-  std::vector<CHIPGraphNode *> Nodes = OriginalGraph_->getNodes();
-  auto RootNodesVec = OriginalGraph_->getRootNodes();
+  // Build ExecQueues_ from the CompiledGraph_ — this is the structure
+  // ExtractSubGraphs_ inlined child-graph nodes into, and the clone whose
+  // dependency edges were remapped via the copy constructor. Using
+  // OriginalGraph_ here would leave child-graph wrappers in the queue and
+  // never schedule the inlined subgraph nodes.
+  std::vector<CHIPGraphNode *> Nodes = CompiledGraph_.getNodes();
+  auto RootNodesVec = CompiledGraph_.getRootNodes();
   std::set<CHIPGraphNode *> RootNodes(RootNodesVec.begin(), RootNodesVec.end());
   ExecQueues_.push(RootNodes);
   //  Remove root nodes from the set of nodes
@@ -421,49 +426,78 @@ void CHIPGraphNodeHost::execute(chipstar::Queue *Queue) const {
 }
 
 void CHIPGraphExec::ExtractSubGraphs_() {
-  auto Nodes = CompiledGraph_.getNodes();
+  // Operate on a reference to CompiledGraph_'s node vector so that node
+  // erase/insert mutations actually persist. The previous `auto Nodes = ...`
+  // bound to a copy, throwing away the inlining work and leaving the wrapper
+  // CHIPGraphNodeGraph in place — its execute() is a no-op, so the child
+  // graph never ran.
+  auto &Nodes = CompiledGraph_.getNodes();
   // Track which subgraphs we've already expanded so a self-referencing or
   // diamond-referenced child graph doesn't blow up here. Without this guard,
   // a graph that adds itself as a child node (legal CUDA pattern, exercised
   // by Unit_hipGraphAddChildGraphNode_OrgGraphAsChildGraph) recursively
   // re-expands its own nodes and hangs the launch.
   std::set<CHIPGraph *> Expanded;
-  for (int i = 0; i < Nodes.size(); i++) {
+  for (int i = 0; i < (int)Nodes.size(); i++) {
     auto Node = Nodes[i];
-    if (Node->getType() == hipGraphNodeTypeGraph) {
-      auto SubGraphNode = static_cast<CHIPGraphNodeGraph *>(Node);
-      auto SubGraph = SubGraphNode->getGraph();
+    if (Node->getType() != hipGraphNodeTypeGraph)
+      continue;
 
-      // Self-reference / already-expanded: drop the wrapper and skip
-      // re-injecting nodes (they're already present in the parent).
-      if (SubGraph == OriginalGraph_ || !Expanded.insert(SubGraph).second) {
-        Nodes.erase(Nodes.begin() + i);
-        --i;
-        continue;
-      }
+    auto *SubGraphNode = static_cast<CHIPGraphNodeGraph *>(Node);
+    auto *SubGraph = SubGraphNode->getGraph();
 
-      // 1. get all the root nodes
-      auto RootNodes = SubGraph->getRootNodes();
-      if (i > 0) {
-        // 2. make them dependants of prev nodes
-        auto PrevNode = Nodes[i - 1];
-        PrevNode->addDependencies(RootNodes);
-      }
+    // Snapshot the wrapper's actual graph-edge neighbours up front so we
+    // can detach the wrapper cleanly. These are the topological parents
+    // and children of the wrapper, NOT the vector neighbours at i-1/i+1.
+    auto WrapperDeps = SubGraphNode->getDependencies();
+    auto WrapperDependants = SubGraphNode->getDependants();
 
-      // 3. get all the leaf nodes
-      auto LeafNodes = SubGraph->getLeafNodes();
-      if (i + 1 < Nodes.size()) {
-        // 4. add dependency on next node
-        auto NextNode = Nodes[i + 1];
-        NextNode->addDependants(LeafNodes);
-      }
-
-      // 5. Erase the original subgraph node
+    auto eraseWrapper = [&]() {
+      // Detach the wrapper from neighbours so dangling pointers don't
+      // confuse the level-builder in compile().
+      for (auto *Dep : WrapperDeps)
+        Dep->removeDependant(SubGraphNode);
+      for (auto *Dn : WrapperDependants)
+        Dn->removeDependency(SubGraphNode);
       Nodes.erase(Nodes.begin() + i);
-      // 6. replace it with nodes from the subgraph
-      for (auto SubGraphNode : SubGraph->getNodes()) {
-        Nodes.push_back(SubGraphNode);
+      --i;
+    };
+
+    // Self-reference / already-expanded: drop the wrapper without
+    // re-injecting subgraph nodes (they're already present in the parent
+    // or recursively reachable). Still rewire wrapper neighbours so the
+    // wrapper isn't left as a stale dependency on the surviving copy of
+    // those nodes — fall through to compile() using just those.
+    if (SubGraph == OriginalGraph_ || !Expanded.insert(SubGraph).second) {
+      // Bridge: wrapper's parents become deps of wrapper's children so the
+      // ordering survives wrapper removal.
+      for (auto *Dn : WrapperDependants) {
+        for (auto *Dep : WrapperDeps) {
+          Dn->addDependency(Dep);
+        }
       }
+      eraseWrapper();
+      continue;
+    }
+
+    // Inline the subgraph: child roots inherit the wrapper's deps; child
+    // leaves inherit the wrapper's dependants.
+    auto RootNodes = SubGraph->getRootNodes();
+    auto LeafNodes = SubGraph->getLeafNodes();
+
+    for (auto *Root : RootNodes) {
+      for (auto *Dep : WrapperDeps)
+        Root->addDependency(Dep);
+    }
+    for (auto *Leaf : LeafNodes) {
+      for (auto *Dn : WrapperDependants)
+        Dn->addDependency(Leaf);
+    }
+
+    eraseWrapper();
+    // Inject the subgraph's nodes into the compiled parent.
+    for (auto *SubNode : SubGraph->getNodes()) {
+      Nodes.push_back(SubNode);
     }
   }
 }
