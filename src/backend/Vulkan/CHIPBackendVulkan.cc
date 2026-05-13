@@ -1211,6 +1211,12 @@ void *CHIPContextVulkan::allocateImpl(size_t Size, size_t Alignment,
   BufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                   VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  // Phase Z3: opt every HIP-allocated buffer into BDA so a kernel that picks
+  // the BDA path can produce a valid PhysicalStorageBuffer pointer via
+  // vkGetBufferDeviceAddress. The buffer-usage bit is harmless for buffers
+  // that never get queried for a device address.
+  if (Dev->hasBufferDeviceAddress())
+    BufInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
   BufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
   VmaAllocationCreateInfo AllocInfo{};
@@ -1478,6 +1484,11 @@ CHIPDeviceVulkan *CHIPDeviceVulkan::create(CHIPContextVulkan *ChipContext,
   Dev->HasShaderInt8_ = (V12Features.shaderInt8 == VK_TRUE) ||
                         (F16I8Features.shaderInt8 == VK_TRUE);
   Dev->HasShaderInt64_ = Feat2.features.shaderInt64 == VK_TRUE;
+  // Phase Z3: probe bufferDeviceAddress (Vulkan 1.2 core). Required for the
+  // BDA path the bridging pass selects when a module has IGBAs (e.g.
+  // pointer-inside-struct kernel args). Without it, push-constant BDA slots
+  // would carry raw VmaAllocation cookies that OpConvertUToPtr can't resolve.
+  Dev->HasBufferDeviceAddress_ = (V12Features.bufferDeviceAddress == VK_TRUE);
 
   // ----- Pick a compute-capable queue family -----
   uint32_t QFamCount = 0;
@@ -1546,6 +1557,22 @@ CHIPDeviceVulkan *CHIPDeviceVulkan::create(CHIPContextVulkan *ChipContext,
   Enable12.shaderInt8 = Dev->HasShaderInt8_ ? VK_TRUE : VK_FALSE;
   Enable12.hostQueryReset = VK_TRUE;
   Enable12.timelineSemaphore = VK_TRUE;
+  // Phase Z3: opt into bufferDeviceAddress when the device supports it. Used
+  // by the BDA push-constant path for kernels emitted by the bridging pass'
+  // rewriteKernelSignatureBDA. Capture-replay stays off — only needed for
+  // validation-layer replay tooling, not runtime BDA lookup.
+  Enable12.bufferDeviceAddress =
+      Dev->HasBufferDeviceAddress_ ? VK_TRUE : VK_FALSE;
+  Enable12.bufferDeviceAddressCaptureReplay = VK_FALSE;
+  // Phase Z3: also opt into VK_KHR_maintenance4 (core in Vulkan 1.3). The
+  // bridging pass + inject_reflection.py emit `OpExecutionModeId LocalSizeId`
+  // with spec-constant workgroup dimensions — this requires the maintenance4
+  // feature to be enabled. Without it, vkCreateShaderModule rejects every
+  // kernel SPV with VUID-RuntimeSpirv-LocalSizeId-06434.
+  VkPhysicalDeviceMaintenance4FeaturesKHR EnableM4{};
+  EnableM4.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES_KHR;
+  EnableM4.maintenance4 = VK_TRUE;
+  Enable12.pNext = &EnableM4;
 
   VkPhysicalDeviceFeatures2 EnableFeat{};
   EnableFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -1554,6 +1581,7 @@ CHIPDeviceVulkan *CHIPDeviceVulkan::create(CHIPContextVulkan *ChipContext,
 
   std::vector<const char *> DevExts = {
       VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME,
+      VK_KHR_MAINTENANCE_4_EXTENSION_NAME,
   };
 
   VkDeviceCreateInfo DevInfo{};
@@ -1583,8 +1611,15 @@ CHIPDeviceVulkan *CHIPDeviceVulkan::create(CHIPContextVulkan *ChipContext,
   AInfo.device = Dev->LogicalDevice_;
   AInfo.instance = static_cast<CHIPBackendVulkan *>(::Backend)->getInstance();
   AInfo.vulkanApiVersion = VK_API_VERSION_1_2;
-  // Deliberately no VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT — worklog
-  // #10 excludes BDA from the spike (toolchain emits Logical GLSL450).
+  // Phase Z3: enable BDA in VMA when the device supports it. The bridging
+  // pass' BDA path (rewriteKernelSignatureBDA) emits PhysicalStorageBuffer64
+  // SPIR-V with OpConvertUToPtr fed from push-constant ulong fields; those
+  // ulongs are filled at dispatch time by vkGetBufferDeviceAddress on the
+  // VkBuffer backing each HIP pointer kernel arg, which requires the buffer
+  // to have been created with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT —
+  // VMA propagates that automatically only when this allocator flag is set.
+  if (Dev->HasBufferDeviceAddress_)
+    AInfo.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
   R = vmaCreateAllocator(&AInfo, &Dev->Allocator_);
   if (R != VK_SUCCESS) {
     vkDestroyDevice(Dev->LogicalDevice_, nullptr);
