@@ -1175,6 +1175,53 @@ void CHIPExecItemVulkan::setupAllArgs() {
         Pc.HipSourceIndex >= 0 ? Pc.HipSourceIndex : (int32_t)Pc.Ordinal;
     std::memcpy(PushConstantBlob_.data() + Pc.Offset, Args_[ArgsIdx], Pc.Size);
   }
+  // Phase Z3 (BDA): for every recorded BDA pointer slot in the PC block,
+  // the bytes just copied from the user are a raw HIP pointer (8 bytes;
+  // under the native Vulkan backend, the VmaAllocation cookie returned by
+  // hipMalloc). The BDA path in the bridging pass emits
+  //   OpConvertUToPtr(_ptr_PhysicalStorageBuffer_*, <ulong>)
+  // so the shader needs an actual VkDeviceAddress in those 8 bytes. Look up
+  // the backing VkBuffer (range-aware to handle pointer-into-allocation),
+  // resolve its device address, and overwrite the slot. Buffers were given
+  // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT at allocate time, and the
+  // logical device was created with VkPhysicalDeviceVulkan12Features::
+  // bufferDeviceAddress=VK_TRUE, so vkGetBufferDeviceAddress is valid here.
+  if (!Refl->BDAPointerSlotOffsets.empty()) {
+    if (!Dev->hasBufferDeviceAddress())
+      CHIPERR_LOG_AND_THROW(
+          "ExecItem::setupAllArgs: kernel uses Buffer Device Address but the "
+          "Vulkan device does not support bufferDeviceAddress",
+          hipErrorNotSupported);
+    VkDevice VkDev = Dev->getLogicalDevice();
+    for (uint32_t Offset : Refl->BDAPointerSlotOffsets) {
+      if ((size_t)Offset + sizeof(uint64_t) > PushConstantBlob_.size()) {
+        std::string Msg = "ExecItem::setupAllArgs: BDA pointer slot offset " +
+                          std::to_string(Offset) +
+                          " is past the end of the push-constant block (" +
+                          std::to_string(PushConstantBlob_.size()) + " bytes)";
+        CHIPERR_LOG_AND_THROW(Msg, hipErrorInvalidValue);
+      }
+      void *HipPtr = nullptr;
+      std::memcpy(&HipPtr, PushConstantBlob_.data() + Offset, sizeof(void *));
+      uint64_t Bda = 0;
+      if (HipPtr != nullptr) {
+        size_t SubOffset = 0;
+        const auto *Entry = Ctx->getDevPtrEntryContaining(HipPtr, SubOffset);
+        if (Entry == nullptr) {
+          std::string Msg =
+              "ExecItem::setupAllArgs: BDA pointer slot at offset " +
+              std::to_string(Offset) +
+              " references an unregistered device pointer";
+          CHIPERR_LOG_AND_THROW(Msg, hipErrorInvalidDevicePointer);
+        }
+        VkBufferDeviceAddressInfo Bdai{};
+        Bdai.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+        Bdai.buffer = Entry->Buffer;
+        Bda = vkGetBufferDeviceAddress(VkDev, &Bdai) + SubOffset;
+      }
+      std::memcpy(PushConstantBlob_.data() + Offset, &Bda, sizeof(uint64_t));
+    }
+  }
   this->ArgsSetup = true;
 }
 
