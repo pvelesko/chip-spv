@@ -506,6 +506,24 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
                    It->second.Name, Ord, Sz);
           break;
         }
+        case 26: { // Phase Z3: ArgumentPointerPushConstant(kernel, ord, offset, size, [arg_info])
+          // Buffer Device Address slot: 8-byte ulong at `offset` within the PC
+          // block where the runtime must substitute the user's HIP pointer
+          // with vkGetBufferDeviceAddress(buffer_lookup(pointer)). Multiple
+          // slots may exist per kernel (e.g. a byval struct with several
+          // pointer fields). The slot is NOT a separate ClientArg — it lives
+          // inside an existing POD/byval kernel arg's push-constant region.
+          if (Wc < 9)
+            break;
+          auto It = Kernels.find(Words[5]);
+          if (It == Kernels.end())
+            break;
+          uint32_t Offset = static_cast<uint32_t>(Consts[Words[7]]);
+          Output.BDAPointerSlotOffsetsByKernel[It->second.Name].push_back(Offset);
+          logDebug("Reflect kernel='{}' ArgPointerPushConstant offset={}",
+                   It->second.Name, Offset);
+          break;
+        }
         default:
           break;
         }

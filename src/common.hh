@@ -87,6 +87,15 @@ struct SPVModuleInfo {
   /// bind the chipStar-allocated cl_mem of `<symbol>` at the recorded ord.
   std::map<std::string, std::vector<SPVKernelDeviceGlobalArg>>
       HiddenDGArgsByKernel;
+  /// Phase Z3 (Vulkan BDA): kernel-name -> ordered list of byte offsets
+  /// within the kernel's push-constant block where an 8-byte Buffer Device
+  /// Address slot lives. The bridging pass (rewriteKernelSignatureBDA) emits
+  /// these via NonSemantic.ClspvReflection ArgumentPointerPushConstant=26
+  /// ExtInsts; inject_reflection.py produces them when it sees a global
+  /// `.hipspv.bda_offsets.<kernel>` constant. The runtime substitutes the
+  /// raw HIP pointer at each offset with vkGetBufferDeviceAddress(buffer)
+  /// before pushing the PC block. Empty for non-BDA modules.
+  std::map<std::string, std::vector<uint32_t>> BDAPointerSlotOffsetsByKernel;
 };
 
 // Processing done before analysis.
