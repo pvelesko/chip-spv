@@ -1,1 +1,2 @@
+add_shell_test(TestStaticLibRDCOffloadArch.bash)
 add_shell_test(TestStaticLibRDC.bash)
