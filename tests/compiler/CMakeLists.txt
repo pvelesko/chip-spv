@@ -208,3 +208,6 @@ add_subdirectory(irVerification)
 
 # Add the warp size (intel_reqd_sub_group_size) pass tests
 add_subdirectory(warpSize)
+
+# Add the untranslatable math intrinsic (llround / llrint / ldexp) pass tests
+add_subdirectory(mathIntrinsics)
