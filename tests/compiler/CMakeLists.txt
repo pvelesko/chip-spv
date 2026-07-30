@@ -205,3 +205,6 @@ add_subdirectory(promoteInt)
 
 # Add the IR verification tests
 add_subdirectory(irVerification)
+
+# Add the warp size (intel_reqd_sub_group_size) pass tests
+add_subdirectory(warpSize)
