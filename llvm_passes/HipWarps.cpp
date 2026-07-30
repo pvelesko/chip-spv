@@ -41,93 +41,48 @@ PreservedAnalyses HipWarpsPass::run(Module &Mod, ModuleAnalysisManager &AM) {
   // constant that can be queried from the device info.
   //
   // Add the intel_reqd_sub_group_size kernel metadata to force the subgroup
-  // size to be fixed to the warp size used by the chipStar build in case there
-  // is a possibility the kernel's semantically sensitive to the warp width.
+  // size to be fixed to the warp size used by the chipStar build.
   //
-  // For now check if the CUDA warp-size sensitive intrinsic declarations appear
-  // in the module and assume all the kernels call them. TO OPTIMIZE: Use
-  // CallGraph to analyze if the kernels really call them to allow subgroup
-  // freedom for those that don't.
-
-  std::vector<const char *> WarpSizeSensitiveFuncNames = {
-      // Basic shuffle operations
-      "_Z6__shfliii",
-      "_Z6__shflfii",
-      "_Z10__shfl_xoriii",
-      "_Z10__shfl_xorfii",
-      "_Z9__shfl_upiji",
-      "_Z9__shfl_upfji",
-      "_Z11__shfl_downiji",
-      "_Z11__shfl_downfji",
-      
-      // Ballot operations
-      "_Z8__balloti",
-      
-      // Subgroup operations
-      "_Z16sub_group_balloti",
-      "_Z17sub_group_shufflefj",
-      "_Z17sub_group_shuffleij",
-      "_Z21sub_group_shuffle_xorij",
-      "_Z21sub_group_shuffle_xorfj",
-      "_Z22sub_group_shuffle_downiij",
-      "_Z22sub_group_shuffle_downffj",
-      "_Z20sub_group_shuffle_upiij",
-      "_Z20sub_group_shuffle_upffj",
-      
-      // Intel subgroup operations
-      "_Z23intel_sub_group_shuffleij",
-      "_Z23intel_sub_group_shufflefj",
-      "_Z27intel_sub_group_shuffle_xorij",
-      "_Z27intel_sub_group_shuffle_xorfj",
-      
-      // Subgroup ID query
-      "_Z22get_sub_group_local_idv",
-      
-      // Additional warp operations
-      "_Z12__chip_allsyncjii",  // __chip_all_sync
-      "_Z12__chip_anysyncjii",  // __chip_any_sync
-      "_Z15__chip_ballotsynciij", // __chip_ballot_sync
-      "_Z9__chip_alli",         // __chip_all
-      "_Z9__chip_anyi",         // __chip_any
-      "_Z13__chip_balloti",     // __chip_ballot
-      "_Z14__chip_lane_idv",    // __chip_lane_id
-      "_Z14__chip_syncwarpv",   // __chip_syncwarp
-      
-      // Sync variants of shuffle operations
-      "_Z11__shfl_syncjiii",
-      "_Z11__shfl_syncjfii",
-      "_Z15__shfl_xor_syncjiiii",
-      "_Z15__shfl_xor_syncjfii",
-      "_Z14__shfl_up_syncjijii",
-      "_Z14__shfl_up_syncjfjii",
-      "_Z16__shfl_down_syncjijii",
-      "_Z16__shfl_down_syncjfjii"};
-
-  SmallPtrSet<Function *, 8> Sensitive;
-  for (auto &FuncName : WarpSizeSensitiveFuncNames)
-    if (auto *F = Mod.getFunction(FuncName))
-      Sensitive.insert(F);
-
-  if (Sensitive.empty())
-    return PreservedAnalyses::all();
+  // Every kernel is stamped, unconditionally. Device code is compiled against
+  // a warpSize that is a compile-time constant (CHIP_DEFAULT_WARP_SIZE, see
+  // include/hip/devicelib/sync_and_util.hh), so a kernel is warp-width
+  // sensitive whenever it relies on that constant -- and that is not something
+  // this pass can detect:
+  //
+  //  * Warp lock-step semantics. CUDA/HIP lets device code drop explicit
+  //    synchronization whenever warp lock-step guarantees a well-defined
+  //    read-modify-write interleaving inside the warp. Such code calls no
+  //    warp primitive at all; it only indexes shared memory by
+  //    threadIdx % warpSize. Kokkos' HIP block reduction
+  //    (HIPReductionsFunctor<F,false>::scalar_intra_warp_reduction) is exactly
+  //    this: a barrier-free binary tree over warpSize shared-memory slots
+  //    followed by a barrier-free broadcast of the warp leader's slot. If the
+  //    subgroup is narrower than warpSize the halves race and each
+  //    contribution is accumulated several times over. See
+  //    tests/runtime/TestWarpSyncSharedMemReduction.hip.
+  //
+  //  * Matching a declaration list cannot work either. The previous version of
+  //    this pass returned early unless one of a fixed list of mangled warp
+  //    primitive names appeared in the module. That check is order dependent:
+  //    it holds per translation unit, but with -fgpu-rdc chipStar runs its
+  //    passes on the device-linked module, by which point the primitives are
+  //    resolved and inlined and no matching declaration is left. Every kernel
+  //    in every RDC build therefore went unstamped, IGC was free to pick the
+  //    subgroup size, and -cl-opt-disable (or merely enough register pressure)
+  //    made it pick 16 while device code still believed warpSize was 32.
+  //
+  // Cost: kernels that would rather have been compiled narrower are now pinned
+  // to the warp size, which IGC honours even at the price of spilling. That is
+  // the correct trade -- a silently wrong reduction is worse than a slow one.
 
   // Kernels that perform an indirect call must not be stamped: the driver then
   // delivers the correct 'this' but zero for every argument after it, silently.
   // No error, no diagnostic, just wrong results.
   //
-  // Since one shuffle declaration anywhere in the module stamps every kernel,
-  // and Kokkos_Core.hpp declares the shuffle intrinsics, a single #include used
-  // to break device-side virtual dispatch for a whole application. See
-  // tests/runtime/TestIndirectCall.hip.
+  // See tests/runtime/TestIndirectCall.hip.
   //
-  // Everything else keeps the existing conservative behaviour. Narrowing the
-  // stamp to kernels that provably reach a sensitive function was tried and is
-  // wrong today: WarpSizeSensitiveFuncNames only lists some of the shuffle
-  // overloads, so Kokkos' own reductions lost the subgroup size they rely on
-  // and started accumulating each contribution several times.
-  //
-  // A kernel that both dispatches indirectly and shuffles cannot be served
-  // either way; correct arguments are the more useful half.
+  // A kernel that both dispatches indirectly and depends on the warp width
+  // cannot be served either way; correct arguments are the more useful half.
   auto reachesIndirectCall = [](Function &Kernel) {
     SmallPtrSet<Function *, 16> Seen;
     SmallVector<Function *, 16> Worklist{&Kernel};
