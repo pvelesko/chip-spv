@@ -1464,16 +1464,19 @@ chipstar::Module *chipstar::Device::getOrCreateModule(HostPtr Ptr) {
 
 /// Get compiled module for the source module 'SrcMod'.
 chipstar::Module *chipstar::Device::getOrCreateModule(const SPVModule &SrcMod) {
-  LOCK(DeviceVarMtx); // chipstar::Device::SrcModToCompiledMod_
-                      // chipstar::Device::HostPtrToCompiledMod_
-                      // chipstar::Device::DeviceVarLookup_
-
-  // Check if we have already created the module for the source.
-  if (SrcModToCompiledMod_.count(&SrcMod))
-    return SrcModToCompiledMod_[&SrcMod];
+  { // Check if we have already created the module for the source.
+    LOCK(DeviceVarMtx); // chipstar::Device::SrcModToCompiledMod_
+    if (SrcModToCompiledMod_.count(&SrcMod))
+      return SrcModToCompiledMod_[&SrcMod];
+  }
 
   logDebug("Compile module {}", static_cast<const void *>(&SrcMod));
 
+  // compile() runs with DeviceVarMtx released. It enters the backend compiler,
+  // which is free to block, throw, or terminate the process:
+  // SPIRV-LLVM-Translator calls exit() from inside clBuildProgram on a module
+  // it rejects, and the atexit path that runs then takes DeviceVarMtx again in
+  // deallocateDeviceVariables() on this same thread.
   auto start = std::chrono::high_resolution_clock::now();
   auto *Module = compile(SrcMod);
   auto end = std::chrono::high_resolution_clock::now();
@@ -1485,7 +1488,12 @@ chipstar::Module *chipstar::Device::getOrCreateModule(const SPVModule &SrcMod) {
     return nullptr;
   }
 
-  SrcModToCompiledMod_.insert(std::make_pair(&SrcMod, Module));
+  LOCK(DeviceVarMtx); // chipstar::Device::SrcModToCompiledMod_
+  auto Insertion = SrcModToCompiledMod_.insert(std::make_pair(&SrcMod, Module));
+  if (!Insertion.second) { // Another thread compiled the same source.
+    delete Module;
+    return Insertion.first->second;
+  }
   return Module;
 }
 
