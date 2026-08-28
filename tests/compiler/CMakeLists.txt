@@ -214,3 +214,6 @@ add_subdirectory(mathIntrinsics)
 
 # Add the 8 and 16 bit atomic lowering pass tests
 add_subdirectory(subwordAtomics)
+
+# Add the volatile global access lowering pass tests
+add_subdirectory(volatileAccesses)
