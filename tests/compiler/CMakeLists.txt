@@ -211,3 +211,6 @@ add_subdirectory(warpSize)
 
 # Add the untranslatable math intrinsic (llround / llrint / ldexp) pass tests
 add_subdirectory(mathIntrinsics)
+
+# Add the 8 and 16 bit atomic lowering pass tests
+add_subdirectory(subwordAtomics)
