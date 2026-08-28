@@ -333,6 +333,9 @@ std::vector<CHIPGraphNode *> CHIPGraph::getRootNodes() {
 }
 
 void CHIPGraphExec::compile() {
+  // Every launch rebuilds the schedule from scratch; the levels queued by the
+  // previous launch would otherwise run again in front of the new ones.
+  ExecQueues_ = {};
   pruneGraph_();
   logDebug("{} CHIPGraphExec::compile()", (void *)this);
   std::vector<CHIPGraphNode *> Nodes = OriginalGraph_->getNodes();
