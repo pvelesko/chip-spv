@@ -115,6 +115,12 @@ if(SPIRV_DIS AND (NOT USE_NEW_OFFLOAD_DRIVER OR CLANG_OFFLOAD_BUNDLER))
   add_shell_test(TestBoolKernelParamSPIRV.bash)
 endif()
 
+# Volatile 32 and 64 bit global accesses must reach the SPIR-V producer as
+# relaxed device-scope atomics (Kokkos::volatile_load on PVC reads stale L1
+# data otherwise). Inspects the lowered device bitcode of
+# TestFixVolatileLoadLowering.hip, and the SPIR-V module when spirv-dis exists.
+add_shell_test(TestFixVolatileLoadLoweringSPIRV.bash)
+
 add_shell_test(../run_testenvvars.sh)
 set_tests_properties(run_testenvvars PROPERTIES
   TIMEOUT 60)
