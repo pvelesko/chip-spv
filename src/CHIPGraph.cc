@@ -333,7 +333,6 @@ std::vector<CHIPGraphNode *> CHIPGraph::getRootNodes() {
 }
 
 void CHIPGraphExec::compile() {
-  ExtractSubGraphs_();
   pruneGraph_();
   logDebug("{} CHIPGraphExec::compile()", (void *)this);
   std::vector<CHIPGraphNode *> Nodes = OriginalGraph_->getNodes();
@@ -394,38 +393,12 @@ void CHIPGraphNodeHost::execute(chipstar::Queue *Queue) const {
   Params_.fn(Params_.userData);
 }
 
-void CHIPGraphExec::ExtractSubGraphs_() {
-  auto Nodes = CompiledGraph_.getNodes();
-  for (int i = 0; i < Nodes.size(); i++) {
-    auto Node = Nodes[i];
-    if (Node->getType() == hipGraphNodeTypeGraph) {
-      auto SubGraphNode = static_cast<CHIPGraphNodeGraph *>(Node);
-      auto SubGraph = SubGraphNode->getGraph();
-
-      // 1. get all the root nodes
-      auto RootNodes = SubGraph->getRootNodes();
-      if (i > 0) {
-        // 2. make them dependants of prev nodes
-        auto PrevNode = Nodes[i - 1];
-        PrevNode->addDependencies(RootNodes);
-      }
-
-      // 3. get all the leaf nodes
-      auto LeafNodes = SubGraph->getLeafNodes();
-      if (i < Nodes.size()) {
-        // 4. add dependency on next node
-        auto NextNode = Nodes[i + 1];
-        NextNode->addDependants(LeafNodes);
-      }
-
-      // 5. Erase the original subgraph node
-      Nodes.erase(Nodes.begin() + i);
-      // 6. replace it with nodes from the subgraph
-      for (auto SubGraphNode : SubGraph->getNodes()) {
-        Nodes.push_back(SubGraphNode);
-      }
-    }
-  }
+void CHIPGraphNodeGraph::execute(chipstar::Queue *Queue) const {
+  // The schedule runs this node after all of its dependencies and before all
+  // of its dependants, so running the child graph to completion here keeps
+  // the ordering the parent graph asked for.
+  CHIPGraphExec SubGraphExec(SubGraph_);
+  SubGraphExec.launch(Queue);
 }
 
 void CHIPGraphNodeEventRecord::execute(chipstar::Queue *Queue) const {

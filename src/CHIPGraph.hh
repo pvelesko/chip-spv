@@ -423,9 +423,8 @@ public:
 
   virtual ~CHIPGraphNodeGraph() override {}
 
-  virtual void execute(chipstar::Queue *Queue) const override {
-    CHIPERR_LOG_AND_THROW("Attemped to execute GraphNode", hipErrorTbd);
-  }
+  virtual void execute(chipstar::Queue *Queue) const override;
+
   virtual CHIPGraphNode *clone() const override {
     auto NewNode = new CHIPGraphNodeGraph(*this);
     return NewNode;
@@ -662,13 +661,6 @@ protected:
    *
    */
   std::queue<std::set<CHIPGraphNode *>> ExecQueues_;
-
-  /**
-   * @brief For every CHIPGraphNodeGraph in CompiledGraph_, replace this node
-   * with its contents.
-   *
-   */
-  void ExtractSubGraphs_();
 
   /**
    * @brief remove unnecessary dependencies
