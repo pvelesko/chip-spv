@@ -33,6 +33,7 @@
 #include "HipLowerFPAtomicMinMax.h"
 #include "HipLowerRoundIntrinsics.h"
 #include "HipIGBADetector.h"
+#include "HipFunctionPointerAS.h"
 #include "HipPromoteInts.h"
 #include "HipLowerOverflowIntrinsics.h"
 #include "HipSpirvFunctionReorderPass.h"
@@ -208,6 +209,11 @@ static void addFullLinkTimePasses(ModulePassManager &MPM) {
 
   addPassWithVerification(MPM, createModuleToFunctionPassAdaptor(InferAddressSpacesPass(4)), "InferAddressSpacesPass");
 
+  // Move vtable function pointers into the generic address space. Runs after
+  // inlining and InferAddressSpaces so it only sees the indirect calls that
+  // genuinely survive into the SPIR-V module.
+  addPassWithVerification(MPM, HipFunctionPointerASPass(), "HipFunctionPointerASPass");
+
   addPassWithVerification(MPM, HipIGBADetectorPass(), "HipIGBADetectorPass");
 
   // Fix InvalidBitWidth errors due to non-standard integer types
@@ -271,6 +277,12 @@ llvmGetPassPluginInfo() {
                   // which makes it directly testable with opt.
                   if (Name == "hip-lower-overflow-intrinsics") {
                     MPM.addPass(HipLowerOverflowIntrinsicsPass());
+                    return true;
+                  }
+                  // Register the vtable function pointer address space pass
+                  // as standalone, which makes it directly testable with opt.
+                  if (Name == "hip-function-pointer-as") {
+                    MPM.addPass(HipFunctionPointerASPass());
                     return true;
                   }
                   // Register SPIR-V function reorder pass as standalone
