@@ -284,6 +284,8 @@ public:
 
   hipKernelNodeParams getParams() const { return Params_; }
 
+  std::string getKernelName() const;
+
   void setParams(const hipKernelNodeParams Params) { Params_ = Params; }
   /**
    * @brief Createa a copy of this node
@@ -617,6 +619,14 @@ public:
   }
 
   std::vector<CHIPGraphNode *> &getNodes() { return Nodes_; }
+
+  /**
+   * @brief Write the graph in DOT format (hipGraphDebugDotPrint).
+   *
+   * @param Out stream to write to
+   * @param Flags hipGraphDebugDotFlags selecting the per-node details
+   */
+  void writeDot(std::ostream &Out, unsigned Flags);
 
   std::vector<std::pair<CHIPGraphNode *, CHIPGraphNode *>> getEdges() {
     std::set<std::pair<CHIPGraphNode *, CHIPGraphNode *>> Edges;
