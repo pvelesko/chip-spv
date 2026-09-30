@@ -511,9 +511,6 @@ chipstar::Module::allocateDeviceVariablesNoLock(chipstar::Device *Device,
                                  hipMemoryType::hipMemoryTypeDevice);
       Var->setDevAddr(Addr);
       // Phase I3: seed init bytes (recovered from the SPV OpName encoding).
-      // The runtime treats absent InitData as "leave the buffer at its
-      // alloc-default zero" — Vulkan StorageBuffer descriptors are zeroed
-      // at first allocation, matching `__device__ int X;` semantics.
       if (Var->getInitData().empty()) {
         if (const auto *DG = LookupDG(Var->getName())) {
           if (!DG->InitData.empty())
@@ -528,6 +525,8 @@ chipstar::Module::allocateDeviceVariablesNoLock(chipstar::Device *Device,
         Queue->memCopyAsync(Addr, Init.data(), CopyN, hipMemcpyHostToDevice);
         Var->markHasInitializer(true);
       } else {
+        // Reused device memory is not zero; prepare zero-fills it.
+        Var->setInitKind(ChipVarInitHostFill);
         Var->markHasInitializer(false);
       }
     }
