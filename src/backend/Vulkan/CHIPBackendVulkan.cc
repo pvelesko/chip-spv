@@ -2556,6 +2556,24 @@ inline void i8EndCmdBuffer(VkCommandBuffer Cmd) {
 // itself the host-mapped pointer; the transfer collapses to a plain
 // std::memcpy without staging in both directions.
 // ----------------------------------------------------------------------------
+void CHIPQueueVulkan::waitSubmitted() {
+  if (TimelineSemaphore_ == VK_NULL_HANDLE)
+    return;
+  uint64_t Target;
+  {
+    std::lock_guard<std::mutex> Lock(QueueOpMtx_);
+    Target = TimelineValue_;
+  }
+  VkSemaphoreWaitInfo WI{};
+  WI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+  WI.semaphoreCount = 1;
+  WI.pSemaphores = &TimelineSemaphore_;
+  WI.pValues = &Target;
+  checkVk(vkWaitSemaphores(ChipDevice_->getLogicalDevice(), &WI, UINT64_MAX),
+          "CHIPQueueVulkan::waitSubmitted: vkWaitSemaphores failed",
+          hipErrorTbd);
+}
+
 std::shared_ptr<chipstar::Event>
 CHIPQueueVulkan::memCopyAsyncImpl(void *Dst, const void *Src, size_t Size,
                                   hipMemcpyKind Kind) {
@@ -2607,22 +2625,7 @@ CHIPQueueVulkan::memCopyAsyncImpl(void *Dst, const void *Src, size_t Size,
       (Kind == hipMemcpyDeviceToDevice && DstIsMapped && SrcIsMapped)) {
     logTrace("CHIPQueueVulkan::memCopyAsync host-side memcpy {} -> {} / {} B",
              Src, Dst, Size);
-    // The host copy must not overtake work already submitted to this queue.
-    if (TimelineSemaphore_ != VK_NULL_HANDLE) {
-      uint64_t Target;
-      {
-        std::lock_guard<std::mutex> Lock(QueueOpMtx_);
-        Target = TimelineValue_;
-      }
-      VkSemaphoreWaitInfo WI{};
-      WI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-      WI.semaphoreCount = 1;
-      WI.pSemaphores = &TimelineSemaphore_;
-      WI.pValues = &Target;
-      checkVk(vkWaitSemaphores(ChipDevice_->getLogicalDevice(), &WI,
-                               UINT64_MAX),
-              "memCopyAsync: vkWaitSemaphores failed", hipErrorTbd);
-    }
+    waitSubmitted();
     std::memcpy(Dst, Src, Size);
     {
       VkCommandBuffer EmptyCmd = i8BeginCmdBuffer(this);
@@ -2776,6 +2779,7 @@ CHIPQueueVulkan::memFillAsyncImpl(void *Dst, size_t Size, const void *Pattern,
   // host-visible mapping, so writing through `Dst` directly is correct
   // even when Dst is an offset within the alloc.
   if (DstBuf == VK_NULL_HANDLE || DstIsMapped) {
+    waitSubmitted();
     logTrace("CHIPQueueVulkan::memFillAsync host-side fill {} / {} B (pat {})",
              Dst, Size, PatternSize);
     i8TilePattern(Dst, Size, Pattern, PatternSize);
@@ -2899,6 +2903,7 @@ std::shared_ptr<chipstar::Event> CHIPQueueVulkan::memCopy2DAsyncImpl(
       (Kind == hipMemcpyHostToDevice && DstIsMapped) ||
       (Kind == hipMemcpyDeviceToHost && SrcIsMapped) ||
       (Kind == hipMemcpyDeviceToDevice && DstIsMapped && SrcIsMapped)) {
+    waitSubmitted();
     for (size_t Row = 0; Row < Height; ++Row) {
       void *DstRow = static_cast<uint8_t *>(Dst) + Row * DPitch;
       const void *SrcRow = static_cast<const uint8_t *>(Src) + Row * SPitch;
@@ -3067,6 +3072,7 @@ std::shared_ptr<chipstar::Event> CHIPQueueVulkan::memCopy3DAsyncImpl(
       (Kind == hipMemcpyHostToDevice && DstIsMapped) ||
       (Kind == hipMemcpyDeviceToHost && SrcIsMapped) ||
       (Kind == hipMemcpyDeviceToDevice && DstIsMapped && SrcIsMapped)) {
+    waitSubmitted();
     for (size_t S = 0; S < Depth; ++S)
       for (size_t R = 0; R < Height; ++R) {
         void *DstRow =
@@ -3225,6 +3231,7 @@ void CHIPQueueVulkan::memFillAsync2D(void *Dst, size_t Pitch, int Value,
 
   // Host-side fill (mapped or unregistered host pointer).
   if (DstBuf == VK_NULL_HANDLE || DstIsMapped) {
+    waitSubmitted();
     unsigned char Byte = static_cast<unsigned char>(Value);
     for (size_t R = 0; R < Height; ++R) {
       void *Row = static_cast<uint8_t *>(Dst) + R * Pitch;
@@ -3326,6 +3333,7 @@ void CHIPQueueVulkan::memFillAsync3D(hipPitchedPtr PitchedDevPtr, int Value,
                                      DstMappedBase);
 
   if (DstBuf == VK_NULL_HANDLE || DstIsMapped) {
+    waitSubmitted();
     unsigned char Byte = static_cast<unsigned char>(Value);
     for (size_t S = 0; S < Depth; ++S)
       for (size_t R = 0; R < Height; ++R) {

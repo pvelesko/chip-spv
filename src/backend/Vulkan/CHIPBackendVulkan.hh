@@ -854,6 +854,8 @@ public:
   virtual void finish() override;                                     // I6
   /// Print and clear device printf records; aborts on a device-side abort.
   void drainDevicePrintf();
+  /// Block until everything already submitted to this queue has finished.
+  void waitSubmitted();
   bool Draining_ = false;
   virtual bool query() override;                                      // I6
   virtual std::shared_ptr<chipstar::Event> enqueueBarrierImpl(
