@@ -82,7 +82,7 @@ set(NATIVE_VULKAN_NA_SCRIPTS TestFix1677PrintfCallConv.bash
   TestFix1673DynMemCallConv.bash TestFix1680DuplicatePhiPreds.bash
   TestSpirvDuplicatePhiHip.bash TestFix1634ZeroLengthCopy.bash
   TestDeadVTableVirtualBase.bash TestFix582VarInitWorkItems.bash
-  TestPrefetchLowering.bash)
+  TestPrefetchLowering.bash TestFix1723BallotSyncType.bash)
 
 function(add_shell_test SCRIPT)
   if(CHIP_USE_NATIVE_VULKAN_SPIRV AND SCRIPT IN_LIST NATIVE_VULKAN_NA_SCRIPTS)
@@ -270,7 +270,10 @@ add_hipcc_test(TestSwitchCase.hip HIPCC_OPTIONS -O1 -c)
 # already runs the device link that translates to SPIR-V, which is where the
 # unfixed compiler failed. The dispatch is executed by
 # tests/runtime/TestDeviceVirtualDispatch.hip on devices that can run it.
-add_hipcc_test(TestDeviceVirtualFunctions.hip HIPCC_OPTIONS -c)
+# Vulkan compute has no function pointers.
+if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
+  add_hipcc_test(TestDeviceVirtualFunctions.hip HIPCC_OPTIONS -c)
+endif()
 # Dead vtables of an explicit instantiation must not survive into the device
 # module (#1382). Inspects the lowered device bitcode.
 add_shell_test(TestDeadVTableVirtualBase.bash)

@@ -181,7 +181,10 @@ find_program(
   NAMES clang-offload-bundler-${LLVM_VERSION_MAJOR} clang-offload-bundler
   PATHS ${HIP_CLANG_PATH})
 if(SPIRV_DIS AND (NOT USE_NEW_OFFLOAD_DRIVER OR CLANG_OFFLOAD_BUNDLER))
-  add_shell_test(TestBoolKernelParamSPIRV.bash)
+  # Inspects OpenCL-flavored (OpEntryPoint Kernel) SPIR-V.
+  if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
+    add_shell_test(TestBoolKernelParamSPIRV.bash)
+  endif()
 endif()
 
 # The runtime's stderr must stay NUL-free at CHIP_LOGLEVEL=info (the Level
@@ -235,7 +238,10 @@ add_shell_test(TestFix1592ExtractorExitStatus.bash)
 add_shell_test(TestFix1600ExtractorArgvBoundaries.bash)
 
 # --validate and -o must handle a module of any SPIR-V version (#1696).
-add_shell_test(TestFix1696ExtractorSpirvVersion.bash)
+# Validates the extracted module against the OpenCL environment.
+if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
+  add_shell_test(TestFix1696ExtractorSpirvVersion.bash)
+endif()
 
 # The two volatile reproducers above are deliberately not registered as ctests:
 # both PASS on a chipStar built without HipLowerVolatileAccessesPass, so neither
