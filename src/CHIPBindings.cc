@@ -37,6 +37,8 @@
  */
 #ifndef CHIP_BINDINGS_H
 #define CHIP_BINDINGS_H
+#include <cstring>
+#include <unistd.h>
 #include <cstddef> // for size_t
 #include <errno.h>
 #include <fstream>
@@ -6887,11 +6889,27 @@ hipError_t hipGetSymbolAddress(void **DevPtr, const void *Symbol) {
   CHIP_CATCH
 }
 
+// An IPC event handle records the creating process and the event. Sharing
+// an event with another process is not supported; opening a handle in the
+// process that created it is invalid, as in HIP.
+namespace {
+struct IpcEventHandleData {
+  uint64_t Pid;
+  uint64_t Event;
+};
+static_assert(sizeof(IpcEventHandleData) <= HIP_IPC_HANDLE_SIZE);
+} // namespace
+
 hipError_t hipIpcOpenEventHandle(hipEvent_t *Event,
                                  hipIpcEventHandle_t Handle) {
   CHIP_TRY
   LOCK(ApiMtx);
   CHIPInitialize();
+  NULLCHECK(Event);
+  IpcEventHandleData Data;
+  std::memcpy(&Data, Handle.reserved, sizeof(Data));
+  if (Data.Pid == static_cast<uint64_t>(getpid()))
+    RETURN(hipErrorInvalidContext);
   UNIMPLEMENTED(hipErrorNotSupported);
   CHIP_CATCH
 }
@@ -6899,7 +6917,14 @@ hipError_t hipIpcGetEventHandle(hipIpcEventHandle_t *Handle, hipEvent_t Event) {
   CHIP_TRY
   LOCK(ApiMtx);
   CHIPInitialize();
-  UNIMPLEMENTED(hipErrorNotSupported);
+  NULLCHECK(Handle, Event);
+  if (!static_cast<chipstar::Event *>(Event)->getFlags().isInterprocess())
+    RETURN(hipErrorInvalidConfiguration);
+  IpcEventHandleData Data{static_cast<uint64_t>(getpid()),
+                          reinterpret_cast<uint64_t>(Event)};
+  std::memset(Handle->reserved, 0, sizeof(Handle->reserved));
+  std::memcpy(Handle->reserved, &Data, sizeof(Data));
+  RETURN(hipSuccess);
   CHIP_CATCH
 }
 
