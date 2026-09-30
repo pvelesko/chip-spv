@@ -122,7 +122,8 @@ list(REMOVE_ITEM RUNTIME_TEST_SOURCES ${RUNTIME_TESTS_MANUAL})
 # Vulkan compute has no function pointers and no numeric __shared__ addresses.
 if(CHIP_USE_NATIVE_VULKAN_SPIRV)
   list(REMOVE_ITEM RUNTIME_TEST_SOURCES TestIndirectCall.hip
-    TestDeviceVirtualDispatch.hip TestFix1691SharedAddrLocalInit.hip)
+    TestDeviceVirtualDispatch.hip TestFix1691SharedAddrLocalInit.hip
+    TestSubwordAtomics.hip)
 endif()
 list(SORT RUNTIME_TEST_SOURCES)
 # Registered per mode below, not by the glob.
