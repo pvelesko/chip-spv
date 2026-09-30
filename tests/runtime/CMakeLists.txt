@@ -254,7 +254,10 @@ add_shell_test(TestFix1696ExtractorSpirvVersion.bash)
 # otherwise), in whichever of the two forms this build selected. Inspects the
 # lowered device bitcode of TestFixVolatileLoadLowering.hip, and the SPIR-V
 # module when spirv-dis exists.
-add_shell_test(TestFixVolatileLoadLoweringSPIRV.bash)
+# Inspects the OpenCL-path *-lower.bc, absent on the native Vulkan build.
+if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
+  add_shell_test(TestFixVolatileLoadLoweringSPIRV.bash)
+endif()
 
 # The SPIR-V check above proves what chipStar emits; this one proves what the
 # consumer generates from it. IGC discards a cache hint when it widens adjacent

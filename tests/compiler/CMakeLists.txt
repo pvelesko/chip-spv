@@ -75,7 +75,19 @@ function(add_hipcc_test_run MAIN_SOURCE)
 endfunction()
 
 # add_shell_test(<script-file>)
+# These inspect the OpenCL-path *-lower.bc, which the native Vulkan build
+# does not produce.
+set(NATIVE_VULKAN_NA_SCRIPTS TestFix1677PrintfCallConv.bash
+  TestFix1662DynMemUserCallsUser.bash TestFix1670DynMemCallArgs.bash
+  TestFix1673DynMemCallConv.bash TestFix1680DuplicatePhiPreds.bash
+  TestSpirvDuplicatePhiHip.bash TestFix1634ZeroLengthCopy.bash
+  TestDeadVTableVirtualBase.bash TestFix582VarInitWorkItems.bash
+  TestPrefetchLowering.bash)
+
 function(add_shell_test SCRIPT)
+  if(CHIP_USE_NATIVE_VULKAN_SPIRV AND SCRIPT IN_LIST NATIVE_VULKAN_NA_SCRIPTS)
+    return()
+  endif()
   get_filename_component(TEST_NAME ${SCRIPT} NAME_WLE)
   configure_file(${SCRIPT} ${SCRIPT} @ONLY)
   add_test(NAME ${TEST_NAME}
@@ -306,9 +318,13 @@ add_subdirectory(promoteInt)
 add_subdirectory(irVerification)
 
 # Add the 8 and 16 bit atomic lowering pass tests
-add_subdirectory(subwordAtomics)
+if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
+  add_subdirectory(subwordAtomics)
+endif()
 
 # Add the untranslatable math intrinsic (llround / llrint / ldexp) pass tests
-add_subdirectory(mathIntrinsics)
+if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
+  add_subdirectory(mathIntrinsics)
+endif()
 # Add the volatile global access lowering pass tests
 add_subdirectory(volatileAccesses)
