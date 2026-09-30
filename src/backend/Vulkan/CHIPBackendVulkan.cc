@@ -3542,6 +3542,24 @@ CHIPQueueVulkan::launchImpl(chipstar::ExecItem *ExecItem) {
     AllocInfo.descriptorSetCount = 1;
     AllocInfo.pSetLayouts = &DSLayout;
     VkResult R = vkAllocateDescriptorSets(Device, &AllocInfo, &DescSet);
+    if (R == VK_ERROR_OUT_OF_POOL_MEMORY || R == VK_ERROR_FRAGMENTED_POOL) {
+      // Pool exhausted: once this queue's submitted work (the only user of
+      // its pool) has finished, every set can be recycled.
+      uint64_t Target;
+      {
+        std::lock_guard<std::mutex> Lock(QueueOpMtx_);
+        Target = TimelineValue_;
+      }
+      VkSemaphoreWaitInfo WI{};
+      WI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+      WI.semaphoreCount = 1;
+      WI.pSemaphores = &TimelineSemaphore_;
+      WI.pValues = &Target;
+      vkWaitSemaphores(Device, &WI, UINT64_MAX);
+      vkResetDescriptorPool(Device, DescPool, 0);
+      DescSet = VK_NULL_HANDLE;
+      R = vkAllocateDescriptorSets(Device, &AllocInfo, &DescSet);
+    }
     if (R != VK_SUCCESS || DescSet == VK_NULL_HANDLE)
       CHIPERR_LOG_AND_THROW("vkAllocateDescriptorSets failed in launchImpl",
                             hipErrorOutOfMemory);
