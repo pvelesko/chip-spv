@@ -717,6 +717,32 @@ void CHIPModuleVulkan::compile(chipstar::Device *ChipDev) {
 
   createModulePipelineCache(SrcBin);
 
+  // A function without a body is a device symbol nobody defined; the SPIR-V
+  // preprocessing already logged its name.
+  {
+    const auto *W = reinterpret_cast<const uint32_t *>(SrcBin.data());
+    size_t N = SizeBytes / sizeof(uint32_t);
+    bool InFn = false, HasBody = false;
+    for (size_t I = 5; I < N;) {
+      uint32_t Op = W[I] & 0xffff, Wc = W[I] >> 16;
+      if (Wc == 0)
+        break;
+      if (Op == 54 /*OpFunction*/) {
+        InFn = true;
+        HasBody = false;
+      } else if (Op == 248 /*OpLabel*/) {
+        HasBody = true;
+      } else if (Op == 56 /*OpFunctionEnd*/ && InFn) {
+        if (!HasBody)
+          CHIPERR_LOG_AND_THROW("CHIPModuleVulkan::compile: module calls "
+                                "undefined device functions",
+                                hipErrorSharedObjectInitFailed);
+        InFn = false;
+      }
+      I += Wc;
+    }
+  }
+
   // 2. Create the single VkShaderModule for this SPV. One shader module per
   //    SPVModule; every entry point in the SPV is reachable via its
   //    OpEntryPoint name when a VkPipeline is constructed below.
