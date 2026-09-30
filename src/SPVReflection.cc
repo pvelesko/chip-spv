@@ -514,6 +514,23 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
                    It->second.Name, Ord);
           break;
         }
+        case 5: { // ArgumentPodStorageBuffer(kernel, ord, set, binding,
+                  //                          offset, size)
+          if (Wc < 11)
+            break;
+          auto It = Kernels.find(Words[5]);
+          if (It == Kernels.end())
+            break;
+          SPVArgTypeInfo Ti;
+          Ti.Kind = SPVTypeKind::POD;
+          Ti.StorageClass = SPVStorageClass::Private;
+          Ti.Binding = static_cast<int>(Consts[Words[8]]);
+          Ti.PushConstOffset = static_cast<int>(Consts[Words[9]]);
+          Ti.Size = static_cast<size_t>(Consts[Words[10]]);
+          It->second.Args.emplace_back(
+              static_cast<uint32_t>(Consts[Words[6]]), Ti);
+          break;
+        }
         case 7: { // ArgumentPodPushConstant(kernel, ord, offset, size)
           if (Wc < 9)
             break;

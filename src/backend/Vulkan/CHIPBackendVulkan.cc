@@ -818,6 +818,11 @@ void CHIPModuleVulkan::compile(chipstar::Device *ChipDev) {
                         ? static_cast<uint32_t>(A.PushConstOffset)
                         : PCRunningOffset;
         Pc.Size = static_cast<uint32_t>(A.Size);
+        if (A.Binding >= 0) {
+          Refl.PodBufferBinding = A.Binding;
+          Refl.MaxDescriptorBinding =
+              std::max<uint32_t>(Refl.MaxDescriptorBinding, A.Binding);
+        }
         PCRunningOffset += Pc.Size;
         if (Pc.Offset + Pc.Size > MaxPCEnd)
           MaxPCEnd = Pc.Offset + Pc.Size;
@@ -848,7 +853,7 @@ void CHIPModuleVulkan::compile(chipstar::Device *ChipDev) {
     // grows a UBO-spill path for >maxPushConstantsSize PC blocks, mark the
     // kernel as unlaunchable so launchImpl can refuse the dispatch with a
     // clean hipErrorNotSupported instead of crashing the process.
-    if (ChipDevice_ != nullptr) {
+    if (ChipDevice_ != nullptr && Refl.PodBufferBinding < 0) {
       const auto &Limits = ChipDevice_->getProperties().limits;
       if (Refl.PushConstantBlockSize > Limits.maxPushConstantsSize) {
         logError("CHIPModuleVulkan::compile: kernel '{}' push-constant block "
@@ -971,6 +976,14 @@ buildDescriptorSetLayout(VkDevice Dev, const VulkanKernelReflection &Refl) {
     LB.pImmutableSamplers = nullptr;
     Bindings.push_back(LB);
   }
+  if (Refl.PodBufferBinding >= 0) {
+    VkDescriptorSetLayoutBinding LB{};
+    LB.binding = static_cast<uint32_t>(Refl.PodBufferBinding);
+    LB.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    LB.descriptorCount = 1;
+    LB.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    Bindings.push_back(LB);
+  }
   VkDescriptorSetLayoutCreateInfo Ci{};
   Ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
   Ci.bindingCount = static_cast<uint32_t>(Bindings.size());
@@ -1066,10 +1079,7 @@ CHIPModuleVulkan::getOrCreatePipelineLayout(const std::string &KernelName) {
     DSLayouts_[KernelName] = DSL;
 
   VkPipelineLayout Layout =
-      buildPipelineLayout(Dev, DSL,
-                          Refl->OversizedPushConstants
-                              ? 0u
-                              : Refl->PushConstantBlockSize);
+      buildPipelineLayout(Dev, DSL, Refl->pushConstantRangeSize());
   PipelineLayouts_[KernelName] = Layout;
   return Layout;
 }
@@ -1110,10 +1120,7 @@ VkPipeline CHIPModuleVulkan::getOrCreatePipeline(const std::string &KernelName,
   auto PLIt = PipelineLayouts_.find(KernelName);
   VkPipelineLayout PLayout =
       (PLIt == PipelineLayouts_.end())
-          ? buildPipelineLayout(Dev, DSL,
-                                Refl->OversizedPushConstants
-                                    ? 0u
-                                    : Refl->PushConstantBlockSize)
+          ? buildPipelineLayout(Dev, DSL, Refl->pushConstantRangeSize())
           : PLIt->second;
   if (PLIt == PipelineLayouts_.end())
     PipelineLayouts_[KernelName] = PLayout;
@@ -1636,6 +1643,13 @@ CHIPContextVulkan::getDevPtrEntryContaining(const void *DevPtr,
     }
   }
   return nullptr;
+}
+
+void *CHIPContextVulkan::getPodArgBuffer() {
+  std::call_once(PodArgOnce_, [this]() {
+    PodArgBuffer_ = allocateImpl(PodArgBufferSize, 256, hipMemoryTypeDevice);
+  });
+  return PodArgBuffer_;
 }
 
 void *CHIPContextVulkan::getNullArgPlaceholder() {
@@ -3723,7 +3737,7 @@ CHIPQueueVulkan::launchImpl(chipstar::ExecItem *ExecItem) {
 
   std::vector<VkDescriptorBufferInfo> BufInfos;
   std::vector<VkWriteDescriptorSet> Writes;
-  BufInfos.reserve(Bindings.size());
+  BufInfos.reserve(Bindings.size() + 1); // + the POD argument buffer
   Writes.reserve(Bindings.size());
   for (uint32_t I = 0; I < Bindings.size(); ++I) {
     VkBuffer Buf = Bindings[I];
@@ -3743,6 +3757,28 @@ CHIPQueueVulkan::launchImpl(chipstar::ExecItem *ExecItem) {
     W.dstSet = DescSet;
     W.dstBinding = I;
     W.dstArrayElement = 0;
+    W.descriptorCount = 1;
+    W.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    W.pBufferInfo = &BI;
+  }
+  const auto &PCBlob = VkExecItem->getPushConstantBlob();
+  VkBuffer PodBuf = VK_NULL_HANDLE;
+  if (Refl->PodBufferBinding >= 0) {
+    auto *Ctx = static_cast<CHIPContextVulkan *>(ChipDevice_->getContext());
+    if (const auto *E = Ctx->getDevPtrEntry(Ctx->getPodArgBuffer()))
+      PodBuf = E->Buffer;
+    if (PodBuf == VK_NULL_HANDLE ||
+        PCBlob.size() > CHIPContextVulkan::PodArgBufferSize)
+      CHIPERR_LOG_AND_THROW("CHIPQueueVulkan::launchImpl: kernel arguments "
+                            "exceed the POD argument buffer",
+                            hipErrorLaunchFailure);
+    VkDescriptorBufferInfo &BI = BufInfos.emplace_back();
+    BI = {PodBuf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet &W = Writes.emplace_back();
+    W = {};
+    W.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    W.dstSet = DescSet;
+    W.dstBinding = static_cast<uint32_t>(Refl->PodBufferBinding);
     W.descriptorCount = 1;
     W.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     W.pBufferInfo = &BI;
@@ -3770,8 +3806,23 @@ CHIPQueueVulkan::launchImpl(chipstar::ExecItem *ExecItem) {
                           /*firstSet=*/0, 1, &DescSet,
                           /*dynamicOffsetCount=*/0, nullptr);
 
-  const auto &PCBlob = VkExecItem->getPushConstantBlob();
-  if (Refl->PushConstantBlockSize > 0 && !PCBlob.empty()) {
+  if (PodBuf != VK_NULL_HANDLE && !PCBlob.empty()) {
+    // All queues share one VkQueue, so the barriers order this update after
+    // every earlier dispatch reading the buffer and before this one.
+    VkMemoryBarrier MB{};
+    MB.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    MB.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    MB.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(Cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &MB, 0, nullptr,
+                         0, nullptr);
+    vkCmdUpdateBuffer(Cmd, PodBuf, 0, PCBlob.size(), PCBlob.data());
+    MB.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    MB.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(Cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &MB, 0,
+                         nullptr, 0, nullptr);
+  } else if (Refl->PushConstantBlockSize > 0 && !PCBlob.empty()) {
     // We honor the reflection's size - the blob may be larger if the I4
     // packer rounds up; the kernel only reads up to PushConstantBlockSize.
     const uint32_t PCSize =

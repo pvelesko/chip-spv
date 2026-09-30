@@ -239,6 +239,14 @@ struct VulkanKernelReflection {
   /// driver via an oversized vkCmdPushConstants. Lowering >max PC blocks to
   /// a UBO is a future bridging-pass feature.
   bool OversizedPushConstants = false;
+  /// Binding of the storage buffer the POD arguments are read from instead of
+  /// push constants, or -1.
+  int32_t PodBufferBinding = -1;
+  uint32_t pushConstantRangeSize() const {
+    return OversizedPushConstants || PodBufferBinding >= 0
+               ? 0
+               : PushConstantBlockSize;
+  }
 };
 
 // ============================================================================
@@ -558,10 +566,16 @@ class CHIPContextVulkan : public chipstar::Context {
 public:
   /// Device buffer bound for null pointer kernel arguments.
   void *getNullArgPlaceholder();
+  /// Device buffer holding the POD arguments of a launch whose arguments are
+  /// too large to push; each launch rewrites it in its command buffer.
+  void *getPodArgBuffer();
+  static constexpr size_t PodArgBufferSize = 65536; // vkCmdUpdateBuffer max
 
 private:
   std::once_flag NullArgOnce_;
   void *NullArgPlaceholder_ = nullptr;
+  std::once_flag PodArgOnce_;
+  void *PodArgBuffer_ = nullptr;
 
 public:
   void importHostMemory(void *HostPtr, size_t SizeBytes) override {}
