@@ -680,6 +680,9 @@ class CHIPDeviceVulkan : public chipstar::Device {
                    int Idx);
 
 public:
+  /// Device printf buffers of every compiled module.
+  std::vector<chipstar::DeviceVar *> getDevicePrintfBuffers();
+
   virtual ~CHIPDeviceVulkan() override;
 
   static CHIPDeviceVulkan *create(CHIPContextVulkan *ChipContext,
@@ -848,6 +851,9 @@ public:
   virtual std::shared_ptr<chipstar::Event>
   launchImpl(chipstar::ExecItem *ExecItem) override;                  // I7
   virtual void finish() override;                                     // I6
+  /// Print and clear device printf records; aborts on a device-side abort.
+  void drainDevicePrintf();
+  bool Draining_ = false;
   virtual bool query() override;                                      // I6
   virtual std::shared_ptr<chipstar::Event> enqueueBarrierImpl(
       const std::vector<std::shared_ptr<chipstar::Event>> &EventsToWaitFor)

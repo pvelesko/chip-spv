@@ -1543,6 +1543,12 @@ public:
 
   /// Return the number of currently compiled modules on this device.
   size_t getNumCompiledModules() const { return SrcModToCompiledMod_.size(); }
+  std::vector<chipstar::Module *> getCompiledModules() const {
+    std::vector<chipstar::Module *> Mods;
+    for (auto &Kv : SrcModToCompiledMod_)
+      Mods.push_back(Kv.second);
+    return Mods;
+  }
 
   /**
    * @brief Get the Kernels object

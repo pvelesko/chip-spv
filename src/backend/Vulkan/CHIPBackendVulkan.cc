@@ -3663,6 +3663,142 @@ CHIPQueueVulkan::launchImpl(chipstar::ExecItem *ExecItem) {
 // ===== I6 continues below
 // ============================================================================
 
+std::vector<chipstar::DeviceVar *> CHIPDeviceVulkan::getDevicePrintfBuffers() {
+  std::vector<chipstar::DeviceVar *> Out;
+  for (auto *Mod : getCompiledModules())
+    for (auto *V : Mod->getDeviceVariables())
+      if (V->getName() == "__hipspv_printf_buf" && V->getDevAddr())
+        Out.push_back(V);
+  return Out;
+}
+
+// Format one record written by HIPSPVLowerToHLSLShape's device printf:
+// [nwords, fmt_bytes | stderr<<31, fmt words, {tag, lo, hi}...].
+static void printDevicePrintfRecord(const uint32_t *W, uint32_t NW) {
+  uint32_t FmtBytes = W[1] & 0x7fffffffu;
+  size_t FmtWords = (FmtBytes + 3) / 4;
+  if (2 + FmtWords > NW)
+    return;
+  std::string Fmt(reinterpret_cast<const char *>(&W[2]), FmtBytes);
+  struct Arg {
+    uint32_t Tag;
+    uint64_t V;
+    std::string S;
+  };
+  std::vector<Arg> Args;
+  for (size_t I = 2 + FmtWords; I + 3 <= NW;) {
+    Arg A{W[I], W[I + 1] | (uint64_t(W[I + 2]) << 32), {}};
+    I += 3;
+    if (A.Tag == 4) {
+      size_t Bytes = A.V & 0xffffffffu, Words = (Bytes + 3) / 4;
+      if (I + Words > NW)
+        break;
+      A.S.assign(reinterpret_cast<const char *>(&W[I]), Bytes);
+      I += Words;
+    }
+    Args.push_back(std::move(A));
+  }
+  std::string Out;
+  size_t AI = 0;
+  for (size_t P = 0; P < Fmt.size();) {
+    if (Fmt[P] != '%') {
+      Out += Fmt[P++];
+      continue;
+    }
+    size_t Q = P + 1;
+    if (Q < Fmt.size() && Fmt[Q] == '%') {
+      Out += '%';
+      P = Q + 1;
+      continue;
+    }
+    while (Q < Fmt.size() && strchr("-+ #0123456789.", Fmt[Q]))
+      ++Q;
+    std::string Spec = Fmt.substr(P, Q - P);
+    while (Q < Fmt.size() && strchr("hlLqjzt", Fmt[Q]))
+      ++Q;
+    if (Q >= Fmt.size())
+      break;
+    char Conv = Fmt[Q];
+    P = Q + 1;
+    if (AI >= Args.size())
+      continue;
+    const Arg &A = Args[AI++];
+    char Buf[512] = {0};
+    uint64_t U = A.Tag == 1 ? uint64_t(uint32_t(A.V)) : A.V;
+    double D;
+    std::memcpy(&D, &A.V, sizeof(D));
+    switch (Conv) {
+    case 'd':
+    case 'i':
+      snprintf(Buf, sizeof(Buf), (Spec + "lld").c_str(), (long long)A.V);
+      break;
+    case 'u':
+    case 'x':
+    case 'X':
+    case 'o':
+      snprintf(Buf, sizeof(Buf), (Spec + "ll" + Conv).c_str(),
+               (unsigned long long)U);
+      break;
+    case 'c':
+      snprintf(Buf, sizeof(Buf), (Spec + "c").c_str(), (int)A.V);
+      break;
+    case 's':
+      snprintf(Buf, sizeof(Buf), (Spec + "s").c_str(), A.S.c_str());
+      break;
+    case 'p':
+      snprintf(Buf, sizeof(Buf), "0x%llx", (unsigned long long)A.V);
+      break;
+    default:
+      snprintf(Buf, sizeof(Buf), (Spec + Conv).c_str(), D);
+      break;
+    }
+    Out += Buf;
+  }
+  fputs(Out.c_str(), (W[1] >> 31) ? stderr : stdout);
+}
+
+void CHIPQueueVulkan::drainDevicePrintf() {
+  if (Draining_)
+    return;
+  Draining_ = true;
+  bool Abort = false;
+  auto *Dev = static_cast<CHIPDeviceVulkan *>(ChipDevice_);
+  for (auto *V : Dev->getDevicePrintfBuffers()) {
+    uint32_t Hdr[2] = {0, 0};
+    memCopyAsyncImpl(Hdr, V->getDevAddr(), sizeof(Hdr),
+                     hipMemcpyDeviceToHost);
+    if (!Hdr[0] && !Hdr[1])
+      continue;
+    size_t Cap = V->getSize() / sizeof(uint32_t) - 3;
+    size_t Used = std::min<size_t>(Hdr[0], Cap);
+    std::vector<uint32_t> Data(Used);
+    if (Used)
+      memCopyAsyncImpl(Data.data(),
+                       static_cast<char *>(V->getDevAddr()) + sizeof(Hdr),
+                       Used * sizeof(uint32_t), hipMemcpyDeviceToHost);
+    for (size_t I = 0; I < Used;) {
+      uint32_t NW = Data[I];
+      if (NW < 2 || I + NW > Used)
+        break;
+      printDevicePrintfRecord(&Data[I], NW);
+      I += NW;
+    }
+    Abort |= Hdr[1] != 0;
+    static const uint32_t Zero[2] = {0, 0};
+    auto Ev = memCopyAsyncImpl(V->getDevAddr(), Zero, sizeof(Zero),
+                               hipMemcpyHostToDevice);
+    if (auto *EvVk = static_cast<CHIPEventVulkan *>(Ev.get()))
+      if (VkFence F = EvVk->getFence())
+        vkWaitForFences(ChipDevice_->getLogicalDevice(), 1, &F, VK_TRUE,
+                        UINT64_MAX);
+  }
+  fflush(stdout);
+  fflush(stderr);
+  Draining_ = false;
+  if (Abort && !getenv("CHIP_HOST_IGNORES_DEVICE_ABORT"))
+    abort();
+}
+
 void CHIPQueueVulkan::finish() {
   VkQueue Q = ChipDevice_->getComputeQueue();
   if (Q != VK_NULL_HANDLE) {
@@ -3671,6 +3807,7 @@ void CHIPQueueVulkan::finish() {
     checkVk(vkQueueWaitIdle(Q),
             "CHIPQueueVulkan::finish: vkQueueWaitIdle failed", hipErrorTbd);
   }
+  drainDevicePrintf();
 
   // Drain any pending stream callbacks on this queue. hipStreamSynchronize's
   // contract is that all queued work (including callbacks) has completed
@@ -3890,7 +4027,9 @@ std::shared_ptr<chipstar::Event> CHIPQueueVulkan::submitWithEvent(
   }
   // Legacy default stream semantics: the default stream waits for every
   // blocking stream, and a blocking stream waits for the default stream.
-  if (getQueueFlags().isBlocking()) {
+  // Draining runs inside finish(), whose callers may hold
+  // QueueAddRemoveMtx; its copies need no cross-stream ordering.
+  if (getQueueFlags().isBlocking() && !Draining_) {
     std::lock_guard<std::mutex> QLock(ChipDevice_->QueueAddRemoveMtx);
     std::vector<chipstar::Queue *> Others;
     if (isDefaultLegacyQueue()) {
