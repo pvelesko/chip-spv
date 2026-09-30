@@ -83,6 +83,8 @@ struct SPVArgTypeInfo {
   int KernelArgIndex = -1;
   /// Byte offset of a push-constant POD argument, from Vulkan reflection.
   int PushConstOffset = -1;
+  /// Descriptor binding of a storage-buffer argument, from Vulkan reflection.
+  int Binding = -1;
 
   bool isWorkgroupPtr() const {
     return Kind == SPVTypeKind::Pointer &&

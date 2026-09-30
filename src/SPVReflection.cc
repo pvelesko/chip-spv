@@ -467,6 +467,7 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
           Ti.Kind = SPVTypeKind::Pointer;
           Ti.StorageClass = SPVStorageClass::CrossWorkgroup;
           Ti.Size = 8; // pointer size
+          Ti.Binding = static_cast<int>(ArgBinding);
           // Phase H4: if this descriptor is a hidden device-global arg,
           // record (kernel, ord, symbol) so the launch path can bind the
           // chipStar-allocated cl_mem, and mark its kind so visitClientArgs
@@ -612,13 +613,51 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
     // extra PCs across all kernels in the program. We bind only the
     // first NumHipPtrs SBs (in clspv ord order) to the HIP pointer
     // args and only the first NumHipPods PCs to the HIP POD args.
+    // No reflected PODs at all but HIP has non-pointer args: they were all
+    // unused (e.g. empty functors) and the backend dropped them.
+    bool AllPodsDropped = PodArgsOcl.empty() && NumHipPods > 0;
+    // Unused pointer args are dropped too; the pass numbers bindings in HIP
+    // pointer order, so the survivors can still be placed by binding.
+    bool PtrsByBinding = NumHipPtrs > (long)PointerArgsOcl.size() &&
+                         std::all_of(PointerArgsOcl.begin(),
+                                     PointerArgsOcl.end(), [&](size_t I) {
+                                       int B = Rec.Args[I].second.Binding;
+                                       return B >= 0 && B < NumHipPtrs;
+                                     });
     bool RemapOk = !IsPtrPerHipArg.empty() &&
-                   NumHipPtrs <= (long)PointerArgsOcl.size() &&
-                   NumHipPods <= (long)PodArgsOcl.size();
+                   (NumHipPtrs <= (long)PointerArgsOcl.size() ||
+                    PtrsByBinding) &&
+                   (NumHipPods <= (long)PodArgsOcl.size() || AllPodsDropped);
 
     if (RemapOk) {
       size_t NextPtr = 0, NextPod = 0;
       for (bool IsPtr : IsPtrPerHipArg) {
+        if (IsPtr && PtrsByBinding) {
+          int Want = (int)NextPtr++;
+          auto Hit = std::find_if(
+              PointerArgsOcl.begin(), PointerArgsOcl.end(),
+              [&](size_t I) { return Rec.Args[I].second.Binding == Want; });
+          if (Hit == PointerArgsOcl.end()) {
+            SPVArgTypeInfo Ti{};
+            Ti.Kind = SPVTypeKind::POD;
+            Ti.StorageClass = SPVStorageClass::Private;
+            Ti.Size = 0;
+            ArgInfos.push_back(Ti);
+          } else {
+            SPVArgTypeInfo Ti = Rec.Args[*Hit].second;
+            Ti.KernelArgIndex = (int)Rec.Args[*Hit].first;
+            ArgInfos.push_back(Ti);
+          }
+          continue;
+        }
+        if (!IsPtr && AllPodsDropped) {
+          SPVArgTypeInfo Ti{};
+          Ti.Kind = SPVTypeKind::POD;
+          Ti.StorageClass = SPVStorageClass::Private;
+          Ti.Size = 0;
+          ArgInfos.push_back(Ti);
+          continue;
+        }
         size_t OclIdx;
         if (IsPtr)
           OclIdx = PointerArgsOcl[NextPtr++];
@@ -641,7 +680,8 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
         Ti.KernelArgIndex = (int)Rec.Args[Idx].first;
         ArgInfos.push_back(Ti);
       }
-      for (size_t I = NextPtr; I < PointerArgsOcl.size(); ++I) {
+      for (size_t I = PtrsByBinding ? PointerArgsOcl.size() : NextPtr;
+           I < PointerArgsOcl.size(); ++I) {
         SPVArgTypeInfo Ti = Rec.Args[PointerArgsOcl[I]].second;
         Ti.Kind = SPVTypeKind::DeviceGlobalHidden;
         Ti.KernelArgIndex = (int)Rec.Args[PointerArgsOcl[I]].first;

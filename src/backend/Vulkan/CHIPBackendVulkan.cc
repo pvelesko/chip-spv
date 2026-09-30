@@ -688,7 +688,9 @@ void CHIPModuleVulkan::compile(chipstar::Device *ChipDev) {
         VulkanStorageBufferArg Buf;
         Buf.Ordinal = Ord;
         Buf.Set = 0;
-        Buf.Binding = NextBinding++;
+        Buf.Binding = A.Binding >= 0 ? static_cast<uint32_t>(A.Binding)
+                                     : NextBinding;
+        NextBinding = std::max(NextBinding, Buf.Binding + 1);
         Buf.HipSourceIndex = HipSrcIdx++;
         Refl.Buffers.push_back(Buf);
         if (Buf.Binding > Refl.MaxDescriptorBinding)
@@ -699,7 +701,9 @@ void CHIPModuleVulkan::compile(chipstar::Device *ChipDev) {
         VulkanStorageBufferArg Buf;
         Buf.Ordinal = Ord;
         Buf.Set = 0;
-        Buf.Binding = NextBinding++;
+        Buf.Binding = A.Binding >= 0 ? static_cast<uint32_t>(A.Binding)
+                                     : NextBinding;
+        NextBinding = std::max(NextBinding, Buf.Binding + 1);
         Buf.HipSourceIndex = -1; // Bound from per-symbol DG table, not Args_.
         Refl.Buffers.push_back(Buf);
         if (Buf.Binding > Refl.MaxDescriptorBinding)
