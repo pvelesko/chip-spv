@@ -163,8 +163,9 @@ if(OpenCL_LIBRARY) # Depends on OpenCL
   add_hip_runtime_test(TestBufferDevAddr.hip)
 endif()
 # String literals are initialized program-scope globals, which rusticl/Mesa
-# rejects ("Initializer for CrossWorkgroup variable not yet supported").
-if(CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS)
+# rejects ("Initializer for CrossWorkgroup variable not yet supported"), and
+# native Vulkan has no numeric addresses for constant data.
+if(CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS AND NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
   add_hip_runtime_test(TestFix1693StringTableOffset.hip)
   add_hip_runtime_test(TestFix1703ByteOffsetTable.hip)
 endif()
