@@ -3838,25 +3838,54 @@ std::shared_ptr<chipstar::Event> CHIPQueueVulkan::submitWithEvent(
   // submit AVAILABLE+VISIBLE to commands in this submit (semaphore
   // signal/wait pairs satisfy Vulkan's memory dependency rules without
   // requiring an explicit vkCmdPipelineBarrier across cmd-buffer boundaries).
-  const VkPipelineStageFlags WaitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  std::vector<VkSemaphore> WaitSems;
+  std::vector<uint64_t> WaitVals;
+  if (WaitTimelineVal > 0) {
+    WaitSems.push_back(TimelineSemaphore_);
+    WaitVals.push_back(WaitTimelineVal);
+  }
+  // Legacy default stream semantics: the default stream waits for every
+  // blocking stream, and a blocking stream waits for the default stream.
+  if (getQueueFlags().isBlocking()) {
+    std::lock_guard<std::mutex> QLock(ChipDevice_->QueueAddRemoveMtx);
+    std::vector<chipstar::Queue *> Others;
+    if (isDefaultLegacyQueue()) {
+      for (auto *Q : ChipDevice_->getQueuesNoLock())
+        if (Q != this && Q->getQueueFlags().isBlocking())
+          Others.push_back(Q);
+    } else if (auto *Def = ChipDevice_->getLegacyDefaultQueue()) {
+      if (Def != this)
+        Others.push_back(Def);
+    }
+    for (auto *Q : Others) {
+      auto *QV = static_cast<CHIPQueueVulkan *>(Q);
+      uint64_t V;
+      {
+        std::lock_guard<std::mutex> Lock(QV->QueueOpMtx_);
+        V = QV->TimelineValue_;
+      }
+      if (V > 0 && QV->TimelineSemaphore_ != VK_NULL_HANDLE) {
+        WaitSems.push_back(QV->TimelineSemaphore_);
+        WaitVals.push_back(V);
+      }
+    }
+  }
+  std::vector<VkPipelineStageFlags> WaitStages(
+      WaitSems.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
 
   VkTimelineSemaphoreSubmitInfo TsSubmit{};
   TsSubmit.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
-  if (WaitTimelineVal > 0) {
-    TsSubmit.waitSemaphoreValueCount = 1;
-    TsSubmit.pWaitSemaphoreValues = &WaitTimelineVal;
-  }
+  TsSubmit.waitSemaphoreValueCount = static_cast<uint32_t>(WaitVals.size());
+  TsSubmit.pWaitSemaphoreValues = WaitVals.data();
   TsSubmit.signalSemaphoreValueCount = 1;
   TsSubmit.pSignalSemaphoreValues = &SignalTimelineVal;
 
   VkSubmitInfo Submit{};
   Submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   Submit.pNext = &TsSubmit;
-  if (WaitTimelineVal > 0) {
-    Submit.waitSemaphoreCount = 1;
-    Submit.pWaitSemaphores = &TimelineSemaphore_;
-    Submit.pWaitDstStageMask = &WaitStage;
-  }
+  Submit.waitSemaphoreCount = static_cast<uint32_t>(WaitSems.size());
+  Submit.pWaitSemaphores = WaitSems.data();
+  Submit.pWaitDstStageMask = WaitStages.data();
   Submit.commandBufferCount = (Buf != VK_NULL_HANDLE) ? 1u : 0u;
   Submit.pCommandBuffers = (Buf != VK_NULL_HANDLE) ? &Buf : nullptr;
   Submit.signalSemaphoreCount = 1;
