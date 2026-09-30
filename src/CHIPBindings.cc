@@ -847,23 +847,43 @@ hipError_t hipPointerGetAttribute(void *data, hipPointer_attribute attribute,
     *static_cast<unsigned int *>(data) =
         static_cast<unsigned int>(AllocInfo->MemoryType);
     RETURN(hipSuccess);
-  case HIP_POINTER_ATTRIBUTE_DEVICE_POINTER:
+  case HIP_POINTER_ATTRIBUTE_DEVICE_POINTER: {
     if (AllocInfo->MemoryType == hipMemoryTypeHost &&
         !AllocInfo->Flags.isMapped())
       RETURN(hipErrorInvalidValue);
-    *static_cast<void **>(data) = AllocInfo->DevPtr;
+    // Preserve the caller's offset into the allocation. The HIP API returns
+    // the unified-address pointer corresponding to `ptr`, not the base of
+    // the containing allocation.
+    auto Offset = static_cast<uintptr_t>(
+        reinterpret_cast<char *>(ptr) -
+        reinterpret_cast<char *>(AllocInfo->DevPtr));
+    *static_cast<void **>(data) =
+        static_cast<char *>(AllocInfo->DevPtr) + Offset;
     RETURN(hipSuccess);
-  case HIP_POINTER_ATTRIBUTE_HOST_POINTER:
+  }
+  case HIP_POINTER_ATTRIBUTE_HOST_POINTER: {
     if (!AllocInfo->HostPtr || AllocInfo->MemoryType == hipMemoryTypeDevice)
       RETURN(hipErrorInvalidValue);
-    *static_cast<void **>(data) = AllocInfo->HostPtr;
+    // For UVA/mapped allocations HostPtr == DevPtr, so the input pointer
+    // is already a host pointer at the same offset. Preserve the offset.
+    auto Base = AllocInfo->HostPtr ? AllocInfo->HostPtr : AllocInfo->DevPtr;
+    uintptr_t OffsetFromKnown =
+        static_cast<uintptr_t>(reinterpret_cast<char *>(ptr) -
+                               reinterpret_cast<char *>(AllocInfo->DevPtr));
+    *static_cast<void **>(data) = static_cast<char *>(Base) + OffsetFromKnown;
     RETURN(hipSuccess);
+  }
   case HIP_POINTER_ATTRIBUTE_BUFFER_ID:
     *static_cast<uint64_t *>(data) = AllocInfo->BufferId;
     RETURN(hipSuccess);
   case HIP_POINTER_ATTRIBUTE_IS_MANAGED:
+    // hipMallocManaged allocates with hipMemoryTypeUnified; treat both
+    // Managed and Unified as "managed" for the attribute query.
     *static_cast<unsigned int *>(data) =
-        (AllocInfo->MemoryType == hipMemoryTypeManaged) ? 1u : 0u;
+        (AllocInfo->MemoryType == hipMemoryTypeManaged ||
+         AllocInfo->MemoryType == hipMemoryTypeUnified)
+            ? 1u
+            : 0u;
     RETURN(hipSuccess);
   case HIP_POINTER_ATTRIBUTE_DEVICE_ORDINAL:
     *static_cast<int *>(data) = AllocInfo->Device;

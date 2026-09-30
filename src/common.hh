@@ -87,6 +87,7 @@ struct SPVModuleInfo {
   /// bind the chipStar-allocated cl_mem of `<symbol>` at the recorded ord.
   std::map<std::string, std::vector<SPVKernelDeviceGlobalArg>>
       HiddenDGArgsByKernel;
+
   /// Phase Z3 (Vulkan BDA): kernel-name -> ordered list of byte offsets
   /// within the kernel's push-constant block where an 8-byte Buffer Device
   /// Address slot lives. The bridging pass (rewriteKernelSignatureBDA) emits

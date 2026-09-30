@@ -922,6 +922,7 @@ public:
   /// skips its Vulkan calls.
   static std::atomic<bool> ShuttingDown_;
   static std::recursive_mutex TeardownMtx_;
+
   // chipstar::Backend pure virtuals.
   virtual chipstar::ExecItem *createExecItem(dim3 GridDim, dim3 BlockDim,
                                              size_t SharedMem,

@@ -1050,7 +1050,9 @@ VkPipeline CHIPModuleVulkan::getOrCreatePipeline(const std::string &KernelName,
       Dev, ChipDevice_->getPipelineCache(),
       /*createInfoCount=*/1, &Ci, /*pAlloc=*/nullptr, &Pipeline);
   if (R != VK_SUCCESS || Pipeline == VK_NULL_HANDLE)
-    CHIPERR_LOG_AND_THROW("vkCreateComputePipelines failed",
+    CHIPERR_LOG_AND_THROW("vkCreateComputePipelines failed (VkResult=" +
+                              std::to_string(static_cast<int>(R)) +
+                              " kernel=" + KernelName + ")",
                           hipErrorInitializationError);
   Pipelines_[CacheKey] = Pipeline;
   return Pipeline;
@@ -1139,13 +1141,31 @@ void CHIPExecItemVulkan::setupAllArgs() {
   for (const auto &Buf : Refl->Buffers) {
     auto HDGIt = HiddenDGByOrd.find(Buf.Ordinal);
     if (HDGIt != HiddenDGByOrd.end()) {
-      // Hidden device-global descriptor. Look up by symbol on the module.
-      const auto *DGE = Mod->getDeviceGlobal(HDGIt->second);
+      // Hidden device-global descriptor. The chipstar layer also allocates
+      // a buffer for this symbol via prepareDeviceVariables /
+      // allocateDeviceVariablesNoLock and registers it in DevPtrToEntry_ —
+      // that's the buffer hipMemcpyToSymbol writes to. Prefer it so the
+      // kernel sees writes made via hipMemcpyToSymbol; fall back to the
+      // compile()-time DeviceGlobals_ buffer (seeded from InitData) when
+      // the chipstar buffer hasn't been allocated yet.
+      const std::string &Sym = HDGIt->second;
+      void *DevPtr = nullptr;
+      if (chipstar::DeviceVar *Var = Mod->getGlobalVar(Sym.c_str()))
+        DevPtr = Var->getDevAddr();
+      if (DevPtr != nullptr) {
+        const auto *Entry = Ctx->getDevPtrEntry(DevPtr);
+        if (Entry != nullptr) {
+          BufferBindings_[Buf.Binding] = Entry->Buffer;
+          BufferRanges_[Buf.Binding] = Entry->Size;
+          BufferOffsets_[Buf.Binding] = 0;
+          continue;
+        }
+      }
+      const auto *DGE = Mod->getDeviceGlobal(Sym);
       if (DGE == nullptr) {
         std::string Msg =
             "ExecItem::setupAllArgs: kernel references __device__ symbol '" +
-            HDGIt->second +
-            "' that wasn't allocated at module compile time";
+            Sym + "' that wasn't allocated at module compile time";
         CHIPERR_LOG_AND_THROW(Msg, hipErrorInvalidDevicePointer);
       }
       BufferBindings_[Buf.Binding] = DGE->Buffer;
@@ -1635,6 +1655,7 @@ CHIPDeviceVulkan *CHIPDeviceVulkan::create(CHIPContextVulkan *ChipContext,
   Enable12.bufferDeviceAddress =
       Dev->HasBufferDeviceAddress_ ? VK_TRUE : VK_FALSE;
   Enable12.bufferDeviceAddressCaptureReplay = VK_FALSE;
+
   // Phase Z3: also opt into VK_KHR_maintenance4 (core in Vulkan 1.3). The
   // bridging pass + inject_reflection.py emit `OpExecutionModeId LocalSizeId`
   // with spec-constant workgroup dimensions — this requires the maintenance4
@@ -1643,6 +1664,16 @@ CHIPDeviceVulkan *CHIPDeviceVulkan::create(CHIPContextVulkan *ChipContext,
   VkPhysicalDeviceMaintenance4FeaturesKHR EnableM4{};
   EnableM4.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES_KHR;
   EnableM4.maintenance4 = VK_TRUE;
+
+  VkPhysicalDeviceShaderAtomicInt64Features EnableAI64{};
+  EnableAI64.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES;
+  EnableAI64.shaderBufferInt64Atomics =
+      V12Features.shaderBufferInt64Atomics;
+  EnableAI64.shaderSharedInt64Atomics =
+      V12Features.shaderSharedInt64Atomics;
+  EnableM4.pNext = &EnableAI64;
+
   Enable12.pNext = &EnableM4;
 
   VkPhysicalDeviceFeatures2 EnableFeat{};
@@ -3223,6 +3254,7 @@ void CHIPQueueVulkan::memFillAsync3D(hipPitchedPtr PitchedDevPtr, int Value,
     return;
 
   auto CmdLock = lockCmdRecord();
+
   void *Dst = PitchedDevPtr.ptr;
   const size_t Pitch = PitchedDevPtr.pitch;
   const size_t SlicePitch = Pitch * PitchedDevPtr.ysize;
@@ -3439,6 +3471,7 @@ CHIPQueueVulkan::launchImpl(chipstar::ExecItem *ExecItem) {
         "VkPhysicalDeviceLimits::maxPushConstantsSize; UBO spill not yet "
         "implemented",
         hipErrorNotSupported);
+
   dim3 Grid = VkExecItem->getGrid();
   dim3 Block = VkExecItem->getBlock();
   VkPipeline Pipeline = Module->getOrCreatePipeline(KernelName, Block);
