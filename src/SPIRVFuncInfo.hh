@@ -81,6 +81,8 @@ struct SPVArgTypeInfo {
   /// while the HIP host still passes its argument list in original HIP
   /// source order.
   int KernelArgIndex = -1;
+  /// Byte offset of a push-constant POD argument, from Vulkan reflection.
+  int PushConstOffset = -1;
 
   bool isWorkgroupPtr() const {
     return Kind == SPVTypeKind::Pointer &&

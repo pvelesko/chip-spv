@@ -709,7 +709,9 @@ void CHIPModuleVulkan::compile(chipstar::Device *ChipDev) {
       case SPVTypeKind::POD: {
         VulkanPushConstantArg Pc;
         Pc.Ordinal = Ord;
-        Pc.Offset = PCRunningOffset;
+        Pc.Offset = A.PushConstOffset >= 0
+                        ? static_cast<uint32_t>(A.PushConstOffset)
+                        : PCRunningOffset;
         Pc.Size = static_cast<uint32_t>(A.Size);
         PCRunningOffset += Pc.Size;
         if (Pc.Offset + Pc.Size > MaxPCEnd)

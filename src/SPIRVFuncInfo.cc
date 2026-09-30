@@ -183,6 +183,7 @@ void SPVFuncInfo::visitKernelArgsImpl(void **ClientArgList,
     KArg.Size = ArgSize;
     KArg.DevGlobalName = ArgTI.DevGlobalName;
     KArg.KernelArgIndex = ArgTI.KernelArgIndex;
+    KArg.PushConstOffset = ArgTI.PushConstOffset;
     KArg.Index = EffectiveIndex;
     KArg.Data = ArgData;
     Visitor(KArg);

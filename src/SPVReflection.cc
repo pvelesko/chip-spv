@@ -501,6 +501,7 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
           Ti.Kind = SPVTypeKind::POD;
           Ti.StorageClass = SPVStorageClass::Private;
           Ti.Size = static_cast<size_t>(Sz);
+          Ti.PushConstOffset = static_cast<int>(Consts[Words[7]]);
           It->second.Args.emplace_back(Ord, Ti);
           logDebug("Reflect kernel='{}' ArgPodPushConstant ord={} size={}",
                    It->second.Name, Ord, Sz);
