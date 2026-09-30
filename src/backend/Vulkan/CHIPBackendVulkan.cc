@@ -2496,6 +2496,16 @@ inline VkBuffer i8LookupVkBuffer(CHIPContextVulkan *Ctx, const void *Ptr,
   return Entry->Buffer;
 }
 
+// Throw hipErrorInvalidValue when [Ptr, Ptr + Size) runs past the end of the
+// registered allocation containing Ptr (unregistered host memory is fine).
+inline void i8CheckFitsAllocation(CHIPContextVulkan *Ctx, const void *Ptr,
+                                  size_t Size) {
+  size_t Offset = 0;
+  const auto *Entry = Ctx ? Ctx->getDevPtrEntryContaining(Ptr, Offset) : nullptr;
+  if (Entry && Offset + Size > Entry->Size)
+    CHIPERR_LOG_AND_THROW("Access exceeds the allocation", hipErrorInvalidValue);
+}
+
 // Backward-compatible 2-arg form for call sites that don't yet care about
 // offsets (and that will continue to work for exact-base pointers).
 inline VkBuffer i8LookupVkBuffer(CHIPContextVulkan *Ctx, const void *Ptr,
@@ -2605,6 +2615,8 @@ CHIPQueueVulkan::memCopyAsyncImpl(void *Dst, const void *Src, size_t Size,
                                      DstMappedBase);
   VkBuffer SrcBuf = i8LookupVkBuffer(Ctx, Src, SrcIsMapped, SrcOffset,
                                      SrcMappedBase);
+  i8CheckFitsAllocation(Ctx, Dst, Size);
+  i8CheckFitsAllocation(Ctx, Src, Size);
 
   if (Kind == hipMemcpyDefault) {
     if (DstBuf != VK_NULL_HANDLE && SrcBuf != VK_NULL_HANDLE)
@@ -2773,6 +2785,7 @@ CHIPQueueVulkan::memFillAsyncImpl(void *Dst, size_t Size, const void *Pattern,
   const void *DstMappedBase = nullptr;
   VkBuffer DstBuf = i8LookupVkBuffer(Ctx, Dst, DstIsMapped, DstOffset,
                                      DstMappedBase);
+  i8CheckFitsAllocation(Ctx, Dst, Size);
 
   // Host-side fallback for mapped/host-only pointers. Note: for mapped
   // device-side allocations the HIP pointer's virtual address IS the
