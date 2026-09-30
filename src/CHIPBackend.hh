@@ -1119,6 +1119,8 @@ public:
   }
 
   std::vector<chipstar::DeviceVar *> &getDeviceVariables() { return ChipVars_; }
+  /// True if the module carries OpenCL-path variable-info shadow kernels.
+  bool hasVarInfoShadowKernels() const;
 
   /// Record a device variable for every __chip_var_info_<X> shadow kernel of
   /// this module whose X has no device variable yet. Caller must hold

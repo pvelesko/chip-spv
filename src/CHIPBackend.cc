@@ -1459,6 +1459,13 @@ void chipstar::Device::deallocateDeviceVariables() {
 
 /// Get compiled module associated with the host pointer 'Ptr'. Return
 /// nullptr if 'Ptr' is not associated with any module.
+bool chipstar::Module::hasVarInfoShadowKernels() const {
+  for (auto *K : ChipKernels_)
+    if (K->getName().rfind(ChipVarInfoPrefix, 0) == 0)
+      return true;
+  return false;
+}
+
 chipstar::Module *chipstar::Device::getOrCreateModule(HostPtr Ptr) {
   {
     LOCK(DeviceVarMtx); // chipstar::Device::HostPtrToCompiledMod_
@@ -1509,7 +1516,12 @@ chipstar::Module *chipstar::Device::getOrCreateModule(HostPtr Ptr) {
         }
       }
     }
-    if (!HasShadow && !HasDeviceGlobal) {
+    // Without shadow kernels (Vulkan path) an unreferenced user variable
+    // still needs storage for the symbol APIs; its registered size is known.
+    bool KeepUnused = !HasShadow && !HasDeviceGlobal && Info.Size > 0 &&
+                      NameTmp.rfind("__chip", 0) != 0 &&
+                      !Mod->hasVarInfoShadowKernels();
+    if (!HasShadow && !HasDeviceGlobal && !KeepUnused) {
       // The kernel compilation pipe is allowed to remove device-side unused
       // global variables from the device modules. This is utilized in the
       // abort implementation to signal that abort is not called in the
