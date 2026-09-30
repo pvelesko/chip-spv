@@ -41,6 +41,7 @@
 #include "vk_mem_alloc.h"
 
 #include "CHIPBackendVulkan.hh"
+#include "../../ModuleCache.hh"
 
 #include "../../CHIPException.hh"
 #include "../../Utils.hh"
@@ -622,8 +623,73 @@ CHIPModuleVulkan::~CHIPModuleVulkan() {
         vmaDestroyBuffer(Allocator, Kv.second.Buffer, Kv.second.Allocation);
     }
   }
+  if (PipelineCache_ != VK_NULL_HANDLE)
+    vkDestroyPipelineCache(Dev, PipelineCache_, nullptr);
   if (ShaderModule_ != VK_NULL_HANDLE)
     vkDestroyShaderModule(Dev, ShaderModule_, nullptr);
+}
+
+/// The module-cache artifact is this module's VkPipelineCache data, keyed by
+/// the SPIR-V, the device and driver, the loaded libraries and the compiler
+/// environment.
+void CHIPModuleVulkan::createModulePipelineCache(std::string_view Spv) {
+  namespace cache = chipstar::cache;
+  VkDevice Dev = ChipDevice_->getLogicalDevice();
+  std::string Key;
+  cache::Entry Hit;
+  if (ChipEnvVars.getModuleCacheDir().has_value()) {
+    const VkPhysicalDeviceProperties &P = ChipDevice_->getProperties();
+    cache::KeyBuilder KB;
+    KB.add(cache::KeyField::BackendTag, "vulkan")
+        .add(cache::KeyField::Il, Spv)
+        .add(cache::KeyField::BuildOptions, ChipEnvVars.getJitFlagsOverride())
+        .add(cache::KeyField::DeviceName, std::string_view(P.deviceName))
+        .add(cache::KeyField::DriverVersion, uint64_t(P.driverVersion))
+        .add(cache::KeyField::VendorId, uint64_t(P.vendorID))
+        .add(cache::KeyField::DeviceId, uint64_t(P.deviceID))
+        .add(cache::KeyField::LoaderDelta, cache::loaderDeltaDigest())
+        .add(cache::KeyField::Environment,
+             collectCompilerEnvironmentVariables());
+    Key = KB.finish();
+    Hit = cache::load(ChipEnvVars.getModuleCacheDir().value(), "vulkan", Key);
+  }
+  VkPipelineCacheCreateInfo Ci{};
+  Ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+  if (Hit) {
+    Ci.initialDataSize = Hit.data().size();
+    Ci.pInitialData = Hit.data().data();
+    if (vkCreatePipelineCache(Dev, &Ci, nullptr, &PipelineCache_) ==
+        VK_SUCCESS) {
+      cache::logOutcome("vulkan", Key, cache::Outcome::Hit, "");
+      return;
+    }
+    cache::logOutcome("vulkan", Key, cache::Outcome::Rejected,
+                      "pipeline-cache");
+    Ci.initialDataSize = 0;
+    Ci.pInitialData = nullptr;
+  }
+  if (vkCreatePipelineCache(Dev, &Ci, nullptr, &PipelineCache_) != VK_SUCCESS)
+    PipelineCache_ = VK_NULL_HANDLE;
+  PendingCacheKey_ = Key;
+}
+
+/// Store the pipeline cache once the first pipeline has been compiled.
+void CHIPModuleVulkan::storeModulePipelineCache() {
+  if (PendingCacheKey_.empty() || PipelineCache_ == VK_NULL_HANDLE)
+    return;
+  VkDevice Dev = ChipDevice_->getLogicalDevice();
+  size_t Size = 0;
+  std::vector<uint8_t> Data;
+  if (vkGetPipelineCacheData(Dev, PipelineCache_, &Size, nullptr) ==
+          VK_SUCCESS &&
+      Size > 0) {
+    Data.resize(Size);
+    if (vkGetPipelineCacheData(Dev, PipelineCache_, &Size, Data.data()) ==
+        VK_SUCCESS)
+      chipstar::cache::store(ChipEnvVars.getModuleCacheDir().value(), "vulkan",
+                             PendingCacheKey_, Data.data(), Size);
+  }
+  PendingCacheKey_.clear();
 }
 
 void CHIPModuleVulkan::compile(chipstar::Device *ChipDev) {
@@ -648,6 +714,8 @@ void CHIPModuleVulkan::compile(chipstar::Device *ChipDev) {
   if (SizeBytes == 0 || (SizeBytes % sizeof(uint32_t)) != 0)
     CHIPERR_LOG_AND_THROW("CHIPModuleVulkan::compile: SPV binary size invalid",
                           hipErrorInvalidImage);
+
+  createModulePipelineCache(SrcBin);
 
   // 2. Create the single VkShaderModule for this SPV. One shader module per
   //    SPVModule; every entry point in the SPV is reachable via its
@@ -1060,7 +1128,9 @@ VkPipeline CHIPModuleVulkan::getOrCreatePipeline(const std::string &KernelName,
 
   VkPipeline Pipeline = VK_NULL_HANDLE;
   VkResult R = vkCreateComputePipelines(
-      Dev, ChipDevice_->getPipelineCache(),
+      Dev,
+      PipelineCache_ != VK_NULL_HANDLE ? PipelineCache_
+                                       : ChipDevice_->getPipelineCache(),
       /*createInfoCount=*/1, &Ci, /*pAlloc=*/nullptr, &Pipeline);
   if (R != VK_SUCCESS || Pipeline == VK_NULL_HANDLE)
     CHIPERR_LOG_AND_THROW("vkCreateComputePipelines failed (VkResult=" +
@@ -1068,6 +1138,7 @@ VkPipeline CHIPModuleVulkan::getOrCreatePipeline(const std::string &KernelName,
                               " kernel=" + KernelName + ")",
                           hipErrorInitializationError);
   Pipelines_[CacheKey] = Pipeline;
+  storeModulePipelineCache();
   return Pipeline;
 }
 

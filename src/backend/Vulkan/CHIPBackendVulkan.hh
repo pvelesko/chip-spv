@@ -350,6 +350,11 @@ class CHIPModuleVulkan : public chipstar::Module {
   /// The single VkShaderModule covering every entry point in this SPV.
   VkShaderModule ShaderModule_ = VK_NULL_HANDLE;
 
+  /// This module's pipelines; its data is the module-cache artifact.
+  VkPipelineCache PipelineCache_ = VK_NULL_HANDLE;
+  /// Module-cache key still to be stored (set on a miss, cleared on store).
+  std::string PendingCacheKey_;
+
   /// Per-kernel reflection records, indexed by HostFName. Populated during
   /// compile() from `tryAnalyzeVulkanReflection`. Looked up by I4 to build
   /// descriptor-set updates and push-constant blobs.
@@ -390,6 +395,8 @@ class CHIPModuleVulkan : public chipstar::Module {
 public:
   CHIPModuleVulkan(const SPVModule &SrcMod);
   virtual ~CHIPModuleVulkan() override;
+  void createModulePipelineCache(std::string_view Spv);
+  void storeModulePipelineCache();
 
   // chipstar::Module pure virtuals (owned by I3).
   virtual void compile(chipstar::Device *ChipDev) override;
