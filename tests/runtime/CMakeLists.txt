@@ -123,7 +123,7 @@ list(REMOVE_ITEM RUNTIME_TEST_SOURCES ${RUNTIME_TESTS_MANUAL})
 if(CHIP_USE_NATIVE_VULKAN_SPIRV)
   list(REMOVE_ITEM RUNTIME_TEST_SOURCES TestIndirectCall.hip
     TestDeviceVirtualDispatch.hip TestFix1691SharedAddrLocalInit.hip
-    TestSubwordAtomics.hip)
+    TestSubwordAtomics.hip TestAlignAttrRuntime.hip)
 endif()
 list(SORT RUNTIME_TEST_SOURCES)
 # Registered per mode below, not by the glob.
