@@ -875,6 +875,13 @@ void CHIPModuleVulkan::compile(chipstar::Device *ChipDev) {
     auto BdaIt = Info.BDAPointerSlotOffsetsByKernel.find(Name);
     if (BdaIt != Info.BDAPointerSlotOffsetsByKernel.end())
       Refl.BDAPointerSlotOffsets = BdaIt->second;
+    auto NullIt = Info.NullFlagSlotsByKernel.find(Name);
+    if (NullIt != Info.NullFlagSlotsByKernel.end()) {
+      Refl.NullFlagSlots = NullIt->second;
+      for (auto [ArgIdx, Offset] : Refl.NullFlagSlots)
+        Refl.PushConstantBlockSize =
+            std::max<uint32_t>(Refl.PushConstantBlockSize, Offset + 4);
+    }
 
     Reflection_.emplace(Name, std::move(Refl));
   }
@@ -1357,6 +1364,11 @@ void CHIPExecItemVulkan::setupAllArgs() {
     int32_t ArgsIdx =
         Pc.HipSourceIndex >= 0 ? Pc.HipSourceIndex : (int32_t)Pc.Ordinal;
     std::memcpy(PushConstantBlob_.data() + Pc.Offset, Args_[ArgsIdx], Pc.Size);
+  }
+  for (auto [ArgIdx, Offset] : Refl->NullFlagSlots) {
+    uint32_t NonNull = *reinterpret_cast<void **>(Args_[ArgIdx]) != nullptr;
+    if (Offset + sizeof(NonNull) <= PushConstantBlob_.size())
+      std::memcpy(PushConstantBlob_.data() + Offset, &NonNull, sizeof(NonNull));
   }
   // Phase Z3 (BDA): for every recorded BDA pointer slot in the PC block,
   // the bytes just copied from the user are a raw HIP pointer (8 bytes;

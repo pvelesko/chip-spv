@@ -97,6 +97,10 @@ struct SPVModuleInfo {
   /// raw HIP pointer at each offset with vkGetBufferDeviceAddress(buffer)
   /// before pushing the PC block. Empty for non-BDA modules.
   std::map<std::string, std::vector<uint32_t>> BDAPointerSlotOffsetsByKernel;
+  /// Per kernel: (HIP argument index, push-constant offset) of each i32 the
+  /// runtime sets to (pointer argument != nullptr).
+  std::map<std::string, std::vector<std::pair<uint32_t, uint32_t>>>
+      NullFlagSlotsByKernel;
 };
 
 // Processing done before analysis.

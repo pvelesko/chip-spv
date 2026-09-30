@@ -231,6 +231,8 @@ struct VulkanKernelReflection {
   /// looks up the backing VkBuffer, and overwrites with
   /// vkGetBufferDeviceAddress(buffer). Empty for non-BDA kernels.
   std::vector<uint32_t> BDAPointerSlotOffsets;
+  /// (HIP argument index, offset) of each non-null flag in the PC block.
+  std::vector<std::pair<uint32_t, uint32_t>> NullFlagSlots;
   uint32_t PushConstantBlockSize = 0;            ///< Total bytes used by all PushConst entries (rounded up).
   uint32_t MaxDescriptorBinding = 0;             ///< Highest binding used in set=0.
   /// Phase Z6: set true at module-compile time when

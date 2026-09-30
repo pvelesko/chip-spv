@@ -545,6 +545,17 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
                    It->second.Name, Offset);
           break;
         }
+        case 1000: { // chipStar: ArgumentPointerNullFlag(kernel, ord, offset)
+          if (Wc < 8)
+            break;
+          auto It = Kernels.find(Words[5]);
+          if (It == Kernels.end())
+            break;
+          Output.NullFlagSlotsByKernel[It->second.Name].emplace_back(
+              static_cast<uint32_t>(Consts[Words[6]]),
+              static_cast<uint32_t>(Consts[Words[7]]));
+          break;
+        }
         default:
           break;
         }
