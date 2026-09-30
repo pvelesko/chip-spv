@@ -1505,17 +1505,15 @@ CHIPContextVulkan::getDevPtrEntryContaining(const void *DevPtr,
     OutOffset = 0;
     return &It->second;
   }
-  // Slow path: linear scan for the entry that contains this pointer. The
-  // DevPtrToEntry_ map is keyed on the base pointer; we scan all entries.
-  // The HIP test workloads have ~tens to hundreds of live allocations at
-  // most, so O(N) per lookup is acceptable for the spike. A sorted address
-  // map could be introduced in Phase 5 if profiling shows hot lookups.
-  const auto *Bytes = static_cast<const uint8_t *>(DevPtr);
-  for (const auto &Kv : DevPtrToEntry_) {
-    const auto *BaseBytes = static_cast<const uint8_t *>(Kv.first);
-    if (Bytes >= BaseBytes && Bytes < BaseBytes + Kv.second.Size) {
+  // Otherwise the entry with the greatest base below DevPtr, if it covers it.
+  auto Ub = DevPtrToEntry_.upper_bound(DevPtr);
+  if (Ub != DevPtrToEntry_.begin()) {
+    --Ub;
+    const auto *Bytes = static_cast<const uint8_t *>(DevPtr);
+    const auto *BaseBytes = static_cast<const uint8_t *>(Ub->first);
+    if (Bytes < BaseBytes + Ub->second.Size) {
       OutOffset = static_cast<size_t>(Bytes - BaseBytes);
-      return &Kv.second;
+      return &Ub->second;
     }
   }
   return nullptr;

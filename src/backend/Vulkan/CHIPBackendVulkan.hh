@@ -145,6 +145,7 @@
 #ifndef CHIP_BACKEND_VULKAN_H
 #define CHIP_BACKEND_VULKAN_H
 
+#include <map>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -545,7 +546,7 @@ class CHIPContextVulkan : public chipstar::Context {
     hipMemoryType MemType = hipMemoryTypeDevice;
     chipstar::HostAllocFlags Flags;
   };
-  std::unordered_map<const void *, DevPtrEntry> DevPtrToEntry_;
+  std::map<const void *, DevPtrEntry> DevPtrToEntry_;
 
 public:
   /// Device buffer bound for null pointer kernel arguments.
