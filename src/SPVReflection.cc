@@ -213,6 +213,7 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
   std::map<InstWord, std::string> Strings;
   std::map<InstWord, uint64_t> Consts;
   std::map<InstWord, std::string> EntryPointNames; // fn_id → entry name
+  std::map<InstWord, std::vector<InstWord>> EntryPointIface; // fn_id → vars
   // Phase G4: per-result-id OpName plus DescriptorSet/Binding decorations,
   // and result-ids of OpVariable in StorageBuffer storage class. These three
   // sources together identify the device-global descriptors emitted by the
@@ -277,7 +278,8 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
       // Words[0]=opcode, [1]=execution_model, [2]=fn_id, [3..]=name+iface.
       InstWord FnId = Words[2];
       std::string EpName;
-      for (size_t k = 3; k < Wc; ++k) {
+      size_t k = 3;
+      for (; k < Wc; ++k) {
         InstWord X = Words[k];
         bool Done = false;
         for (int b = 0; b < 4; ++b) {
@@ -292,6 +294,8 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
           break;
       }
       EntryPointNames[FnId] = EpName;
+      EntryPointIface[FnId].assign(Words + std::min<size_t>(k + 1, Wc),
+                                   Words + Wc);
     } else if (Op == 5 /*OpName*/ && Wc >= 3) {
       // OpName target_id <literal name>
       InstWord Tgt = Words[1];
@@ -336,6 +340,7 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
   // arg ordinal. Build a per-binding -> symbol map here; per-kernel ord
   // mapping is built below in the reflection-walk.
   std::map<uint32_t, std::string> BindingToDGSymbol; // set=0 binding -> symbol
+  std::map<InstWord, std::string> VarToDGSymbol;
   {
     static constexpr const char *kPrefix = "__hipspv_dg_";
     static constexpr size_t kPrefixLen = 12;
@@ -400,6 +405,7 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
       if (Symbol.empty())
         continue;
       BindingToDGSymbol[BI->second] = Symbol;
+      VarToDGSymbol[Id] = Symbol;
       if (SeenSymbols.insert(Symbol).second) {
         SPVDeviceGlobal DG;
         DG.Name = Symbol;
@@ -473,16 +479,34 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
           // chipStar-allocated cl_mem, and mark its kind so visitClientArgs
           // skips it.
           if (ArgSet == 0) {
-            auto SymIt = BindingToDGSymbol.find(ArgBinding);
-            if (SymIt != BindingToDGSymbol.end()) {
+            // Bindings are per kernel, so resolve through this entry
+            // point's interface; other kernels may reuse the binding.
+            const std::string *Sym = nullptr;
+            auto IfIt = EntryPointIface.find(It->second.FunctionId);
+            if (IfIt != EntryPointIface.end()) {
+              for (InstWord V : IfIt->second) {
+                auto VS = VarToDGSymbol.find(V);
+                auto VB = DescBinding.find(V);
+                if (VS != VarToDGSymbol.end() && VB != DescBinding.end() &&
+                    VB->second == ArgBinding && DescSet[V] == 0) {
+                  Sym = &VS->second;
+                  break;
+                }
+              }
+            } else {
+              auto SymIt = BindingToDGSymbol.find(ArgBinding);
+              if (SymIt != BindingToDGSymbol.end())
+                Sym = &SymIt->second;
+            }
+            if (Sym) {
               SPVKernelDeviceGlobalArg HA;
-              HA.Symbol = SymIt->second;
+              HA.Symbol = *Sym;
               HA.ArgIndex = Ord;
               Output.HiddenDGArgsByKernel[It->second.Name].push_back(HA);
               Ti.Kind = SPVTypeKind::DeviceGlobalHidden;
               logDebug(
                   "Reflect kernel='{}' hidden DG arg ord={} symbol='{}'",
-                  It->second.Name, Ord, SymIt->second);
+                  It->second.Name, Ord, *Sym);
             }
           }
           It->second.Args.emplace_back(Ord, Ti);
