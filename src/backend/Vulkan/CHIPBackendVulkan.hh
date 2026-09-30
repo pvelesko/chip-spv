@@ -857,6 +857,8 @@ public:
   /// Block until everything already submitted to this queue has finished.
   void waitSubmitted();
   bool Draining_ = false;
+  /// Host callbacks enqueued on this queue that have not finished running.
+  std::atomic<int> PendingCallbacks{0};
   virtual bool query() override;                                      // I6
   virtual std::shared_ptr<chipstar::Event> enqueueBarrierImpl(
       const std::vector<std::shared_ptr<chipstar::Event>> &EventsToWaitFor)

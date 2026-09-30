@@ -395,10 +395,13 @@ void CHIPEventVulkan::hostSignal() {
 // in the spike currently uses GpuAck as a wait-dep for a GPU operation;
 // it only blocks the EventMonitor's per-callback drain step.
 
+static thread_local bool InCallbackThread = false;
+
 CHIPCallbackDataVulkan::CHIPCallbackDataVulkan(hipStreamCallback_t CallbackF,
                                                 void *CallbackArgs,
                                                 chipstar::Queue *ChipQueue)
     : chipstar::CallbackData(CallbackF, CallbackArgs, ChipQueue) {
+  static_cast<CHIPQueueVulkan *>(ChipQueue)->PendingCallbacks++;
   auto *Ctx = ChipQueue->getContext();
   auto *BVk = static_cast<CHIPBackendVulkan *>(Backend);
 
@@ -506,12 +509,16 @@ void EventMonitorVulkan::monitor() {
       // (e.g. hipStreamAddCallback recursion) don't deadlock on
       // CallbackQueueMtx.
       for (auto *CbData : ToExecute) {
+        InCallbackThread = true;
         CbData->execute(hipSuccess);
+        InCallbackThread = false;
         if (CbData->CpuCallbackComplete)
           CbData->CpuCallbackComplete->hostSignal();
         if (CbData->GpuAck)
           CbData->GpuAck->hostSignal();
+        auto *Q = static_cast<CHIPQueueVulkan *>(CbData->ChipQueue);
         delete static_cast<CHIPCallbackDataVulkan *>(CbData);
+        Q->PendingCallbacks--;
       }
     }
 
@@ -3833,24 +3840,9 @@ void CHIPQueueVulkan::finish() {
   // before it returns. The EventMonitor runs callbacks asynchronously, so
   // we have to poll until callbacks bound to this queue have all executed
   // (their CallbackData entry is delete()d after execution).
-  while (true) {
-    bool HasPending = false;
-    {
-      LOCK(Backend->CallbackQueueMtx);
-      // Walk the queue without modifying ordering; we just check membership.
-      size_t N = Backend->CallbackQueue.size();
-      for (size_t i = 0; i < N; ++i) {
-        chipstar::CallbackData *Cb = Backend->CallbackQueue.front();
-        Backend->CallbackQueue.pop();
-        if (Cb && Cb->ChipQueue == this)
-          HasPending = true;
-        Backend->CallbackQueue.push(Cb);
-      }
-    }
-    if (!HasPending)
-      break;
+  // A callback syncing its own stream would wait on itself.
+  while (!InCallbackThread && PendingCallbacks.load() > 0)
     std::this_thread::sleep_for(std::chrono::microseconds(100));
-  }
 
   // All GPU work has drained; release cross-queue dep markers and mark the
   // queue empty so the default-stream sync helper can skip it.
