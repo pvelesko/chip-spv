@@ -548,6 +548,14 @@ class CHIPContextVulkan : public chipstar::Context {
   std::unordered_map<const void *, DevPtrEntry> DevPtrToEntry_;
 
 public:
+  /// Device buffer bound for null pointer kernel arguments.
+  void *getNullArgPlaceholder();
+
+private:
+  std::once_flag NullArgOnce_;
+  void *NullArgPlaceholder_ = nullptr;
+
+public:
   void importHostMemory(void *HostPtr, size_t SizeBytes) override {}
   void releaseHostMemory(void *HostPtr) override {}
   CHIPContextVulkan();

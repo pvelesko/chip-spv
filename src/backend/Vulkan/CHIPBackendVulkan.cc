@@ -1193,6 +1193,10 @@ void CHIPExecItemVulkan::setupAllArgs() {
     // descriptor's offset is set so the kernel sees the same byte view the
     // caller had on the host pointer.
     size_t Offset = 0;
+    // A null pointer argument is legal as long as the kernel never
+    // dereferences it; bind a small placeholder buffer.
+    if (HipPtr == nullptr)
+      HipPtr = Ctx->getNullArgPlaceholder();
     const auto *Entry = Ctx->getDevPtrEntryContaining(HipPtr, Offset);
     if (Entry == nullptr) {
       std::string Msg = "ExecItem::setupAllArgs: unregistered device pointer "
@@ -1511,6 +1515,13 @@ CHIPContextVulkan::getDevPtrEntryContaining(const void *DevPtr,
     }
   }
   return nullptr;
+}
+
+void *CHIPContextVulkan::getNullArgPlaceholder() {
+  std::call_once(NullArgOnce_, [this]() {
+    NullArgPlaceholder_ = allocateImpl(256, 256, hipMemoryTypeDevice);
+  });
+  return NullArgPlaceholder_;
 }
 
 CHIPDeviceVulkan *CHIPContextVulkan::getVulkanDevice() const {
