@@ -574,6 +574,16 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
     // HIP source order with each entry's KernelArgIndex set to the OCL
     // kernel-arg ordinal (the reflection ord).
     auto IsPtrPerHipArg = classifyHipKernelArgsByMangling(Rec.Name);
+    // The bridging pass recorded this kernel's source argument order, so the
+    // ordinals already are HIP source positions.
+    std::string SrcOrderMarker = ".hipspv.pcsargs." + Rec.Name;
+    bool SourceOrdered = std::any_of(
+        ResultNames.begin(), ResultNames.end(), [&](const auto &KV) {
+          const std::string &N = KV.second;
+          return N.compare(0, SrcOrderMarker.size(), SrcOrderMarker) == 0 &&
+                 (N.size() == SrcOrderMarker.size() ||
+                  N[SrcOrderMarker.size()] == '.');
+        });
 
     // Partition the reflected args into three buckets.
     std::vector<size_t> PointerArgsOcl;
@@ -611,7 +621,7 @@ bool tryAnalyzeVulkanReflection(const InstWord *Stream, size_t NumWords,
     // HIPSPV bridging pass (e.g. as a private global string consumed by
     // hipspv-inject-reflection and surfaced through the kernel attrs
     // OpString), so this heuristic isn't needed.
-    if (IsPtrPerHipArg.empty() && !PointerArgsOcl.empty() &&
+    if (IsPtrPerHipArg.empty() && !SourceOrdered && !PointerArgsOcl.empty() &&
         !PodArgsOcl.empty()) {
       IsPtrPerHipArg.reserve(PodArgsOcl.size() + PointerArgsOcl.size());
       IsPtrPerHipArg.insert(IsPtrPerHipArg.end(), PodArgsOcl.size(), false);
