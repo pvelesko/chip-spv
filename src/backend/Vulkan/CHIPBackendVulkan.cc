@@ -1588,11 +1588,12 @@ CHIPDeviceVulkan *CHIPDeviceVulkan::create(CHIPContextVulkan *ChipContext,
   vkGetPhysicalDeviceQueueFamilyProperties(PhysDev, &QFamCount,
                                            QFamProps.data());
   uint32_t QFamIdx = ~0u;
-  // Prefer a compute-only family (no graphics bit) for the spike; fall back
-  // to any family advertising COMPUTE.
+  // Prefer the universal (graphics+compute) family: on Mesa ANV the
+  // compute-only family on Xe2 (Arc B570) leaves dispatch writes invisible
+  // to the following transfer. Fall back to any COMPUTE family.
   for (uint32_t i = 0; i < QFamCount; ++i) {
     if ((QFamProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
-        !(QFamProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+        (QFamProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
       QFamIdx = i;
       break;
     }
