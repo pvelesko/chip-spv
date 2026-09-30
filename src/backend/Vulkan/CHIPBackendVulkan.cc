@@ -2418,6 +2418,7 @@ void CHIPQueueVulkan::recordEvent(chipstar::Event *Event) {
   {
     std::lock_guard<std::mutex> Lock(QueueOpMtx_);
     SignalTimelineVal = ++TimelineValue_;
+    noteRingSubmit(Cb, SignalTimelineVal);
   }
 
   VkTimelineSemaphoreSubmitInfo TsSubmit{};
@@ -4081,13 +4082,33 @@ VkCommandBuffer CHIPQueueVulkan::acquireCmdBuffer() {
   // GPU. For the 2_vecadd target the workload is far smaller than
   // RingCapacity_ submits in flight, so we skip the per-slot fence-wait.
   // Phase 5 adds an explicit per-slot completion fence + wait here.
-  std::lock_guard<std::mutex> Lock(QueueOpMtx_);
-  VkCommandBuffer Cb = CmdBufferRing_[RingHead_];
-  RingHead_ = (RingHead_ + 1) % RingCapacity_;
+  VkCommandBuffer Cb;
+  uint64_t Pending;
+  {
+    std::lock_guard<std::mutex> Lock(QueueOpMtx_);
+    Cb = CmdBufferRing_[RingHead_];
+    Pending = RingSlotValue_[RingHead_];
+    RingHead_ = (RingHead_ + 1) % RingCapacity_;
+  }
+  // Resetting a command buffer that is still pending drops its commands.
+  if (Pending > 0 && TimelineSemaphore_ != VK_NULL_HANDLE) {
+    VkSemaphoreWaitInfo WI{};
+    WI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    WI.semaphoreCount = 1;
+    WI.pSemaphores = &TimelineSemaphore_;
+    WI.pValues = &Pending;
+    (void)vkWaitSemaphores(ChipDevice_->getLogicalDevice(), &WI, UINT64_MAX);
+  }
   if (Cb != VK_NULL_HANDLE) {
     (void)vkResetCommandBuffer(Cb, /*flags=*/0);
   }
   return Cb;
+}
+
+void CHIPQueueVulkan::noteRingSubmit(VkCommandBuffer Cb, uint64_t Val) {
+  for (uint32_t I = 0; I < RingCapacity_; ++I)
+    if (CmdBufferRing_[I] == Cb)
+      RingSlotValue_[I] = Val;
 }
 
 std::shared_ptr<chipstar::Event> CHIPQueueVulkan::submitWithEvent(
@@ -4119,6 +4140,7 @@ std::shared_ptr<chipstar::Event> CHIPQueueVulkan::submitWithEvent(
     std::lock_guard<std::mutex> Lock(QueueOpMtx_);
     WaitTimelineVal = TimelineValue_;
     SignalTimelineVal = ++TimelineValue_;
+    noteRingSubmit(Buf, SignalTimelineVal);
   }
 
   // Serialize this submit against every prior submit on the same queue by

@@ -777,6 +777,10 @@ class CHIPQueueVulkan : public chipstar::Queue {
   static constexpr uint32_t RingCapacity_ = 16;
   std::vector<VkCommandBuffer> CmdBufferRing_;
   uint32_t RingHead_ = 0;
+  /// Timeline value signalled by each ring slot's last submit.
+  std::vector<uint64_t> RingSlotValue_ = std::vector<uint64_t>(RingCapacity_);
+  /// Record that Cb's submit signals timeline value Val.
+  void noteRingSubmit(VkCommandBuffer Cb, uint64_t Val);
 
   /// Timeline semaphore monotonically incremented on every submit; used by
   /// enqueueBarrierImpl to chain dependencies across submits without
