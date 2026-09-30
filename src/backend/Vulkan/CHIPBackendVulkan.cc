@@ -3818,7 +3818,10 @@ static void printDevicePrintfRecord(const uint32_t *W, uint32_t NW) {
     Arg A{W[I], W[I + 1] | (uint64_t(W[I + 2]) << 32), {}};
     I += 3;
     if (A.Tag == 4) {
-      size_t Bytes = A.V & 0xffffffffu, Words = (Bytes + 3) / 4;
+      // The high word, when set, is the padded word count of a string
+      // chosen at run time among several literals.
+      size_t Bytes = A.V & 0xffffffffu,
+             Words = (A.V >> 32) ? (A.V >> 32) : (Bytes + 3) / 4;
       if (I + Words > NW)
         break;
       A.S.assign(reinterpret_cast<const char *>(&W[I]), Bytes);
