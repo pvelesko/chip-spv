@@ -60,49 +60,27 @@ namespace {
 static std::vector<bool>
 classifyDemangledArgs(const std::string &Demangled) {
   std::vector<bool> Result;
-  // Find the parameter list. The signature may be like
-  // `bcast(int, int*)` or `addCountReverse<int>(int const*, int*, long, int)`.
-  // We want the outermost parens.
+  // The parameter list is the paren group closing the signature, e.g.
+  // `(anonymous namespace)::f<int>(int const*, long)`: scan back from the end.
+  size_t RParen = Demangled.rfind(')');
+  if (RParen == std::string::npos)
+    return Result;
   size_t LParen = std::string::npos;
-  int Depth = 0;
-  for (size_t I = 0; I < Demangled.size(); ++I) {
-    char C = Demangled[I];
-    if (C == '<')
-      Depth++;
-    else if (C == '>')
-      Depth--;
-    else if (C == '(' && Depth == 0) {
+  int PDepth = 0;
+  for (size_t I = RParen + 1; I-- > 0;) {
+    if (Demangled[I] == ')')
+      PDepth++;
+    else if (Demangled[I] == '(' && --PDepth == 0) {
       LParen = I;
       break;
     }
   }
   if (LParen == std::string::npos)
     return Result;
-  // Match the closing paren.
-  int PDepth = 1;
-  size_t RParen = std::string::npos;
-  Depth = 0;
-  for (size_t I = LParen + 1; I < Demangled.size(); ++I) {
-    char C = Demangled[I];
-    if (C == '<' || C == '(' || C == '[')
-      Depth++;
-    else if (C == '>' || C == ')' || C == ']') {
-      if (C == ')' && Depth == 0) {
-        if (--PDepth == 0) {
-          RParen = I;
-          break;
-        }
-        continue;
-      }
-      Depth--;
-    }
-  }
-  if (RParen == std::string::npos)
-    return Result;
   // Split the parameter list on commas at depth 0.
   std::string ParamList = Demangled.substr(LParen + 1, RParen - LParen - 1);
   size_t Start = 0;
-  Depth = 0;
+  int Depth = 0;
   auto pushParam = [&](size_t Begin, size_t End) {
     // Trim trailing whitespace.
     while (End > Begin && std::isspace(static_cast<unsigned char>(ParamList[End - 1])))
