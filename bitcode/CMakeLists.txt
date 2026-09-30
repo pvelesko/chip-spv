@@ -102,10 +102,20 @@ set(OCML_LIB_PATHS
   ${CMAKE_BINARY_DIR}/bitcode/ROCm-Device-Libs/oclc/oclc_daz_opt_off.lib.bc
   ${CMAKE_BINARY_DIR}/bitcode/ROCm-Device-Libs/oclc/oclc_isa_version_803.lib.bc
 )
-# OCML assumes AMDGPU intrinsic accuracy (llvm.log2 etc.) that Vulkan lacks.
+# OCML assumes AMDGPU intrinsic accuracy (llvm.log2 etc.) that Vulkan lacks;
+# libclc's generic builtins take its place.
+set(DEVICELIB_LINK_FLAGS)
 if(CHIP_USE_NATIVE_VULKAN_SPIRV)
+  set(LIBCLC_VULKAN
+    "${CLANG_ROOT_PATH}/share/clc/spirv64-unknown-vulkan/libclc.bc")
+  if(NOT EXISTS "${LIBCLC_VULKAN}")
+    message(FATAL_ERROR "CHIP_USE_NATIVE_VULKAN_SPIRV needs libclc built for "
+      "spirv64-unknown-vulkan and installed at ${LIBCLC_VULKAN}")
+  endif()
   set(OCML_LIBS)
-  set(OCML_LIB_PATHS)
+  set(OCML_LIB_PATHS "${LIBCLC_VULKAN}")
+  # libclc's triple is spirv64-unknown-vulkan; the first module's wins.
+  set(DEVICELIB_LINK_FLAGS --suppress-warnings)
 endif()
 
 add_custom_command(
@@ -137,7 +147,7 @@ add_custom_command(
   DEPENDS ${DEPEND_LIST} ${OCML_LIBS}
   COMMAND ${CMAKE_COMMAND} -E make_directory
   "${CMAKE_BINARY_DIR}/${BC_DESTINATION}"
-  COMMAND "${LLVM_LINK}"
+  COMMAND "${LLVM_LINK}" ${DEVICELIB_LINK_FLAGS}
   -o "${CMAKE_BINARY_DIR}/${BC_DESTINATION}/${BC_FILE}"
   ${DEPEND_LIST} 
   ${OCML_LIB_PATHS}
