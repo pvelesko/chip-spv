@@ -1073,8 +1073,15 @@ CHIPKernelVulkan::CHIPKernelVulkan(std::string HostFName, SPVFuncInfo *FuncInfo,
 
 CHIPKernelVulkan::~CHIPKernelVulkan() = default;
 
-hipError_t CHIPKernelVulkan::getAttributes(hipFuncAttributes * /*Attr*/) {
-  unimpl("Kernel::getAttributes");
+hipError_t CHIPKernelVulkan::getAttributes(hipFuncAttributes *Attr) {
+  chipstar::Device *Dev = ::Backend->getActiveDevice();
+  *Attr = hipFuncAttributes{};
+  Attr->binaryVersion = 10;
+  Attr->ptxVersion = 10;
+  Attr->maxThreadsPerBlock = Dev->getAttr(hipDeviceAttributeMaxThreadsPerBlock);
+  Attr->maxDynamicSharedSizeBytes =
+      Dev->getAttr(hipDeviceAttributeMaxSharedMemoryPerBlock);
+  return hipSuccess;
 }
 
 chipstar::Module *CHIPKernelVulkan::getModule() { return Module_; }
