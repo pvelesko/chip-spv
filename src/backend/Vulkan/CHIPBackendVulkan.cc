@@ -2571,6 +2571,22 @@ CHIPQueueVulkan::memCopyAsyncImpl(void *Dst, const void *Src, size_t Size,
       (Kind == hipMemcpyDeviceToDevice && DstIsMapped && SrcIsMapped)) {
     logTrace("CHIPQueueVulkan::memCopyAsync host-side memcpy {} -> {} / {} B",
              Src, Dst, Size);
+    // The host copy must not overtake work already submitted to this queue.
+    if (TimelineSemaphore_ != VK_NULL_HANDLE) {
+      uint64_t Target;
+      {
+        std::lock_guard<std::mutex> Lock(QueueOpMtx_);
+        Target = TimelineValue_;
+      }
+      VkSemaphoreWaitInfo WI{};
+      WI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+      WI.semaphoreCount = 1;
+      WI.pSemaphores = &TimelineSemaphore_;
+      WI.pValues = &Target;
+      checkVk(vkWaitSemaphores(ChipDevice_->getLogicalDevice(), &WI,
+                               UINT64_MAX),
+              "memCopyAsync: vkWaitSemaphores failed", hipErrorTbd);
+    }
     std::memcpy(Dst, Src, Size);
     {
       VkCommandBuffer EmptyCmd = i8BeginCmdBuffer(this);
