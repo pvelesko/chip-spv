@@ -1486,10 +1486,14 @@ void *CHIPContextVulkan::allocateImpl(size_t Size, size_t Alignment,
     // Host-pinned: host-visible + host-coherent, GPU-readable via the same
     // VkBuffer. VMA persistently maps the allocation so pMappedData is the
     // HIP pointer.
-    AllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+    // System memory, not the device-local BAR that CPU_TO_GPU picks on a
+    // ReBAR GPU: host reads from BAR are uncached and very slow.
+    AllocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
     AllocInfo.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    AllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    AllocInfo.preferredFlags = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    AllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |
+                      VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
     Status = vmaCreateBuffer(Allocator, &BufInfo, &AllocInfo, &Buffer,
                              &Allocation, &AllocResult);
     if (Status != VK_SUCCESS || Allocation == VK_NULL_HANDLE ||
