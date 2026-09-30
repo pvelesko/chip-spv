@@ -48,6 +48,11 @@ set(BITCODE_C_COMPILE_FLAGS
 
 # non-OCML sources
 set(NON_OCML_SOURCES "devicelib" "_cl_print_str" "texture" "malloc") # "printf_support"
+# The native Vulkan compiler lowers chipStar's runtime helpers itself and
+# links libclc for the OpenCL builtins, so only the math glue goes in.
+if(CHIP_USE_NATIVE_VULKAN_SPIRV)
+  set(NON_OCML_SOURCES "vulkan_math")
+endif()
 
 # Compiles SOURCE treated as OpenCL to LLVM bitcode.
 function(add_opencl_bitcode TARGET SOURCE OUTPUT)
@@ -97,6 +102,11 @@ set(OCML_LIB_PATHS
   ${CMAKE_BINARY_DIR}/bitcode/ROCm-Device-Libs/oclc/oclc_daz_opt_off.lib.bc
   ${CMAKE_BINARY_DIR}/bitcode/ROCm-Device-Libs/oclc/oclc_isa_version_803.lib.bc
 )
+# OCML assumes AMDGPU intrinsic accuracy (llvm.log2 etc.) that Vulkan lacks.
+if(CHIP_USE_NATIVE_VULKAN_SPIRV)
+  set(OCML_LIBS)
+  set(OCML_LIB_PATHS)
+endif()
 
 add_custom_command(
   OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/BC/c_to_opencl.bc"
@@ -107,6 +117,19 @@ add_custom_command(
   COMMENT "Building c_to_opencl.bc"
   VERBATIM)
 list(APPEND DEPEND_LIST "${CMAKE_CURRENT_BINARY_DIR}/BC/c_to_opencl.bc")
+
+if(CHIP_USE_NATIVE_VULKAN_SPIRV)
+  add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/BC/vulkan_c_to_opencl.bc"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_c_to_opencl.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_c_to_opencl.def"
+    COMMAND "${CMAKE_CXX_COMPILER}" ${BITCODE_C_COMPILE_FLAGS}
+    -o "${CMAKE_CURRENT_BINARY_DIR}/BC/vulkan_c_to_opencl.bc"
+    -c "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_c_to_opencl.c"
+    COMMENT "Building vulkan_c_to_opencl.bc"
+    VERBATIM)
+  list(APPEND DEPEND_LIST "${CMAKE_CURRENT_BINARY_DIR}/BC/vulkan_c_to_opencl.bc")
+endif()
 
 # devicelib
 add_custom_command(
