@@ -1,4 +1,54 @@
 #include "spirv-extractor.hh"
+#include <cerrno>
+#include <spawn.h>
+#include <cstring>
+#include <iostream>
+#include <sys/wait.h>
+
+extern char **environ;
+
+// Run the wrapped test and return an exit status ctest can act on.
+//
+// The child is spawned from an argv vector rather than a command string, so an
+// argument keeps its exact bytes: Catch2 passes each test case name as one
+// argument and many contain spaces, which a shell would re-split.
+//
+// The wait status is decoded rather than returned: it carries the exit code in
+// its high bits, so returning it from main() truncates a child exit of 1 to 0.
+static int runWrapped(const std::string &fatbinaryPath,
+                      const std::vector<std::string> &additionalArgs) {
+  std::vector<char *> Argv;
+  Argv.reserve(additionalArgs.size() + 2);
+  Argv.push_back(const_cast<char *>(fatbinaryPath.c_str()));
+  for (const auto &Arg : additionalArgs)
+    Argv.push_back(const_cast<char *>(Arg.c_str()));
+  Argv.push_back(nullptr);
+
+  pid_t Pid;
+  // posix_spawn, not the p variant: fatbinaryPath is the path the extractor
+  // already opened and read, so searching PATH for it could run something else.
+  if (int Err = posix_spawn(&Pid, fatbinaryPath.c_str(), nullptr, nullptr,
+                            Argv.data(), environ)) {
+    // 127 alone is indistinguishable from a child that exits 127.
+    std::cerr << "spirv-extractor: could not run " << fatbinaryPath << ": "
+              << std::strerror(Err) << "\n";
+    return 127;
+  }
+
+  int Status;
+  while (waitpid(Pid, &Status, 0) < 0)
+    if (errno != EINTR) {
+      std::cerr << "spirv-extractor: could not wait for " << fatbinaryPath
+                << ": " << std::strerror(errno) << "\n";
+      return 127;
+    }
+
+  if (WIFEXITED(Status))
+    return WEXITSTATUS(Status);
+  if (WIFSIGNALED(Status))
+    return 128 + WTERMSIG(Status);
+  return 1;
+}
 
 int main(int argc, char *argv[]) {
   if (argc < 2) {
@@ -97,10 +147,7 @@ int main(int argc, char *argv[]) {
   if (spirvBinary.empty()) {
     if (checkForDoubles) {
       // Can't extract SPIR-V (e.g. hipRTC test) — run the binary anyway.
-      std::string command = fatbinaryPath;
-      for (const auto &arg : additionalArgs)
-        command += " " + arg;
-      return system(command.c_str());
+      return runWrapped(fatbinaryPath, additionalArgs);
     }
     std::cerr << "Failed to extract SPIR-V binary from the fatbinary: "
               << errorMsg << std::endl;
@@ -110,12 +157,41 @@ int main(int argc, char *argv[]) {
   auto spirvText = disassembleSPIRV(spirvBinary);
   bool hasDoubles = usesDoubles(spirvText);
 
+  // A linked executable holds one offload bundle per translation unit, and any
+  // one of them can be the one carrying fp64. spirvBinary above is only the
+  // first, which is all the other modes need, so widen the doubles answer to
+  // every module before it decides whether a test can run.
+  if (checkForDoubles && !hasDoubles) {
+    const char *BufEnd = buffer.data() + buffer.size();
+    for (const void *Bundle :
+         collectOffloadBundles(buffer.data(), buffer.size())) {
+      std::string BundleErr;
+      // Bound the descriptor walk by what is left after this bundle starts:
+      // the walk is driven by counts and sizes read out of the buffer, so a
+      // truncated trailing bundle would otherwise run off the end.
+      size_t Remaining = BufEnd - static_cast<const char *>(Bundle);
+      auto Module = extractSPIRVModule(Bundle, BundleErr, Remaining);
+      if (Module.empty()) {
+        // Not "no fp64": the module could not be read. Say so, because the
+        // caller is about to decide whether a test may run.
+        std::cerr << "spirv-extractor: could not read a device module while "
+                     "checking for doubles: "
+                  << BundleErr << std::endl;
+        continue;
+      }
+      if (usesDoubles(disassembleSPIRV(Module))) {
+        hasDoubles = true;
+        break;
+      }
+    }
+  }
+
   int exitCode = 0;
   
   // Perform SPIR-V validation if requested (lighter weight than full verify)
   if (validateSpirv) {
     std::cout << "Running SPIR-V validator..." << std::endl;
-    spv_context context = spvContextCreate(SPV_ENV_UNIVERSAL_1_1);
+    spv_context context = spvContextCreate(SPV_ENV_UNIVERSAL_1_6);
     spv_diagnostic diagnostic = nullptr;
 
     spv_result_t validationResult = spvValidateBinary(
@@ -164,14 +240,8 @@ int main(int argc, char *argv[]) {
   if (checkForDoubles) {
     if (hasDoubles)
       std::cout << "HIP_SKIP_THIS_TEST: Kernel uses doubles" << std::endl;
-    else {
-      // Execute the binary with additional arguments
-      std::string command = fatbinaryPath;
-      for (const auto &arg : additionalArgs) {
-        command += " " + arg;
-      }
-      exitCode = system(command.c_str());
-    }
+    else
+      exitCode = runWrapped(fatbinaryPath, additionalArgs);
     return exitCode;
   }
 
@@ -185,32 +255,12 @@ int main(int argc, char *argv[]) {
     outputFileText << spirvText;
     outputFileText.close();
 
-    spv_context context = spvContextCreate(SPV_ENV_UNIVERSAL_1_1);
-    spv_binary binary = nullptr;
-    spv_diagnostic diagnostic = nullptr;
-
-    spv_result_t result = spvTextToBinary(
-        context, spirvText.data(), spirvText.size(), &binary, &diagnostic);
-
-    if (result == SPV_SUCCESS) {
-      std::ofstream outputFileBinary(outputFilename, std::ios::binary);
-      if (!outputFileBinary) {
-        std::cerr << "Failed to open file: " << outputFilename << std::endl;
-        return 1;
-      }
-      outputFileBinary.write(reinterpret_cast<const char *>(binary->code),
-                             binary->wordCount * sizeof(uint32_t));
-      outputFileBinary.close();
-      spvBinaryDestroy(binary);
-    } else {
-      std::cerr << "Failed to assemble SPIR-V: " << diagnostic->error
-                << std::endl;
-      spvDiagnosticDestroy(diagnostic);
-      spvContextDestroy(context);
+    std::ofstream outputFileBinary(outputFilename, std::ios::binary);
+    if (!outputFileBinary) {
+      std::cerr << "Failed to open file: " << outputFilename << std::endl;
       return 1;
     }
-
-    spvContextDestroy(context);
+    outputFileBinary.write(spirvBinary.data(), spirvBinary.size());
   } else {
     std::cout << spirvText << std::endl;
   }

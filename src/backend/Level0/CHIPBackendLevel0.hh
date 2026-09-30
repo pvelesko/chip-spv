@@ -30,6 +30,8 @@
 #include "../src/common.hh"
 #include "zeHipErrorConversion.hh"
 #include <algorithm>
+#include <atomic>
+#include <map>
 
 static thread_local ze_result_t
     zeStatus; // instantiated in CHIPBackendLevel0.cc
@@ -51,6 +53,17 @@ class CHIPKernelLevel0;
 
 class CHIPExecItemLevel0 : public chipstar::ExecItem {
   CHIPKernelLevel0 *ChipKernel_ = nullptr;
+  // When true, ChipKernel_ is a per-exec-item clone (its own
+  // ze_kernel_handle_t) owned by this exec item and destroyed on teardown.
+  // HIP graph kernel nodes use this so that two nodes launching the same
+  // kernel bind their arguments to independent handles instead of clobbering
+  // one shared handle (issue #782).
+  bool OwnsKernel_ = false;
+
+  // Replace ChipKernel_ with an owned, independent clone (its own
+  // ze_kernel_handle_t) so this exec item binds arguments to a private handle
+  // (issue #782). Defined out-of-line because it uses CHIPKernelLevel0::clone.
+  void takeOwnedKernelClone();
 
 public:
   CHIPExecItemLevel0(const CHIPExecItemLevel0 &Other)
@@ -65,13 +78,14 @@ public:
                      hipStream_t ChipQueue)
       : ExecItem(GirdDim, BlockDim, SharedMem, ChipQueue) {}
 
-  virtual ~CHIPExecItemLevel0() override {}
+  virtual ~CHIPExecItemLevel0() override {
+    if (OwnsKernel_)
+      delete ChipKernel_;
+  }
 
   virtual void setupAllArgs() override;
-  virtual chipstar::ExecItem *clone() const override {
-    auto NewExecItem = new CHIPExecItemLevel0(*this);
-    return NewExecItem;
-  }
+  virtual chipstar::ExecItem *clone() const override;
+  virtual void useIndependentKernelHandle() override { takeOwnedKernelClone(); }
 
   void setKernel(chipstar::Kernel *Kernel) override;
   chipstar::Kernel *getKernel() override;
@@ -92,6 +106,13 @@ private:
   // The handler of event_pool and event
   ze_event_handle_t Event_;
   ze_event_pool_handle_t EventPoolHandle_;
+
+  // Per-record "slots" (fixes #1258): each hipEventRecord re-record allocates a
+  // fresh L0 event handle and retires the previous (pool, event) pair here,
+  // kept alive until its signal completes, instead of zeEventHostReset-ing one
+  // shared handle that may still be referenced by in-flight barriers from a
+  // circular stream-wait dependency (that reset SEGVs inside the L0 driver).
+  std::vector<std::pair<ze_event_pool_handle_t, ze_event_handle_t>> RetiredSlots_;
 
   std::vector<ActionFn> Actions_;
 
@@ -122,6 +143,12 @@ public:
   virtual void hostSignal() override;
 
   void reset();
+
+  /// Re-record path (fixes #1258): retire the current L0 event handle (kept
+  /// alive in RetiredSlots_) and swap in a fresh one instead of resetting the
+  /// shared handle in place. Reaps already-completed retired slots. Used by
+  /// CHIPQueueLevel0::recordEvent for hipEventRecord re-records.
+  void reRecordReset();
 
   ze_event_handle_t &peek();
 
@@ -354,6 +381,14 @@ protected:
 
   virtual bool query() override;
 
+  // Marker query() keeps on the command list, which other streams may share.
+  ze_event_pool_handle_t QueryEventPool_ = nullptr;
+  ze_event_handle_t QueryEvent_ = nullptr;
+  bool QueryArmed_ = false;
+  uint64_t QuerySubmitCount_ = 0;
+  // The command list was handed to the application; SubmitCount_ cannot see its appends.
+  std::atomic<bool> NativeHandlesEscaped_{false};
+
   // In case of interop queue may or may not be owned by chipStar
   // Ownership indicator helps during teardown
   bool zeCmdQOwnership_{true};
@@ -380,17 +415,64 @@ protected:
 
 public:
   void recordEvent(chipstar::Event *ChipEvent) override;
-  std::mutex CommandListMtx; /// prevent simultaneous access to ZeCmdListImm_
+  // Shared mutex for ZeCmdListImm_. On single-hardware-queue devices (e.g.
+  // Intel Arc B570, numQueues=1), all HIP streams share one L0 immediate CL
+  // handle, so they share this mutex. On multi-queue devices each stream gets
+  // its own private mutex via make_shared in initializeCmdListImm().
+  std::shared_ptr<std::mutex> CmdListMtx_;
   std::atomic<bool> IsEmptyQueue_{true};
+  // Number of times work was submitted to this queue.
+  std::atomic<uint64_t> SubmitCount_{0};
+  void markBusy() {
+    IsEmptyQueue_.store(false);
+    SubmitCount_.fetch_add(1);
+  }
+  // Tracks whether zeCommandListHostSynchronize has been called at least once
+  // on this queue's command list(s). Intel Arc L0 driver requires one full
+  // blocking sync to transition a command list to "idle" state that allows
+  // subsequent kernels to execute in parallel across command lists.
+  std::atomic<bool> CmdListInitialized_{false};
   /// Cross-queue sync marker events that must be kept alive until this queue
   /// is finished. Without this, checkEvents() may recycle their underlying
   /// ze_events while GPU operations on this queue still reference them.
   std::vector<std::shared_ptr<chipstar::Event>> PendingCrossQueueDeps_;
+
+  // this returns whether or not a queue is empty.
+  // if the per-queue atomic tracking isEmpty is true, return
+  // true since it is only true at initial state or after we've confirmed via L0 call.
+  // if it is false, the queue may be busy or it may have finished
+  // all work, so we check with a call to zeCommandListHostSynchronize(ZeCmdListImm_, 0).
+  // because there is a possible race due to the gap between reading this value and returning
+  // (a concurrent submitter could IsEmptyQueue_.store(false) between the L0 check
+  // and a IsEmptyQueue_.store(true)
+  // resulting in setting IsEmptyQueue_ true while there actually is work in the queue)
+  // we use the command list lock (CmdListMtx_)
+  // if we can't get the lock, someone is submitting, so return false.
+  // if we get the lock, check if it's really busy with zeCommandListHostSynchronize.
+  // if it's true (not busy), update IsEmptyQueue_ and return true. else, return false.
   bool isEmptyQueue() override {
-#ifndef CHIP_LZ_API_QUERY_QUEUE_EMPTY
-    return IsEmptyQueue_.load();
-#else
+#ifdef CHIP_LZ_API_QUERY_QUEUE_EMPTY
+    // Fast path: an idle queue (IsEmptyQueue_ == true) is definitively empty,
+    // so return without a Level Zero round-trip. This keeps a null-stream launch
+    // that scans N idle streams at O(1) per stream instead of O(N)
+    // zeCommandListHostSynchronize() calls (see tests/benchmarks/manySmallKernels).
+    if (IsEmptyQueue_.load(std::memory_order_relaxed))
+      return true;
     return (zeCommandListHostSynchronize(ZeCmdListImm_, 0) == ZE_RESULT_SUCCESS);
+#else
+    bool is_empty = IsEmptyQueue_.load(std::memory_order_relaxed);
+    if (is_empty) return true;
+    std::unique_lock<std::mutex> lock_guard(*CmdListMtx_, std::try_to_lock);
+    if (!lock_guard.owns_lock()) {
+      // Submitter holds the lock; conservatively say busy.
+      return false;
+    }
+    // Re-check under lock (another thread may have just updated to true while waiting for the lock)
+    is_empty = IsEmptyQueue_.load(std::memory_order_relaxed);
+    if (is_empty) return true;
+    is_empty = (zeCommandListHostSynchronize(ZeCmdListImm_, 0) == ZE_RESULT_SUCCESS);
+    if (is_empty) IsEmptyQueue_.store(true, std::memory_order_relaxed);
+    return is_empty;
 #endif
   }
 
@@ -560,6 +642,9 @@ public:
       size_t Size, size_t Alignment, hipMemoryType MemTy,
       chipstar::HostAllocFlags Flags = chipstar::HostAllocFlags()) override;
 
+  void importHostMemory(void *HostPtr, size_t SizeBytes) override;
+  void releaseHostMemory(void *HostPtr) override;
+  
   bool isAllocatedPtrMappedToVM(void *Ptr) override { return false; } // TODO
   void freeImpl(void *Ptr) override;
   ze_context_handle_t &get() { return ZeCtx; }
@@ -626,6 +711,12 @@ protected:
   CHIPDeviceLevel0 *Device;
 
 public:
+  // Tracks whether zeKernelSetIndirectAccess has already been called on
+  // this kernel handle. The L0 driver appears to serialize this call
+  // globally; calling it once per kernel instead of once per launch
+  // avoids contention/deadlocks with high launch rates.
+  std::atomic<bool> IndirectAccessSet_{false};
+
   CHIPKernelLevel0();
 
   virtual ~CHIPKernelLevel0() {
@@ -642,6 +733,13 @@ public:
                    CHIPModuleLevel0 *Parent);
   ze_kernel_handle_t &get();
 
+  /// Create an independent copy of this kernel with its own
+  /// ze_kernel_handle_t (a fresh handle from the parent module, as Level Zero
+  /// has no zeKernelClone) so that argument bindings on the clone do not affect
+  /// this kernel's handle. The caller owns the returned object and must delete
+  /// it. Used by HIP graph kernel nodes (issue #782).
+  CHIPKernelLevel0 *clone();
+
   CHIPModuleLevel0 *getModule() override { return Module; }
   const CHIPModuleLevel0 *getModule() const override { return Module; }
   virtual hipError_t getAttributes(hipFuncAttributes *Attr) override;
@@ -657,31 +755,24 @@ public:
                     ze_sampler_handle_t TheSampler)
       : chipstar::Texture(ResDesc), Image(TheImage), Sampler(TheSampler) {}
 
+  // Destructors are implicitly noexcept: an escaping exception during stack
+  // unwinding would call std::terminate. Skip null handles and never let a
+  // failure propagate out of the destructor (log instead of throw). See #1256.
   virtual ~CHIPTextureLevel0() {
-    destroyImage(Image);
-    destroySampler(Sampler);
+    if (Image) {
+      zeStatus = zeImageDestroy(Image);
+      if (zeStatus != ZE_RESULT_SUCCESS)
+        logError("zeImageDestroy failed in ~CHIPTextureLevel0: {}", zeStatus);
+    }
+    if (Sampler) {
+      zeStatus = zeSamplerDestroy(Sampler);
+      if (zeStatus != ZE_RESULT_SUCCESS)
+        logError("zeSamplerDestroy failed in ~CHIPTextureLevel0: {}", zeStatus);
+    }
   }
 
   ze_image_handle_t getImage() const { return Image; }
   ze_sampler_handle_t getSampler() const { return Sampler; }
-
-  // Destroy the LZ image object
-  static void destroyImage(ze_image_handle_t Handle) {
-    // The application must not call this function from
-    // simultaneous threads with the same image handle.
-    // Done via destructor should not be called from multiple threads
-    zeStatus = zeImageDestroy(Handle);
-    CHIPERR_CHECK_LOG_AND_THROW(hipErrorTbd);
-  }
-
-  // Destroy the LZ sampler object
-  static void destroySampler(ze_sampler_handle_t Handle) {
-    // The application must not call this function
-    // from simultaneous threads with the same sampler handle.
-    // Done via destructor should not be called from multiple threads
-    zeStatus = zeSamplerDestroy(Handle);
-    CHIPERR_CHECK_LOG_AND_THROW(hipErrorTbd);
-  }
 };
 
 class CHIPDeviceLevel0 : public chipstar::Device {
@@ -703,8 +794,17 @@ class CHIPDeviceLevel0 : public chipstar::Device {
   ze_command_list_desc_t CommandListComputeDesc_;
   ze_command_list_desc_t CommandListCopyDesc_;
 
-  ze_command_list_handle_t ZeCmdListComputeImm_;
-  ze_command_list_handle_t ZeCmdListCopyImm_;
+  // Shared immediate command lists, one per hardware queue (ordinal, index).
+  // On devices with numQueues==1, all HIP streams map to the same hardware
+  // queue and therefore share one CL handle. This eliminates the ~0.45ms
+  // per-call overhead of zeCommandListAppendLaunchKernel when switching
+  // between different CL handles on Intel Arc.
+  struct SharedImmCL {
+    ze_command_list_handle_t Handle = nullptr;
+    std::shared_ptr<std::mutex> Mutex;
+  };
+  std::map<uint64_t, SharedImmCL> SharedImmCLs_;
+  std::mutex SharedImmCLsMapMtx_;
   void initializeQueueGroupProperties();
 
   void initializeCopyQueue_();
@@ -714,6 +814,10 @@ class CHIPDeviceLevel0 : public chipstar::Device {
 
   // Filled if ZE_extension_float_atomics extension is supported.
   ze_float_atomic_ext_properties_t FpAtomicProps_;
+
+  // Access capabilities (RW, ATOMIC, CONCURRENT) of each USM kind, from
+  // zeDeviceGetMemoryAccessProperties.
+  ze_device_memory_access_properties_t MemAccessProps_;
 
   CHIPDeviceLevel0(ze_device_handle_t ZeDev, CHIPContextLevel0 *ChipCtx,
                    int Idx);
@@ -739,6 +843,10 @@ public:
   getNextComputeQueueDesc(int Priority = L0_DEFAULT_QUEUE_PRIORITY);
   ze_command_queue_desc_t
   getNextCopyQueueDesc(int Priority = L0_DEFAULT_QUEUE_PRIORITY);
+  ze_command_list_handle_t
+  getOrCreateSharedImmCL(ze_context_handle_t ZeCtx,
+                         const ze_command_queue_desc_t &QDesc,
+                         std::shared_ptr<std::mutex> &OutMtx);
 
   static CHIPDeviceLevel0 *create(ze_device_handle_t ZeDev,
                                   CHIPContextLevel0 *ChipCtx, int Idx);
@@ -776,6 +884,11 @@ public:
 
   const ze_float_atomic_ext_properties_t &getFpAtomicProps() const noexcept {
     return FpAtomicProps_;
+  }
+
+  const ze_device_memory_access_properties_t &
+  getMemAccessProps() const noexcept {
+    return MemAccessProps_;
   }
 };
 

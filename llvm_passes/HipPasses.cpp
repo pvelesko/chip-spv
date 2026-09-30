@@ -18,6 +18,7 @@
 #include "HipCleanup.h"
 #include "HipDefrost.h"
 #include "HipDynMem.h"
+#include "HipStripDebugInfo.h"
 #include "HipStripUsedIntrinsics.h"
 #include "HipWarps.h"
 #include "HipPrintf.h"
@@ -27,13 +28,28 @@
 #include "HipKernelArgSpiller.h"
 #include "HipLowerZeroLengthArrays.h"
 #include "HipSanityChecks.h"
+#include "LLVMSPIRV.h"
 #include "HipLowerSwitch.h"
 #include "HipLowerMemset.h"
+#include "HipLowerHintIntrinsics.h"
+#include "HipLowerFPAtomicMinMax.h"
+#include "HipLowerRoundIntrinsics.h"
+#include "HipLowerSubwordAtomics.h"
+#include "HipLowerVolatileAccesses.h"
 #include "HipIGBADetector.h"
+#include "HipFunctionPointerAS.h"
 #include "HipPromoteInts.h"
+#include "HipLowerOverflowIntrinsics.h"
+#include "HipLowerPointerVectors.h"
 #include "HipSpirvFunctionReorderPass.h"
 #include "HipVerify.h"
+#include "HipCanonicalizeGEP.h"
+#include "HipCoalesceDuplicatePhiPreds.h"
 
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/IR/InstIterator.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "PassPluginCompat.h"
@@ -49,24 +65,40 @@
 
 using namespace llvm;
 
-// A predicate for internalize pass
+// A predicate for internalize pass. Returning true means preserve GV.
 //
-// This internalizes all non-kernel functions so unused ones get removed by DCE
-// pass.
-static bool internalizeSPIRVFunctions(const GlobalValue &GV) {
+// Internalizes all non-kernel functions so unused ones get removed by DCE
+// pass, and the Itanium vtable family (_ZTV vtable, _ZTT VTT, _ZTC construction
+// vtable). Clang emits those for every polymorphic class that appears in device
+// code, and an explicit instantiation gives them weak_odr linkage, which
+// GlobalDCE alone must keep. A device module is self-contained, so nothing can
+// link against them and the unreferenced ones can go; left in, a dead table
+// whose virtual base offsets are inttoptr constants aborts llvm-spirv
+// (CHIP-SPV/chipStar#1382).
+static bool preserveDuringInternalize(const GlobalValue &GV) {
+  if (isa<GlobalVariable>(GV)) {
+    StringRef Name = GV.getName();
+    return !(Name.starts_with("_ZTV") || Name.starts_with("_ZTT") ||
+             Name.starts_with("_ZTC"));
+  }
   const auto *F = dyn_cast<Function>(&GV);
-  // Returning true means preserve GV.
   return !(F && F->getCallingConv() == CallingConv::SPIR_FUNC);
 }
 
-// A pass that removes noinline and optnone attributes from functions.
+// Strip compiler-generated optnone+noinline pairs (debug builds) but
+// preserve user-annotated __attribute__((noinline)) so it propagates
+// to SPIR-V FunctionControl=DontInline.  When both optnone and
+// noinline are present, they came from the compiler; noinline alone
+// means the user asked for it explicitly.
 class RemoveNoInlineOptNoneAttrsPass
     : public PassInfoMixin<RemoveNoInlineOptNoneAttrsPass> {
 public:
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
     for (auto &F : M) {
-      F.removeFnAttr(Attribute::NoInline);
-      F.removeFnAttr(Attribute::OptimizeNone);
+      if (F.hasFnAttribute(Attribute::OptimizeNone)) {
+        F.removeFnAttr(Attribute::NoInline);
+        F.removeFnAttr(Attribute::OptimizeNone);
+      }
     }
     return PreservedAnalyses::none();
   }
@@ -103,6 +135,211 @@ public:
   static bool isRequired() { return true; }
 };
 
+// WORKAROUND(CHIP-SPV/chipStar#1691, llvm/llvm-project#198078): clang hoists a
+// local aggregate initializer taking __shared__ addresses into a constant
+// global, where IGC reads them as null and PoCL aborts. Remove when a clang fix
+// that initializes such locals in the function lands.
+class HipSharedAddrLocalInitPass
+    : public PassInfoMixin<HipSharedAddrLocalInitPass> {
+  static bool refersToShared(const Value *V) {
+    if (const auto *GV = dyn_cast<GlobalValue>(V))
+      return GV->getAddressSpace() == SPIRV_WORKGROUP_AS;
+    const auto *C = dyn_cast<Constant>(V);
+    return C && any_of(C->operands(),
+                       [](const Use &Op) { return refersToShared(Op.get()); });
+  }
+
+  // Stores C to Ptr, element by element where it refers to shared memory.
+  static void storeInit(Constant *C, AllocaInst *Ptr,
+                        SmallVectorImpl<Value *> &Idx, IRBuilder<> &B) {
+    if (refersToShared(C) &&
+        (isa<ConstantArray>(C) || isa<ConstantStruct>(C))) {
+      for (unsigned I = 0; I < C->getNumOperands(); ++I) {
+        Idx.push_back(B.getInt32(I));
+        storeInit(C->getAggregateElement(I), Ptr, Idx, B);
+        Idx.pop_back();
+      }
+      return;
+    }
+    Type *Ty = Ptr->getAllocatedType();
+    uint64_t Off =
+        Ptr->getModule()->getDataLayout().getIndexedOffsetInType(Ty, Idx);
+    B.CreateAlignedStore(C, B.CreateInBoundsGEP(Ty, Ptr, Idx),
+                         commonAlignment(Ptr->getAlign(), Off));
+  }
+
+public:
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
+    const DataLayout &DL = M.getDataLayout();
+    SmallSetVector<GlobalVariable *, 4> Inits;
+    for (Function &F : M)
+      for (Instruction &I : make_early_inc_range(instructions(F))) {
+        auto *Copy = dyn_cast<MemCpyInst>(&I);
+        if (!Copy)
+          continue;
+        Value *Src = Copy->getRawSource();
+        APInt Off(DL.getIndexTypeSizeInBits(Src->getType()), 0);
+        auto *GV = dyn_cast<GlobalVariable>(
+            Src->stripAndAccumulateConstantOffsets(DL, Off, true));
+        if (!GV || !GV->isConstant() || !GV->hasDefinitiveInitializer() ||
+            !refersToShared(GV->getInitializer()))
+          continue;
+        // Copy from a function-local instance of the initializer instead.
+        IRBuilder<> B(&F.getEntryBlock(),
+                      F.getEntryBlock().getFirstInsertionPt());
+        AllocaInst *Init = B.CreateAlloca(GV->getValueType());
+        B.SetInsertPoint(Copy);
+        SmallVector<Value *, 4> Idx{B.getInt32(0)};
+        storeInit(GV->getInitializer(), Init, Idx, B);
+        Value *NewSrc = B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), Init,
+                                                     Off.getZExtValue());
+        B.CreateMemCpy(Copy->getRawDest(), Copy->getDestAlign(), NewSrc,
+                       commonAlignment(Init->getAlign(), Off.getZExtValue()),
+                       Copy->getLength(), Copy->isVolatile());
+        Copy->eraseFromParent();
+        Inits.insert(GV);
+      }
+    for (GlobalVariable *GV : Inits) {
+      GV->removeDeadConstantUsers();
+      if (GV->use_empty() && GV->hasLocalLinkage())
+        GV->eraseFromParent();
+    }
+    return Inits.empty() ? PreservedAnalyses::all() : PreservedAnalyses::none();
+  }
+  static bool isRequired() { return true; }
+};
+
+#ifdef CHIP_LLVM_USE_INTERGRATED_SPIRV
+// WORKAROUND(CHIP-SPV/chipStar#1654, llvm/llvm-project#206404): the in-tree
+// backend puts ContractionOff on every kernel unless opencl.enable.FP_CONTRACT
+// is present, llvm-spirv only on kernels reaching an op that forbids
+// contraction. Remove when the backend's default decides from the operations.
+class HipFPContractPass : public PassInfoMixin<HipFPContractPass> {
+  // What makes llvm-spirv disable contraction for the enclosing function.
+  static bool forbidsContraction(const Instruction &I) {
+    if (auto *B = dyn_cast<BinaryOperator>(&I))
+      return (B->getOpcode() == Instruction::FAdd ||
+              B->getOpcode() == Instruction::FSub) &&
+             !B->hasAllowContract();
+    auto *CI = dyn_cast<CallInst>(&I);
+    if (!CI || isa<IntrinsicInst>(CI))
+      return false;
+    const Function *Callee = CI->getCalledFunction();
+    if (!Callee)
+      return true;
+    if (!Callee->isDeclaration())
+      return false;
+    // Builtins are named printf, __spirv_*, or mangled as _Z<len><name>.
+    StringRef Name = Callee->getName();
+    if (Name.size() > 2 && Name.starts_with("_Z") && isDigit(Name[2]))
+      Name = Name.drop_front(2).ltrim("0123456789");
+    else if (Name != "printf" && !Name.starts_with("__spirv_"))
+      return true;
+    // Any other __ name is a chipStar runtime helper, not a builtin.
+    return Name.starts_with("__") && !Name.starts_with("__spirv_");
+  }
+
+public:
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
+    for (const Function &F : M)
+      for (const Instruction &I : instructions(F))
+        if (forbidsContraction(I))
+          return PreservedAnalyses::all();
+    M.getOrInsertNamedMetadata("opencl.enable.FP_CONTRACT");
+    return PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
+#endif
+
+// WORKAROUND(CHIP-SPV/chipStar#1703, no upstream report): the SPIR-V backend
+// indexes an initializer's byte offset into the global's own type. Remove
+// when it offsets by bytes.
+static bool retypeToBytes(GlobalVariable &GV) {
+  Type *I8 = Type::getInt8Ty(GV.getContext());
+  if (auto *Ty = dyn_cast<ArrayType>(GV.getValueType());
+      Ty && Ty->getElementType() == I8)
+    return true;
+  if (!GV.hasLocalLinkage() || !GV.hasDefinitiveInitializer())
+    return false;
+  const DataLayout &DL = GV.getParent()->getDataLayout();
+  Constant *Init = GV.getInitializer();
+  auto *Ty = ArrayType::get(I8, DL.getTypeAllocSize(GV.getValueType()));
+  Constant *Bytes = ConstantAggregateZero::get(Ty);
+  if (!Init->isNullValue()) {
+    // The most constituents one OpConstantComposite can hold.
+    if (Ty->getNumElements() > 65532)
+      return false;
+    SmallVector<uint8_t, 64> Data;
+    for (uint64_t I = 0; I < Ty->getNumElements(); ++I) {
+      // Null for a byte of a pointer or of undef.
+      auto *B = dyn_cast_or_null<ConstantInt>(
+          ConstantFoldLoadFromConst(Init, I8, APInt(64, I), DL));
+      if (!B)
+        return false;
+      Data.push_back(B->getZExtValue());
+    }
+    Bytes = ConstantDataArray::get(GV.getContext(), Data);
+  }
+  if (!GV.getAlign())
+    GV.setAlignment(DL.getPreferredAlign(&GV));
+  GV.replaceInitializer(Bytes);
+  return true;
+}
+
+// WORKAROUND(CHIP-SPV/chipStar#1693, CHIP-SPV/chipStar#1695; no upstream
+// reports): in a global initializer, the in-tree SPIR-V backend aborts on a
+// getelementptr over an addrspacecast of a global, and IGC stores 0 for it.
+// Rewrites it as an addrspacecast of the getelementptr. Remove when both
+// handle the original and #1703 is fixed.
+class HipOffsetBeforeCastPass : public PassInfoMixin<HipOffsetBeforeCastPass> {
+public:
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
+    // Literal indices: rewriting one entry then cannot change, and free,
+    // another.
+    auto IsOffset = [](User *U, User *CE) {
+      auto *GEP = dyn_cast<GEPOperator>(U);
+      return GEP && isa<ConstantExpr>(U) && GEP->getPointerOperand() == CE &&
+             all_of(GEP->indices(),
+                    [](Value *Idx) { return isa<ConstantInt>(Idx); });
+    };
+    auto IsCast = [](User *U) {
+      auto *CE = dyn_cast<ConstantExpr>(U);
+      return CE && CE->getOpcode() == Instruction::AddrSpaceCast;
+    };
+    SmallVector<std::pair<GlobalVariable *, GEPOperator *>, 8> Work;
+    for (GlobalVariable &GV : M.globals()) {
+      GV.removeDeadConstantUsers();
+      // Retype GV only if a rewrite below reaches a constant.
+      if (none_of(GV.users(), [&](User *CE) {
+            return IsCast(CE) && any_of(CE->users(), [&](User *U) {
+                     return IsOffset(U, CE) &&
+                            !all_of(U->users(), IsaPred<Instruction>);
+                   });
+          }) ||
+          !retypeToBytes(GV))
+        continue;
+      for (User *CE : GV.users())
+        if (IsCast(CE))
+          for (User *U : CE->users())
+            if (IsOffset(U, CE))
+              Work.emplace_back(&GV, cast<GEPOperator>(U));
+    }
+    for (auto [GV, GEP] : Work) {
+      SmallVector<Value *, 4> Idx(GEP->idx_begin(), GEP->idx_end());
+      Constant *Offset = ConstantExpr::getGetElementPtr(
+          GEP->getSourceElementType(), GV, Idx, GEP->getNoWrapFlags(),
+          GEP->getInRange());
+      // Direct instruction operands compile fine with the original shape.
+      GEP->replaceUsesWithIf(
+          ConstantExpr::getAddrSpaceCast(Offset, GEP->getType()),
+          [](Use &U) { return !isa<Instruction>(U.getUser()); });
+    }
+    return Work.empty() ? PreservedAnalyses::all() : PreservedAnalyses::none();
+  }
+  static bool isRequired() { return true; }
+};
+
 // Insert a helper that adds a pass with HipVerify validation
 template <typename PassT>
 static void
@@ -119,7 +356,16 @@ addPassWithVerification(ModulePassManager &MPM, PassT &&P,
 
 static void addFullLinkTimePasses(ModulePassManager &MPM) {
   MPM.addPass(HipFixOpenCLMDPass()); // must be first or else we get OCL Version mismatch
-  
+
+#ifndef CHIP_KEEP_KERNEL_DEBUG_INFO
+  // No SPIR-V producer emits debug information our consumers accept, so drop it
+  // up front unless the build opted in (-DCHIP_KEEP_KERNEL_DEBUG_INFO=ON, which
+  // only makes sense on Intel Data Center GPU Max). Doing it here also spares
+  // the passes below from keeping debug metadata consistent as they erase
+  // globals and functions. See HipStripDebugInfo.cpp.
+  MPM.addPass(HipStripDebugInfoPass());
+#endif
+
   // Clear any previous results at the start of a new pipeline
   HipVerifyPass::clearResults();
 
@@ -136,6 +382,10 @@ static void addFullLinkTimePasses(ModulePassManager &MPM) {
   addPassWithVerification(MPM, RemoveNoInlineOptNoneAttrsPass(), "RemoveNoInlineOptNoneAttrsPass");
 
   addPassWithVerification(MPM, createModuleToFunctionPassAdaptor(HipLowerSwitchPass()), "HipLowerSwitchPass");
+
+  // Before HipDynMem, which cannot rewrite a shared address in an initializer.
+  addPassWithVerification(MPM, HipSharedAddrLocalInitPass(),
+                          "HipSharedAddrLocalInitPass");
 
   // Run a collection of passes run at device link time.
   addPassWithVerification(MPM, HipDynMemExternReplaceNewPass(), "HipDynMemExternReplaceNewPass");
@@ -165,14 +415,29 @@ static void addFullLinkTimePasses(ModulePassManager &MPM) {
   addPassWithVerification(MPM, HipPrintfToOpenCLPrintfPass(), "HipPrintfToOpenCLPrintfPass");
   addPassWithVerification(MPM, createModuleToFunctionPassAdaptor(HipDefrostPass()), "HipDefrostPass");
   addPassWithVerification(MPM, createModuleToFunctionPassAdaptor(HipLowerMemsetPass()), "HipLowerMemsetPass");
+  addPassWithVerification(MPM, createModuleToFunctionPassAdaptor(HipLowerFPAtomicMinMaxPass()), "HipLowerFPAtomicMinMaxPass");
+  // OpenCL SPIR-V consumers implement 32 and 64 bit atomics only; rewrite 8
+  // and 16 bit ones onto their containing word. Runs after the fmin / fmax
+  // expansion so the i16 cmpxchg it produces for half gets lowered too, and
+  // before InferAddressSpaces so the word address it forms with a GEP is
+  // still narrowed to the global or local address space.
+  addPassWithVerification(MPM, createModuleToFunctionPassAdaptor(HipLowerSubwordAtomicsPass()), "HipLowerSubwordAtomicsPass");
+  addPassWithVerification(MPM, HipLowerRoundIntrinsicsPass(), "HipLowerRoundIntrinsicsPass");
   addPassWithVerification(MPM, HipAbortPass(), "HipAbortPass");
   // This pass must appear after HipDynMemExternReplaceNewPass.
   addPassWithVerification(MPM, HipGlobalVariablesPass(), "HipGlobalVariablesPass");
+  addPassWithVerification(MPM, HipOffsetBeforeCastPass(), "HipOffsetBeforeCastPass");
 
   addPassWithVerification(MPM, HipWarpsPass(), "HipWarpsPass");
 
   // This pass must be last one that modifies kernel parameter list.
   addPassWithVerification(MPM, HipKernelArgSpillerPass(), "HipKernelArgSpillerPass");
+
+  // After every pass that can create a copy, so a zero length one it emits is
+  // erased too, and before the DCE below, so the address computations feeding
+  // an erased llvm.prefetch go with it.
+  addPassWithVerification(MPM, HipLowerHintIntrinsicsPass(),
+                          "HipLowerHintIntrinsicsPass");
 
   // Remove dead code left over by HIP lowering passes and kept alive by
   // llvm.used and llvm.compiler.used intrinsic variable.
@@ -180,20 +445,65 @@ static void addFullLinkTimePasses(ModulePassManager &MPM) {
 
   // Internalize all __device__ functions (spir_kernels) so the follow-up DCE
   // passes cleans-ups the unused ones.
-  addPassWithVerification(MPM, InternalizePass(internalizeSPIRVFunctions), "InternalizePass");
+  addPassWithVerification(MPM, InternalizePass(preserveDuringInternalize), "InternalizePass");
   addPassWithVerification(MPM, createModuleToFunctionPassAdaptor(DCEPass()), "DCEPass");
   addPassWithVerification(MPM, GlobalDCEPass(), "GlobalDCEPass");
 
   addPassWithVerification(MPM, createModuleToFunctionPassAdaptor(InferAddressSpacesPass(4)), "InferAddressSpacesPass");
 
+  // Move vtable function pointers into the generic address space. Runs after
+  // inlining and InferAddressSpaces so it only sees the indirect calls that
+  // genuinely survive into the SPIR-V module.
+  addPassWithVerification(MPM, HipFunctionPointerASPass(), "HipFunctionPointerASPass");
+
   addPassWithVerification(MPM, HipIGBADetectorPass(), "HipIGBADetectorPass");
+
+  // A volatile global access carries CUDA's ld.volatile / st.volatile meaning
+  // (an access that bypasses the core's cache) and SPIR-V's Volatile memory
+  // operand does not, so rewrite them into relaxed device-scope atomics, which
+  // the SPIR-V producers emit as OpAtomicLoad / OpAtomicStore.
+  addPassWithVerification(MPM, createModuleToFunctionPassAdaptor(HipLowerVolatileAccessesPass()), "HipLowerVolatileAccessesPass");
 
   // Fix InvalidBitWidth errors due to non-standard integer types
   addPassWithVerification(MPM, HipPromoteIntsPass(), "HipPromoteIntsPass");
 
+  // Expand llvm.{u,s}mul.with.overflow, which clang emits for device-side
+  // array-new and __builtin_mul_overflow. Left in place, the backend lane
+  // emits OpUMulExtended, which IGC rejects with an undefined reference to
+  // _Z20__spirv_UMulExtendedll, and the translator lane cannot lower the
+  // signed intrinsic at all. Either failure takes down every kernel in the
+  // module.
+  addPassWithVerification(MPM, HipLowerOverflowIntrinsicsPass(),
+                          "HipLowerOverflowIntrinsicsPass");
+
+  // WORKAROUND(CHIP-SPV/chipStar#1577, llvm/llvm-project#217948): LLVM 23's
+  // SROA folds a struct of pointers into <N x ptr>, which the in-tree backend
+  // asserts on and llvm-spirv will not translate without
+  // SPV_INTEL_masked_gather_scatter, an extension current IGC rejects. Carry
+  // such values as integer vectors instead. Remove once the SPIR-V path
+  // handles <N x ptr> itself.
+  addPassWithVerification(MPM, HipLowerPointerVectorsPass(),
+                          "HipLowerPointerVectorsPass");
+
   // Must be last: removes __chip_*/__hip_* globals and stubs their users.
   // Runs after HipIGBADetectorPass which creates __chip_module_has_no_IGBAs.
   addPassWithVerification(MPM, HipCleanupPass(), "HipCleanupPass");
+
+#ifdef CHIP_LLVM_USE_INTERGRATED_SPIRV
+  // After every pass that creates or removes FP operations or calls.
+  addPassWithVerification(MPM, HipFPContractPass(), "HipFPContractPass");
+#endif
+
+  // Steers SPIR-V emission away from an access chain form IGC miscompiles.
+  // Runs last so nothing downstream reintroduces the canonicalized shape.
+  addPassWithVerification(MPM, HipCanonicalizeGEPPass(),
+                          "HipCanonicalizeGEPPass");
+
+  // WORKAROUND(CHIP-SPV/chipStar#1680, KhronosGroup/SPIRV-LLVM-Translator#3866): llvm-spirv emits one OpPhi entry per LLVM phi entry, duplicating predecessors. Remove when the pinned llvm_release branch includes #3866.
+  // Last CFG change before SPIR-V emission, so nothing merges the forwarding blocks back.
+  addPassWithVerification(
+      MPM, createModuleToFunctionPassAdaptor(HipCoalesceDuplicatePhiPredsPass()),
+      "HipCoalesceDuplicatePhiPredsPass");
 
   // Final verification pass with summary printing
   MPM.addPass(HipVerifyPass("Post-HIP passes", true)); // true = print final summary
@@ -205,7 +515,7 @@ static void addFullLinkTimePasses(ModulePassManager &MPM) {
 #define PASS_ID "hip-post-link-passes"
 #endif
 
-extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
+extern "C" ::llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "hip-passes", LLVM_VERSION_STRING,
           [](PassBuilder &PB) {
@@ -229,6 +539,44 @@ llvmGetPassPluginInfo() {
                   // Register merged IR+SPIR-V validation pass as standalone (legacy - use hip-verify instead)
                   if (Name == "ir-spirv-validate") {
                     MPM.addPass(HipVerifyPass("IR+SPIR-V validation"));
+                    return true;
+                  }
+                  // Register the overflow intrinsic lowering as standalone,
+                  // which makes it directly testable with opt.
+                  if (Name == "hip-lower-overflow-intrinsics") {
+                    MPM.addPass(HipLowerOverflowIntrinsicsPass());
+                    return true;
+                  }
+                  // Same for the pointer-vector lowering, so the workaround
+                  // in #1577 can be tested with opt directly.
+                  if (Name == "hip-lower-pointer-vectors") {
+                    MPM.addPass(HipLowerPointerVectorsPass());
+                    return true;
+                  }
+                  // Register the 8 and 16 bit atomic lowering as standalone,
+                  // which makes it directly testable with opt.
+                  if (Name == "hip-lower-subword-atomics") {
+                    MPM.addPass(createModuleToFunctionPassAdaptor(
+                        HipLowerSubwordAtomicsPass()));
+                    return true;
+                  }
+                  // Register the volatile access lowering as standalone,
+                  // which makes it directly testable with opt.
+                  if (Name == "hip-lower-volatile-accesses") {
+                    MPM.addPass(createModuleToFunctionPassAdaptor(
+                        HipLowerVolatileAccessesPass()));
+                    return true;
+                  }
+                  // Register the vtable function pointer address space pass
+                  // as standalone, which makes it directly testable with opt.
+                  if (Name == "hip-function-pointer-as") {
+                    MPM.addPass(HipFunctionPointerASPass());
+                    return true;
+                  }
+                  // Register the hint intrinsic lowering as standalone,
+                  // which makes it directly testable with opt.
+                  if (Name == "hip-lower-hint-intrinsics") {
+                    MPM.addPass(HipLowerHintIntrinsicsPass());
                     return true;
                   }
                   // Register SPIR-V function reorder pass as standalone

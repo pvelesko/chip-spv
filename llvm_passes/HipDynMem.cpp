@@ -19,7 +19,6 @@
 
 #include "HipDynMem.h"
 
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/Function.h"
@@ -44,7 +43,6 @@ using namespace llvm;
 #define SPIR_LOCAL_AS 3
 #define GENERIC_AS 4
 
-typedef llvm::SmallPtrSet<Function *, 16> FSet;
 typedef llvm::SetVector<Function *> OrderedFSet;
 typedef llvm::SmallVector<GlobalVariable *, 8> GVarVec;
 
@@ -91,7 +89,7 @@ private:
     }
   }
 
-  static void recursivelyFindDirectUsers(Value *V, FSet &FS) {
+  static void recursivelyFindDirectUsers(Value *V, OrderedFSet &FS) {
     for (auto U : V->users()) {
       Instruction *Inst = dyn_cast<Instruction>(U);
       if (Inst) {
@@ -320,6 +318,8 @@ private:
     SmallVector<ReturnInst *, 1> RI;
 
 CloneFunctionInto(NewF, F, VV, CloneFunctionChangeType::GlobalChanges, RI);
+    // The clone reaches shared memory through its new argument.
+    NewF->removeFnAttr(Attribute::Memory);
     IRBuilder<> B(M.getContext());
 
     // float* (without AS, for MDNode)
@@ -345,16 +345,16 @@ CloneFunctionInto(NewF, F, VV, CloneFunctionChangeType::GlobalChanges, RI);
     // ... and replace them with calls to new function
     for (CallInst *CI : CallInstUses) {
       llvm::SmallVector<Value *, 12> Args;
-      Function *CallerF = CI->getCaller();
-      assert(CallerF);
-      assert(CallerF->arg_size() > 0);
       for (Value *V : CI->args()) {
         Args.push_back(V);
       }
-      Argument *LastArg = CallerF->getArg(CallerF->arg_size() - 1);
-      Args.push_back(LastArg);
+      // The caller may not have its argument yet; GV stands in for it.
+      Args.push_back(GV);
       B.SetInsertPoint(CI);
       CallInst *NewCI = B.CreateCall(FT, NewF, Args);
+      NewCI->setCallingConv(CI->getCallingConv());
+      // Not its function attributes: a call-site memory() would go stale here.
+      NewCI->setAttributes(CI->getAttributes().removeFnAttributes(M.getContext()));
 
       CI->replaceAllUsesWith(NewCI);
       CI->eraseFromParent();
@@ -440,7 +440,7 @@ CloneFunctionInto(NewF, F, VV, CloneFunctionChangeType::GlobalChanges, RI);
 
 
     for (GlobalVariable *GV : GVars) {
-      FSet DirectUserSet;
+      OrderedFSet DirectUserSet;
 
       // first, find functions that directly use the GVar. However, these may be
       // called from other functions, so we need to append the
@@ -456,8 +456,7 @@ CloneFunctionInto(NewF, F, VV, CloneFunctionChangeType::GlobalChanges, RI);
       }
 
       // find the functions that indirectly use the GVar. These will be processed (cloned with
-      // dyn mem arg) before the direct users, so that the direct users
-      // can rely on dyn mem argument being present in their caller.
+      // dyn mem arg) before the direct users.
       for (auto FI = IndirectUserSet.rbegin(); FI != IndirectUserSet.rend(); ++FI) {
         Function *F = *FI;
         Function *NewF = cloneFunctionWithDynMemArg(F, M, GV);
@@ -466,12 +465,20 @@ CloneFunctionInto(NewF, F, VV, CloneFunctionChangeType::GlobalChanges, RI);
 
       // now clone the direct users and replace GVar references inside them
       for (Function *F : DirectUserSet) {
+        // Also an indirect user: cloned above, GVar uses included.
+        if (IndirectUserSet.count(F))
+          continue;
 
         Function *NewF = cloneFunctionWithDynMemArg(F, M, GV);
         if(NewF == nullptr)
           llvm_unreachable("cloning failed");
         Modified = true;
       }
+
+      // Replace GV passed by rewritten calls with each caller's own argument.
+      for (Function &F : M)
+        if (isGVarUsedInFunction(GV, &F))
+          replaceGVarUsesWith(GV, &F, F.getArg(F.arg_size() - 1));
 
       // it seems that there are some leftover users of the GVar (ConstExprs)
       while (GV->getNumUses() > 0) {
@@ -482,9 +489,15 @@ CloneFunctionInto(NewF, F, VV, CloneFunctionChangeType::GlobalChanges, RI);
           }
         } else
         if (ConstantExpr *CE = dyn_cast<ConstantExpr>(U)) {
-          if (U->getNumUses() <= 1) {
-            CE->destroyConstant();
-          }
+          CE->removeDeadConstantUsers();
+          // A live user is a global's initializer, which cannot be lowered.
+          if (!CE->use_empty())
+            report_fatal_error(
+                "HipDynMem: a static or global variable is "
+                "initialized with the address of dynamic shared memory '" +
+                    GV->getName() + "', which is unsupported",
+                /*GenCrashDiag=*/false);
+          CE->destroyConstant();
         } else
         llvm_unreachable("unknown User of Global Variable - bug!");
       }
@@ -535,6 +548,7 @@ PreservedAnalyses HipDynMemExternReplaceNewPass::run(Module &M, ModuleAnalysisMa
   return PreservedAnalyses::all();
 }
 
+#ifndef CHIP_COMBINED_PASS_PLUGIN
 extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
 llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "hip-dyn-mem", LLVM_VERSION_STRING,
@@ -550,3 +564,4 @@ llvmGetPassPluginInfo() {
                 });
           }};
 }
+#endif // CHIP_COMBINED_PASS_PLUGIN

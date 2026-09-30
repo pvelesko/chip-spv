@@ -45,6 +45,16 @@ else() # if it was not defined, look for it
       message(FATAL_ERROR "Can't find llvm-config. Please provide CMake argument -DLLVM_CONFIG_BIN=/path/to/llvm-config<-version>")
   endif()
 endif()
+# The tools and CMake packages derived below are cached, and CMake keeps the
+# compiler it detected on the first configure, so another LLVM cannot be adopted.
+if(DEFINED CHIP_CONFIGURED_LLVM_CONFIG_BIN AND
+   NOT CHIP_CONFIGURED_LLVM_CONFIG_BIN STREQUAL LLVM_CONFIG_BIN)
+  message(FATAL_ERROR "LLVM_CONFIG_BIN changed from ${CHIP_CONFIGURED_LLVM_CONFIG_BIN} "
+    "to ${LLVM_CONFIG_BIN}. Configure a fresh build directory for the new LLVM.")
+endif()
+set(CHIP_CONFIGURED_LLVM_CONFIG_BIN "${LLVM_CONFIG_BIN}" CACHE INTERNAL
+  "llvm-config this build directory was configured with")
+
 message(STATUS "Using llvm-config: ${LLVM_CONFIG_BIN}")
 
 execute_process(COMMAND "${LLVM_CONFIG_BIN}" "--obj-root"
@@ -57,6 +67,9 @@ set(CLANG_ROOT_PATH_BIN ${CLANG_ROOT_PATH}/bin)
 # Derive LLVM_DIR from llvm-config so downstream (e.g. ROCm prepare-builtins,
 # include(AddLLVM)) uses the correct LLVM and does not pick up a different
 # system install (e.g. /usr/lib/llvm-18).
+if(LLVM_DIR)
+  message(STATUS "Using LLVM_DIR: ${LLVM_DIR}")
+else()
 set(_LLVM_CMAKE_DIR "${CLANG_ROOT_PATH}/${CMAKE_INSTALL_LIBDIR}/cmake/llvm")
 if(NOT EXISTS "${_LLVM_CMAKE_DIR}/LLVMConfig.cmake")
   set(_LLVM_CMAKE_DIR "${CLANG_ROOT_PATH}/lib/cmake/llvm")
@@ -67,6 +80,7 @@ if(EXISTS "${_LLVM_CMAKE_DIR}/LLVMConfig.cmake")
 else()
   message(FATAL_ERROR "LLVMConfig.cmake not found under ${CLANG_ROOT_PATH}. "
     "Expected at ${_LLVM_CMAKE_DIR}/LLVMConfig.cmake")
+endif()
 endif()
 
 execute_process(COMMAND "${LLVM_CONFIG_BIN}" "--version"

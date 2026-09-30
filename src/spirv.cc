@@ -299,6 +299,8 @@ public:
   InstWord getFunctionRetType() const { return getWord(1); }
 
   bool isType() const {
+    if ((InstWord)Opcode_ == (InstWord)spv::Op::OpTypeUntypedPointerKHR)
+      return true;
     return ((InstWord)Opcode_ >= (InstWord)spv::Op::OpTypeVoid) &&
            ((InstWord)Opcode_ <= (InstWord)spv::Op::OpTypeForwardPointer);
   }
@@ -441,15 +443,18 @@ public:
           logWarn("SPIR-V Parser: MemberId {} not found in type map", MemberId);
           continue;
         }
-        // Compute actual size as in spv::Op::OpTypeArray branch
-        // except don't account the tail padding. C analogy as
-        // example: 'struct { char a; int b; char c}' takes 9 bytes.
         size_t MemberAlignment = Type->alignment();
         TotalSize = roundUp(TotalSize, MemberAlignment);
         TotalSize += Type->size();
         if (MemberAlignment > MaxAlignment)
           MaxAlignment = MemberAlignment;
       }
+      // Account for tail padding so the struct size matches the C/C++ ABI
+      // sizeof (e.g. 'struct { int; char; }' is 8, not 5). Strict OpenCL
+      // drivers (e.g. rusticl) require clSetKernelArg's size for a by-value
+      // struct argument to equal the fully-padded size, otherwise the arg is
+      // rejected with CL_INVALID_ARG_SIZE.
+      TotalSize = roundUp(TotalSize, MaxAlignment);
       return new SPIRVtypePOD(getWord(1), TotalSize, MaxAlignment);
     }
 
@@ -477,7 +482,7 @@ public:
 
     // SPV_KHR_untyped_pointers extension: OpTypeUntypedPointerKHR
     // This is essentially a void* - a pointer without a specific pointee type
-    if ((InstWord)Opcode_ == 4417) { // SpvOpTypeUntypedPointerKHR
+    if ((InstWord)Opcode_ == (InstWord)spv::Op::OpTypeUntypedPointerKHR) {
       // OpTypeUntypedPointerKHR has: Result <id>, Storage Class
       // We treat it like a regular pointer with no pointee type
       return new SPIRVtypePointer(getWord(1), getWord(2), PointerSize,
@@ -554,6 +559,9 @@ class SPIRVmodule {
   std::map<InstWord, std::string_view> LinkNames_;
   std::map<std::string_view, std::vector<std::pair<uint16_t, uint16_t>>>
       SpilledArgAnnotations_;
+  // Kernel-name -> ordered device-global names feeding the trailing implicit
+  // DeviceGlobal arguments (rusticl globals-as-kernel-args lowering).
+  std::map<std::string_view, std::vector<std::string>> GVarArgAnnotations_;
 
   // This flag indicates if the module is known not to have indirect
   // global buffer accesses (IGBA) in any kernel. This is told by a
@@ -628,6 +636,22 @@ public:
         }
       }
 
+      // Mark the trailing implicit DeviceGlobal arguments (rusticl
+      // globals-as-kernel-args lowering). They are appended after the user
+      // args, in annotation order.
+      auto GVarArgsIt = GVarArgAnnotations_.find(KernelName);
+      if (GVarArgsIt != GVarArgAnnotations_.end()) {
+        auto &Names = GVarArgsIt->second;
+        size_t Total = FnInfo->ArgTypeInfo_.size();
+        if (Names.size() <= Total) {
+          size_t Base = Total - Names.size();
+          for (size_t J = 0; J < Names.size(); ++J) {
+            FnInfo->ArgTypeInfo_[Base + J].Kind = SPVTypeKind::DeviceGlobal;
+            FnInfo->ArgTypeInfo_[Base + J].DevGlobalName = Names[J];
+          }
+        }
+      }
+
       ModuleInfo.FuncInfoMap.emplace(std::make_pair(i.second, FnInfo));
     }
     KernelInfoMap_.clear();
@@ -651,6 +675,22 @@ private:
     return It != IdToInstMap_.end() ? It->second.get() : nullptr;
   }
 
+  /// Collect the constituent words (the literal in word 3 of each OpConstant
+  /// element) of an annotation variable's constant-array initializer.
+  /// 'VarInst' is an OpVariable with an initializer operand (word 4).
+  std::vector<uint32_t> getConstArrayElementWords(const SPIRVinst *VarInst) {
+    std::vector<uint32_t> Words;
+    auto *Init = getInstruction(VarInst->getWord(4));
+    assert(Init && "Annotation variable is missing an initializer.");
+    auto *Type = TypeMap_[Init->getResultTypeID()];
+    assert(Type && dynamic_cast<SPIRVtypeArray *>(Type) &&
+           "Could not find type for result ID.");
+    auto ArrLen = static_cast<SPIRVtypeArray *>(Type)->elementCount();
+    for (auto EltID : getWordRange(&Init->getWord(3), ArrLen))
+      Words.push_back(getInstruction(EltID)->getWord(3));
+    return Words;
+  }
+
   void processKernelParameter(const SPIRVinst &Inst, SPVFuncInfo &FuncInfo) {
     // Record kernel parameter size for kernel argument setters in the
     // backends.
@@ -670,11 +710,18 @@ private:
     if (ByValParams_.count(Inst.getResultID())) {
       // ByVal attribute may only be attached on pointer parameters.
       auto *PtrType = static_cast<SPIRVtypePointer *>(ParamType);
-      SPIRVtype *PointeeType = TypeMap_[PtrType->getPointeeTypeID()];
-      assert(PointeeType && "Can't calculate parameter size due to missing "
-                            "pointee type info!");
-      // Backends treat the ByVal attributes pointer parameters as POD.
-      ParamSize = PointeeType->size();
+      auto PointeeTypeID = PtrType->getPointeeTypeID();
+      if (PointeeTypeID == 0) {
+        // Untyped pointer (SPV_KHR_untyped_pointers): pointee size unknown.
+        logWarn("SPIR-V Parser: ByVal parameter with untyped pointer — "
+                "pointee size unknown, using pointer size as fallback.");
+        ParamSize = PtrType->size();
+      } else {
+        SPIRVtype *PointeeType = TypeMap_[PointeeTypeID];
+        assert(PointeeType && "Can't calculate parameter size due to missing "
+                              "pointee type info!");
+        ParamSize = PointeeType->size();
+      }
       TypeKind = SPVTypeKind::POD;
     } else {
       ParamSize = ParamType->size();
@@ -774,23 +821,32 @@ private:
         if (startsWith(Name, SpillArgAnnotation) && Inst->size() >= 5) {
           auto KernelName = Name.substr(SpillArgAnnotation.size());
           auto &SpillAnnotation = SpilledArgAnnotations_[KernelName];
-          // Get initializer operand (word 4, requires at least 5 words).
-          auto *Init = getInstruction(Inst->getWord(4));
-          assert(Init && "Annotation variable is missing an initializer.");
-          // Init is known to be OpConstantComposite of char array.
-          auto *Type = TypeMap_[Init->getResultTypeID()];
-          assert(Type && dynamic_cast<SPIRVtypeArray *>(Type) &&
-                 "Could not type for result ID.");
-          auto *ArrayType = static_cast<SPIRVtypeArray *>(Type);
-          auto ArrLen = ArrayType->elementCount();
-          // Iterate constituents.
-          for (auto EltID : getWordRange(&Init->getWord(3), ArrLen)) {
-            auto *ConstInt = getInstruction(EltID); // OpConstant
-            uint32_t Annotation = ConstInt->getWord(3);
+          // Annotations are 32-bit words: the lower 16 bits carry the argument
+          // index of the spilled argument and the upper 16 bits its size.
+          for (uint32_t Annotation : getConstArrayElementWords(Inst)) {
             uint16_t ArgIndex = Annotation & 0xffff;
             uint16_t ArgSize = Annotation >> 16u;
             SpillAnnotation.push_back(std::make_pair(ArgIndex, ArgSize));
           }
+        }
+
+        auto GVarArgAnnotation = std::string_view(ChipGVarArgPrefix);
+        if (startsWith(Name, GVarArgAnnotation) && Inst->size() >= 5) {
+          auto KernelName = Name.substr(GVarArgAnnotation.size());
+          // The initializer is a uchar array holding the NUL-separated
+          // original global names in trailing-argument order.
+          std::string Bytes;
+          for (uint32_t Word : getConstArrayElementWords(Inst))
+            Bytes.push_back(static_cast<char>(Word & 0xff));
+          // Split on NUL.
+          auto &Names = GVarArgAnnotations_[KernelName];
+          size_t Start = 0;
+          for (size_t I = 0; I <= Bytes.size(); ++I)
+            if (I == Bytes.size() || Bytes[I] == '\0') {
+              if (I > Start)
+                Names.emplace_back(Bytes.substr(Start, I - Start));
+              Start = I + 1;
+            }
         }
 
         if (Name == "__chip_module_has_no_IGBAs" && Inst->size() >= 5) {
@@ -887,6 +943,7 @@ bool preprocessSPIRV(const char *Bytes, size_t NumBytes,
   std::unordered_map<InstWord, std::string_view> MissingDefs;
   IdMapT ResultIdMap;
   IdSetT SampledImgs;
+  bool NeedsSpirv13 = false;
   size_t InsnSize = 0;
   for (size_t I = 0; I < NumWords; I += InsnSize) {
     SPIRVinst Insn(WordsPtr + I);
@@ -895,6 +952,19 @@ bool preprocessSPIRV(const char *Bytes, size_t NumBytes,
 
     if (Insn.isEntryPoint())
       EntryPoints.insert(Insn.entryPointName());
+
+    // The GroupNonUniform* capabilities (e.g. GroupNonUniformShuffle, emitted
+    // for __shfl* / warp intrinsics) require a SPIR-V 1.3 module header. The
+    // SPIR-V translator emits a 1.2 header, which strict validators such as
+    // rusticl/mesa reject ("requires SPIR-V version 1.3 or later"). Remember to
+    // bump the version word below; drivers that tolerated the lower version are
+    // unaffected.
+    if (Insn.getOpcode() == spv::Op::OpCapability) {
+      InstWord Cap = Insn.getWord(1);
+      if (Cap >= (InstWord)spv::CapabilityGroupNonUniform &&
+          Cap <= (InstWord)spv::CapabilityGroupNonUniformQuad)
+        NeedsSpirv13 = true;
+    }
 
     if (Insn.isExtension() && Insn.getExtension() == "SPV_KHR_linkonce_odr")
       // Drop SPV_KHR_linkonce_odr and LinkOnceODR linkage attributes
@@ -952,6 +1022,16 @@ bool preprocessSPIRV(const char *Bytes, size_t NumBytes,
           FnAttr == spv::FunctionParameterAttributeNoReadWrite)
         continue;
     }
+    // The Mali driver rejects the SubgroupDispatch capability that HipWarps'
+    // fixed subgroup-size pin (intel_reqd_sub_group_size) requires. Drop the
+    // pin -- both the SubgroupSize execution mode and the SubgroupDispatch
+    // capability, which must go together to stay valid SPIR-V. Warp-sensitive
+    // kernels then run at the driver's native subgroup width.
+    if ((Insn.getOpcode() == spv::Op::OpCapability &&
+         Insn.getWord(1) == (InstWord)spv::CapabilitySubgroupDispatch) ||
+        (Insn.getOpcode() == spv::Op::OpExecutionMode &&
+         Insn.getWord(2) == (InstWord)spv::ExecutionModeSubgroupSize))
+      continue;
 #endif
 
     std::vector<InstWord> TransformedInst;
@@ -984,6 +1064,14 @@ bool preprocessSPIRV(const char *Bytes, size_t NumBytes,
 
   for (auto &[Ignored, Name] : MissingDefs)
     logWarn("Missing definition for '{}'", Name);
+
+  // Bump the module version to 1.3 if a GroupNonUniform* capability is present
+  // (see above). Dst[1] is the header version word; 1.3 == 0x00010300.
+  if (NeedsSpirv13) {
+    constexpr InstWord Spirv13Version = 0x00010300u;
+    if (Dst.size() > 1 && Dst[1] < Spirv13Version)
+      Dst[1] = Spirv13Version;
+  }
 
   return true;
 }
@@ -1019,7 +1107,8 @@ bool postprocessSPIRV(std::vector<uint32_t> &Input) {
       // for mesa/rusticl that does not support them yet. Also, the
       // variables are essentially dead code for the driver.
       if (LinkName == "__chip_module_has_no_IGBAs" ||
-          startsWith(LinkName, "__chip_spilled_args_"))
+          startsWith(LinkName, "__chip_spilled_args_") ||
+          startsWith(LinkName, ChipGVarArgPrefix))
         InstructionsToErase.insert(Insn.getWord(1));
     }
   }

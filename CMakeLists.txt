@@ -44,6 +44,11 @@ execute_process(
   OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 
+# Resolve symlinks first: on distros where `gcc` is a ccache shim
+# (e.g. Fedora's /usr/lib64/ccache/gcc -> /usr/bin/ccache), the unresolved
+# path yields a wrong --gcc-toolchain base (issue #937).
+get_filename_component(GCC_PATH "${GCC_PATH}" REALPATH)
+
 # Extract the base path (removing /bin/gcc from the end)
 get_filename_component(GCC_BASE_PATH ${GCC_PATH} DIRECTORY)
 get_filename_component(GCC_BASE_PATH ${GCC_BASE_PATH} DIRECTORY)
@@ -106,6 +111,16 @@ if(NOT DEFINED OpenCL_LIBRARY)
   else()
     message(STATUS "OpenCL_LIBRARY was not set. Searching for libOpenCL.so in LD_LIBRARY_PATH")
     find_library(OpenCL_LIBRARY NAMES OpenCL libOpenCL.so.1 PATHS ENV LD_LIBRARY_PATH ./ NO_CACHE)
+    if(NOT OpenCL_LIBRARY)
+      # Fall back to ld.so.conf-registered locations (e.g. vendor ICD loaders
+      # not on LD_LIBRARY_PATH nor CMake's default paths). Issue #542.
+      execute_process(COMMAND ldconfig -p OUTPUT_VARIABLE _ldconfig_out ERROR_QUIET)
+      string(REGEX MATCH "libOpenCL\\.so\\.1[^\n]* => ([^\n]+)" _unused "${_ldconfig_out}")
+      if(CMAKE_MATCH_1)
+        string(STRIP "${CMAKE_MATCH_1}" OpenCL_LIBRARY)
+        message(STATUS "Found libOpenCL via ldconfig: ${OpenCL_LIBRARY}")
+      endif()
+    endif()
   endif()
 endif()
 
@@ -208,6 +223,7 @@ set(CHIP_SRC
   src/CHIPBindings.cc
   src/logging.cc
   src/Utils.cc
+  src/ModuleCache.cc
   src/SPIRVFuncInfo.cc
 )
 
@@ -277,14 +293,24 @@ option(CHIP_VERBOSE "Verbose compilation" OFF)
 option(CHIP_BUILD_SHARED_LIBS "Build chipStar as a shared library" ON)
 option(CHIP_BUILD_DOCS "Build doxygen documentation" OFF)
 option(CHIP_LLVM_USE_INTERGRATED_SPIRV "Use LLVM's intergrated SPIR-V backend for emitting device binary instead of SPIR-V translator. Auto-detected from LLVM targets when LLVM >= 22." OFF)
+option(CHIP_ATOMICS_CACHE_BYPASS_WORKAROUND "Lower volatile global accesses to relaxed device-scope atomics instead of SPV_INTEL_cache_controls decorations. The decorations are the better lowering (they bypass only the core-private cache and need no atomic capability on the allocation), but a module carrying OpCapability CacheControlsINTEL is rejected by a consumer that does not support it: rusticl fails clBuildProgram with -11 spirv_to_nir failed. Enable this when building for such a target." OFF)
+
+option(CHIP_KEEP_KERNEL_DEBUG_INFO "Keep device debug info in kernels. No SPIR-V producer emits debug info that validates, and only IGC on Intel Data Center GPU Max tolerates it, so this is off by default and should only be enabled for that device." OFF)
 option(CHIP_SET_RPATH "Add CMAKE_INSTALL_PREFIX/lib to the RPATH for chipStar executables" ON)
+option(CHIP_SET_RPATH_OCL "Add OpenCL_DIR to the RPATH for chipStar executables" ON)
+option(CHIP_SET_RPATH_L0 "Add LevelZeroLib_DIR to the RPATH for chipStar executables" ON)
 option(CHIP_ENABLE_UNCOMPILABLE_TESTS "Enable tests which are known to not compile" OFF)
 option(CHIP_BUILD_TESTS "Enable build_tests target" ON)
 option(CHIP_BUILD_SAMPLES "Build samples" ON)
-option(CHIP_USE_EXTERNAL_HIP_TESTS "Use Catch2 tests from the hip-tests submodule" OFF)
+option(CHIP_USE_EXTERNAL_HIP_TESTS "Use Catch2 tests from the hip-tests submodule" ON)
 option(CHIP_USE_INTEL_USM "When enabled, cl_intel_unified_shared_memory extension, when available, will be used for HIP allocations in the OpenCL backend" ON)
 option(CHIP_USE_VMA "Use Vulkan Memory Allocator in the native Vulkan backend" ON)
 option(CHIP_VK_VALIDATION "Enable Vulkan validation layers at runtime when the Vulkan backend is active" OFF)
+option(CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS "Enable device-side features that emit program-scope \
+CrossWorkgroup globals: dynamic memory allocation (malloc/free, via __chipspv_device_heap) and \
+clock()/clock64()/wall_clock() (via __chip_clk_counter). Some OpenCL drivers (e.g. rusticl/radeonsi) \
+cannot consume program-scope globals; disable this to omit them, at the cost of device-side malloc/free \
+(unavailable) and clock* (return 0). See issue #1279." ON)
 option(CATCH2_DISCOVER_TESTS_COMPILE_TIME "Discover the tests at compile time" ON)
 option(CHIP_SKIP_TESTS_WITH_DOUBLES "Skip tests where kernels use doubles." OFF)
 
@@ -294,7 +320,6 @@ option(CHIP_SKIP_TESTS_WITH_DOUBLES "Skip tests where kernels use doubles." OFF)
 # If your application does a lot of small allocations, it might be slow
 # https://github.com/CHIP-SPV/chipStar/issues/458 https://github.com/intel/compute-runtime/issues/631
 option(CHIP_L0_MAKE_MEM_RESIDENT "First-touch workaround for Level Zero." OFF)
-option(CHIP_L0_KERNEL_TIMESTAMPS "Enable kernel timestamps for Level Zero events." ON)
 set(CHIP_DEFAULT_JIT_FLAGS "-cl-kernel-arg-info -cl-std=CL3.0")
 
 # This mitigation might be necessary for PVC on Aurora (https://github.com/argonne-lcf/AuroraBugTracking/issues/124)
@@ -329,7 +354,15 @@ endif()
 # to be portable across multiple devices. It should be more portable to
 # fix it to 32 instead of 64, with a trade-off of potential underutilization
 # with GPUs with 64 wide warps.
-set(DEFAULT_WARP_SIZE 32 CACHE STRING "The warp size to use.")
+# The ARM Mali GPU has 8-wide subgroups and cannot honor a fixed 32-wide
+# subgroup size (it rejects the SubgroupDispatch capability, see
+# CHIP_MALI_GPU_WORKAROUNDS), so default the warp size to 8 for Mali builds.
+if(CHIP_MALI_GPU_WORKAROUNDS)
+  set(_CHIP_DEFAULT_WARP_SIZE 8)
+else()
+  set(_CHIP_DEFAULT_WARP_SIZE 32)
+endif()
+set(DEFAULT_WARP_SIZE ${_CHIP_DEFAULT_WARP_SIZE} CACHE STRING "The warp size to use.")
 
 # Set the default build type to Release if not specified
 if(NOT CMAKE_BUILD_TYPE)
@@ -372,6 +405,9 @@ set(SPIRV_EMITTER_OPTS "")
 if(CHIP_LLVM_USE_INTERGRATED_SPIRV)
   set(SPIRV_EMITTER_OPTS "-fintegrated-objemitter")
 endif()
+# The translator variant's flag is defined next to the OFFLOAD_TRIPLE
+# definition below: it needs the triple for its -Xoffload-compiler prefix
+# and, unlike this one, it may only reach non-RDC compilations.
 
 if(CHIP_VERBOSE)
   set(CMAKE_VERBOSE_MAKEFILE ON)
@@ -460,16 +496,113 @@ if(CHIP_USE_NATIVE_VULKAN_SPIRV)
   endif()
   set(OFFLOAD_TRIPLE spirv64-unknown-chipstar-chipstarvulkan)
 elseif(LLVM_VERSION_MAJOR GREATER_EQUAL 23)
-  # On LLVM-23+ the emitted SPIR-V version can be controlled with
-  # subarch string (v#.#). The new "chipstar" OS component sets
-  # allowed SPIR-V extensions tailored for chipStar.
-  set(OFFLOAD_TRIPLE spirv64v1.2-unknown-chipstar)
+  # On LLVM-23+ the emitted SPIR-V version can be controlled with the
+  # subarch string (v#.#). The "chipstar" OS component sets allowed
+  # SPIR-V extensions tailored for chipStar; both variants use it, since
+  # a plain spirv64 triple would select the generic SPIRV toolchain,
+  # whose in-tree backend emission rejects chipStar's printf lowering
+  # (SPV_EXT_relaxed_printf_string_address_space is not in its allow
+  # list) and whose device link runs spirv-link.
+  #
+  # v1.3: Arm Mali's clLinkProgram is broken, so shuffles cannot come
+  # from a runtime-linked rtdevlib module and are inlined into user
+  # kernels instead. An inlined shuffle is a GroupNonUniform* op whose
+  # capability is SPIR-V 1.3, so shuffle-using modules genuinely require
+  # a 1.3 stamp; the versioned triple applies it to every module, which
+  # over-stamps shuffle-free ones. All targeted runtimes accept 1.3
+  # headers (LLVM 22's unversioned triple shipped them all along, and
+  # Intel NEO and Mali were verified by direct clCreateProgramWithIL
+  # probe).
+  set(OFFLOAD_TRIPLE spirv64v1.3-unknown-chipstar)
 else()
   set(OFFLOAD_TRIPLE spirv64)
 endif()
 
+# Translator selection is emitted twice because SPIR-V is produced in a
+# different job depending on the mode: at compile time without -fgpu-rdc
+# (NONRDC_EMITTER_OPTS) and inside clang-linker-wrapper at link time with
+# -fgpu-rdc (RDC_EMITTER_SUPPLEMENT). An RDC compile has no device codegen
+# job at all, so a single always-on flag would sit unclaimed there and
+# clang reports it as an unused argument.
+set(RDC_EMITTER_SUPPLEMENT "")
+set(NONRDC_EMITTER_OPTS "")
+if(LLVM_VERSION_MAJOR GREATER_EQUAL 23 AND NOT CHIP_LLVM_USE_INTERGRATED_SPIRV)
+  # Select the llvm-spirv translator in the HIPSPV toolchain. The flag must
+  # travel via -Xoffload-compiler: passed plainly in -xhip offload mode the
+  # driver validates it against the host toolchain, which rejects it, and
+  # -Xarch_device silently drops it before the device link.
+  set(NONRDC_EMITTER_OPTS
+    -Xoffload-compiler-${OFFLOAD_TRIPLE} -fno-integrated-objemitter)
+  set(RDC_EMITTER_SUPPLEMENT
+    " -Xoffload-compiler-${OFFLOAD_TRIPLE} -fno-integrated-objemitter")
+endif()
+string(REPLACE ";" " " NONRDC_EMITTER_OPTS_STR "${NONRDC_EMITTER_OPTS}")
+
 # =============================================================================
 # chipStar BINARIES & TESTS
+# The cache-control lowering needs SPV_INTEL_cache_controls in the extension
+# allow list the HIPSPV toolchain hands the SPIR-V producer. Only the
+# llvm-patches/llvm-23 series adds it, and without it every decorated access
+# fails to translate ("RequiresExtension: SPV_INTEL_cache_controls", clang
+# exit 18), so fall back to the atomic lowering rather than produce a compiler
+# that cannot build a volatile access.
+#
+# Ask the driver rather than inspecting its binaries: -### prints the very
+# device-compilation command chipStar will run, including the extension list,
+# so this tests the configured toolchain's actual behavior. Both flags matter:
+# --offload-device-only because LLVM 23's offload driver otherwise defers the
+# SPIR-V step to clang-linker-wrapper and prints no extension list at all, and
+# the versioned OFFLOAD_TRIPLE because the HIPSPV allow list is only selected
+# for it; a plain spirv64 triple takes an upstream path that passes +all and
+# would answer a different question. Re-probed on every configure, so pointing
+# an existing build directory at a different toolchain re-decides instead of
+# keeping the first answer.
+#
+# The probe writes its own internal variable and never the user's option, so
+# there is no value in the cache that the user did not put there and a later
+# -DCHIP_ATOMICS_CACHE_BYPASS_WORKAROUND=ON is honoured on the configure that
+# passes it.
+set(_cc_probe_src "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/chip_cache_controls_probe.hip")
+file(WRITE "${_cc_probe_src}" "__attribute__((device)) void chipCacheControlsProbe(void) {}\n")
+execute_process(
+  COMMAND ${CMAKE_CXX_COMPILER} "-###" -x hip -nogpulib -nogpuinc -c
+          --offload-device-only --offload=${OFFLOAD_TRIPLE} ${SPIRV_EMITTER_OPTS}
+          "${_cc_probe_src}"
+  OUTPUT_VARIABLE _cc_out ERROR_VARIABLE _cc_err RESULT_VARIABLE _cc_rc)
+set(_cc_cmds "${_cc_out}${_cc_err}")
+# Either the extension is listed for the producer, or the list is unrestricted.
+if(_cc_cmds MATCHES "spirv-ext=[^ \"]*(\\+all|\\+SPV_INTEL_cache_controls)")
+  set(_cc_supported ON)
+else()
+  set(_cc_supported OFF)
+endif()
+if(NOT _cc_cmds MATCHES "spirv-ext=")
+  # No extension list at all means the probe did not reach a device
+  # compilation, so its answer says nothing about the toolchain.
+  message(WARNING "Could not read an extension list from ${CMAKE_CXX_COMPILER} "
+                  "(exit ${_cc_rc}); assuming SPV_INTEL_cache_controls is unavailable")
+  set(_cc_supported OFF)
+endif()
+set(CHIP_CACHE_CONTROLS_SUPPORTED ${_cc_supported} CACHE INTERNAL
+    "the configured toolchain's HIPSPV extension list carries SPV_INTEL_cache_controls")
+
+# The single variable every consumer of the choice reads.
+if(CHIP_ATOMICS_CACHE_BYPASS_WORKAROUND OR NOT CHIP_CACHE_CONTROLS_SUPPORTED)
+  set(CHIP_VOLATILE_LOWERING_ATOMIC ON)
+  if(CHIP_ATOMICS_CACHE_BYPASS_WORKAROUND)
+    message(STATUS "CHIP_ATOMICS_CACHE_BYPASS_WORKAROUND=ON was requested: "
+                   "volatile accesses lower to relaxed device-scope atomics")
+  else()
+    message(STATUS "SPV_INTEL_cache_controls is not in this toolchain's HIPSPV "
+                   "extension list: volatile accesses lower to relaxed "
+                   "device-scope atomics instead")
+  endif()
+else()
+  set(CHIP_VOLATILE_LOWERING_ATOMIC OFF)
+  message(STATUS "SPV_INTEL_cache_controls available: volatile accesses lower "
+                 "to cache-control decorations")
+endif()
+
 add_subdirectory(llvm_passes)
 add_subdirectory(bitcode)
 
@@ -503,11 +636,25 @@ unset(_hip_ver_major)
 unset(_hip_ver_minor)
 unset(_hip_ver_patch)
 
-# Make CHIP depend on devicelib_bc and LLVMHipPasses for
-# convenience. The CHIP module itself does not depend on these but
-# HIP program compilation does.
-add_dependencies(CHIP devicelib_bc LLVMHipPasses)
-add_dependencies(CHIP hipcc.bin hipconfig.bin)
+# Everything a HIP compile against the build tree needs from the in-tree
+# toolchain: hipcc, the device bitcode library, and the pass plugin that
+# clang loads from <hip-path>/lib while emitting device code.
+#
+# This is a utility target rather than a plain add_dependencies() on
+# LLVMHipPasses because of how the Ninja generator orders object compiles.
+# A dependency on a library target only orders a consumer's objects after
+# that library's own objects, not after its link, so a test TU could be
+# compiled, and its device link could dlopen lib/libLLVMHipSpvPasses.so,
+# while the plugin was still being relinked (CHIP-SPV/chipStar#1488). A
+# utility target is waited on completely, and so is every target it
+# depends on.
+add_custom_target(hip_device_toolchain)
+add_dependencies(hip_device_toolchain LLVMHipPasses devicelib_bc hipcc.bin)
+
+# The CHIP module itself needs none of this, but HIP program compilation
+# does, and everything that compiles HIP code against the build tree
+# links CHIP: the ordering reaches their object compiles through CHIP.
+add_dependencies(CHIP hip_device_toolchain hipconfig.bin)
 
 file(MAKE_DIRECTORY ${HIPCC_BUILD_PATH})
 if(NOT EXISTS "${HIPCC_BUILD_PATH}/hipcc")
@@ -523,57 +670,12 @@ add_subdirectory(bin)
 find_package(SPIRV-Tools)
 if (NOT SPIRV-Tools_FOUND)
   message(STATUS "spirv-tools not found, building...")
-  # Download and build SPIRV-Tools
-  include(ExternalProject)
-  
-  set(SPIRV_TOOLS_VERSION "main")
-  set(SPIRV_TOOLS_INSTALL_DIR "${CMAKE_BINARY_DIR}/external/spirv-tools")
-  
-  # Create the include directory before it's referenced
-  file(MAKE_DIRECTORY "${SPIRV_TOOLS_INSTALL_DIR}/include")
-  file(MAKE_DIRECTORY "${SPIRV_TOOLS_INSTALL_DIR}/lib")
-  
-  set(CHIPSTAR_C_COMPILER gcc)
-  set(CHIPSTAR_CXX_COMPILER g++)
-  message(STATUS "CHIPSTAR_C_COMPILER: ${CHIPSTAR_C_COMPILER}")
-  message(STATUS "CHIPSTAR_CXX_COMPILER: ${CHIPSTAR_CXX_COMPILER}")
-  ExternalProject_Add(SPIRV-Tools-External
-    GIT_REPOSITORY   https://github.com/CHIP-SPV/SPIRV-Tools.git
-    GIT_TAG          ${SPIRV_TOOLS_VERSION}
-    GIT_SHALLOW      TRUE
-    SOURCE_SUBDIR    "."
-    CMAKE_ARGS
-      -DCMAKE_INSTALL_PREFIX=${SPIRV_TOOLS_INSTALL_DIR}
-      -DSPIRV_SKIP_TESTS=ON
-      -DCMAKE_C_COMPILER=${CHIPSTAR_C_COMPILER}
-      -DCMAKE_CXX_COMPILER=${CHIPSTAR_CXX_COMPILER}
-      -DCMAKE_INSTALL_LIBDIR=lib
-      -DSPIRV_TOOLS_INSTALL_HEADERS=ON
-      -DSPIRV_TOOLS_BUILD_STATIC=ON
-      -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
-    UPDATE_COMMAND   ${CMAKE_COMMAND} -E chdir <SOURCE_DIR> python3 utils/git-sync-deps
-    LOG_DOWNLOAD ON
-    LOG_UPDATE ON
-    LOG_CONFIGURE ON
-    LOG_BUILD ON
-    LOG_INSTALL ON
-    BUILD_BYPRODUCTS 
-      ${SPIRV_TOOLS_INSTALL_DIR}/lib/libSPIRV-Tools.a
-      ${SPIRV_TOOLS_INSTALL_DIR}/lib/libSPIRV-Tools-opt.a
-      ${SPIRV_TOOLS_INSTALL_DIR}/lib/libSPIRV-Tools-link.a
-      ${SPIRV_TOOLS_INSTALL_DIR}/lib/libSPIRV-Tools-reduce.a
-  )
-
-  # Create an imported target for SPIRV-Tools
-  add_library(SPIRV-Tools STATIC IMPORTED GLOBAL)
-  add_dependencies(SPIRV-Tools SPIRV-Tools-External)
-  
-  set_target_properties(SPIRV-Tools PROPERTIES
-    IMPORTED_LOCATION "${SPIRV_TOOLS_INSTALL_DIR}/lib/libSPIRV-Tools.a"
-    INTERFACE_INCLUDE_DIRECTORIES "${SPIRV_TOOLS_INSTALL_DIR}/include"
-  )
+  include(cmake/SpirvToolsExternal.cmake)
+  set(CHIP_SPIRV_VAL "${SPIRV_TOOLS_INSTALL_DIR}/bin/spirv-val")
 else()
   message(STATUS "spirv-tools: ${SPIRV-Tools_FOUND}")
+  # spirv-val is not part of the SPIRV-Tools package; look beside that package.
+  find_program(CHIP_SPIRV_VAL spirv-val HINTS "${SPIRV-Tools_DIR}/../../../bin")
 endif()
 
 add_subdirectory(tools/spirv-extractor)
@@ -707,10 +809,20 @@ if (NOT CLANG_VERSION_LESS_15)
     -no-hip-rt) # Clang 15+: Prevents linking amdhip64 library.
 endif()
 
-# For use by hipcc
-execute_process(COMMAND ${LLVM_CONFIG_BIN} --host-target
-  OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE HOST_ARCH)
-set(HOST_ARCH "--target=${HOST_ARCH}")
+# Keep hipcc on the CMake toolchain target; otherwise use the compiler default.
+set(HOST_ARCH "")
+if(CMAKE_CXX_COMPILER_TARGET)
+  set(HOST_ARCH "--target=${CMAKE_CXX_COMPILER_TARGET}")
+endif()
+
+# Sysroot options given on the command line reach the build tree only; the
+# installed files must not carry a path that exists on the build host alone.
+# STRIP first: the split below is on spaces, so edge tabs and newlines would
+# otherwise end up inside an argument.
+string(STRIP "${HIP_SYSROOT_OPTIONS}" CHIP_BUILD_SYSROOT_OPTIONS_)
+string(REPLACE " " ";" CHIP_BUILD_SYSROOT_OPTIONS_ "${CHIP_BUILD_SYSROOT_OPTIONS_}")
+string(STRIP "${HIP_SYSROOT_LINK_OPTIONS}" CHIP_BUILD_SYSROOT_LINK_OPTIONS_)
+string(REPLACE " " ";" CHIP_BUILD_SYSROOT_LINK_OPTIONS_ "${CHIP_BUILD_SYSROOT_LINK_OPTIONS_}")
 
 # On macOS, pass the sysroot only to host compilation (-Xarch_host).
 # The spirv64 device compilation cannot use the macOS SDK sysroot because
@@ -751,6 +863,7 @@ set(HIP_OFFLOAD_COMPILE_OPTIONS_BUILD_
   --hip-path=${CMAKE_BINARY_DIR}
   ${HOST_ARCH}
   ${HIP_SYSROOT_OPTIONS}
+  ${CHIP_BUILD_SYSROOT_OPTIONS_}
   ${HIP_FIXUPS_HEADER_BUILD}
   -I${CMAKE_SOURCE_DIR}/include
   -I${CMAKE_SOURCE_DIR}/HIP/include
@@ -761,21 +874,33 @@ set(HIP_OFFLOAD_COMPILE_OPTIONS_BUILD_
 # -no-hip-rt: Prevents linking amdhip64 library implicitly when doing
 #             combined compile and link or when the --hip-link is
 #             present at the link step.
+#
+# ocml_host_math_funcs is a host-only static library; pass it via -Wl, so
+# clang's static-device-library handling does not unbundle it into empty
+# device bitcode during -fgpu-rdc links (spurious "different data layouts"
+# warnings from llvm-link, see issue #525).
 list(APPEND HIP_OFFLOAD_LINK_OPTIONS_INSTALL_
+  ${HOST_ARCH}
   ${HIP_SYSROOT_LINK_OPTIONS}
-  "-L${LIB_INSTALL_DIR}" "-lCHIP" "-no-hip-rt -locml_host_math_funcs")
+  "-L${LIB_INSTALL_DIR}" "-lCHIP" "-no-hip-rt -Wl,-locml_host_math_funcs")
 list(APPEND HIP_OFFLOAD_LINK_OPTIONS_BUILD_
+  ${HOST_ARCH}
   ${HIP_SYSROOT_LINK_OPTIONS}
-  "-L${CMAKE_BINARY_DIR}" "-lCHIP" "-no-hip-rt -locml_host_math_funcs")
+  ${CHIP_BUILD_SYSROOT_LINK_OPTIONS_}
+  "-L${CMAKE_BINARY_DIR}" "-lCHIP" "-no-hip-rt -Wl,-locml_host_math_funcs")
 
 if(OpenCL_LIBRARY)
-  target_link_options(CHIP PUBLIC -Wl,-rpath,${OpenCL_DIR})
+  if(CHIP_SET_RPATH_OCL)
+    target_link_options(CHIP PUBLIC -Wl,-rpath,${OpenCL_DIR})
+  endif()
   target_link_directories(CHIP PUBLIC ${OpenCL_DIR})
 endif()
 
 if(LevelZero_LIBRARY)
   include_directories(CHIP PUBLIC ${LevelZeroInclude_DIR})
-  target_link_options(CHIP PUBLIC -Wl,-rpath,${LevelZeroLib_DIR})
+  if(CHIP_SET_RPATH_L0)
+    target_link_options(CHIP PUBLIC -Wl,-rpath,${LevelZeroLib_DIR})
+  endif()
   target_link_directories(CHIP PUBLIC ${LevelZeroLib_DIR})
 endif()
 
@@ -800,12 +925,19 @@ message(STATUS "Generated HIP_OFFLOAD_LINK_OPTIONS: ${HIP_OFFLOAD_LINK_OPTIONS_I
 # TODO: Is there a better way to do this?
 add_library(deviceInternal INTERFACE)
 target_compile_options(deviceInternal INTERFACE
-  $<$<COMPILE_LANGUAGE:CXX>:-xhip> ${HIP_OFFLOAD_COMPILE_OPTIONS_BUILD_})
+  $<$<COMPILE_LANGUAGE:CXX>:-xhip> ${HIP_OFFLOAD_COMPILE_OPTIONS_BUILD_}
+  # Not part of HIP_OFFLOAD_COMPILE_OPTIONS_BUILD_: those flags are also
+  # published in .hipInfo, where hipcc must be free to withhold the emitter
+  # selection from RDC compiles.
+  ${NONRDC_EMITTER_OPTS})
+target_link_options(deviceInternal INTERFACE ${HOST_ARCH})
 target_link_libraries(deviceInternal INTERFACE CHIP)
 
 add_library(device INTERFACE)
 target_compile_options(device INTERFACE
-  $<$<COMPILE_LANGUAGE:CXX>:-xhip> ${HIP_OFFLOAD_COMPILE_OPTIONS_INSTALL_})
+  $<$<COMPILE_LANGUAGE:CXX>:-xhip> ${HIP_OFFLOAD_COMPILE_OPTIONS_INSTALL_}
+  ${NONRDC_EMITTER_OPTS})
+target_link_options(device INTERFACE ${HOST_ARCH})
 target_link_libraries(device INTERFACE CHIP)
 
 # same as device on chipStar but provides compatibility with AMD
@@ -855,6 +987,8 @@ if(NOT DEFINED CHIP_CLSPV_BIN)
   set(CHIP_CLSPV_BIN "" CACHE FILEPATH "Path to clspv binary for OpenCL->Vulkan SPIR-V conversion")
 endif()
 
+# Toolchain version for the hipRTC compilation cache key (see spirv_hiprtc.cc).
+set(CHIP_LLVM_VERSION_STRING "${LLVM_VERSION}")
 configure_file(chipStarConfig.hh.in include/chipStarConfig.hh @ONLY)
 
 # PROJECT CONFIGURATION HEADER
@@ -922,10 +1056,15 @@ add_to_config(_hipInfo_install
   HIP_OFFLOAD_COMPILE_OPTIONS "${HIP_OFFLOAD_COMPILE_OPTIONS_INSTALL}")
 add_to_config(_hipInfo_install
   HIP_OFFLOAD_LINK_OPTIONS "${HIP_OFFLOAD_LINK_OPTIONS_INSTALL}")
+# Emitter selection for compilations that do their device codegen at compile
+# time. hipcc withholds it from RDC compiles, where codegen is deferred to the
+# link and the flag would go unclaimed.
+add_to_config(_hipInfo_install
+  HIP_OFFLOAD_NONRDC_COMPILE_SUPPLEMENT_OPTIONS "${NONRDC_EMITTER_OPTS_STR}")
 if(USE_NEW_OFFLOAD_DRIVER)
   add_to_config(_hipInfo_install
     HIP_OFFLOAD_RDC_SUPPLEMENT_LINK_OPTIONS
-    "${HIP_RDC_SUPPLEMENT_LINK_FLAGS} -Xoffload-compiler-${OFFLOAD_TRIPLE} --hip-path=${CMAKE_INSTALL_PREFIX}")
+    "${HIP_RDC_SUPPLEMENT_LINK_FLAGS}${RDC_EMITTER_SUPPLEMENT} -Xoffload-compiler-${OFFLOAD_TRIPLE} --hip-path=${CMAKE_INSTALL_PREFIX}")
 else()
   add_to_config(_hipInfo_install
     HIP_OFFLOAD_RDC_SUPPLEMENT_LINK_OPTIONS
@@ -943,10 +1082,12 @@ add_to_config(_hipInfo_build
   HIP_OFFLOAD_COMPILE_OPTIONS "${HIP_OFFLOAD_COMPILE_OPTIONS_BUILD}")
 add_to_config(_hipInfo_build
   HIP_OFFLOAD_LINK_OPTIONS "${HIP_OFFLOAD_LINK_OPTIONS_BUILD}")
+add_to_config(_hipInfo_build
+  HIP_OFFLOAD_NONRDC_COMPILE_SUPPLEMENT_OPTIONS "${NONRDC_EMITTER_OPTS_STR}")
 if(USE_NEW_OFFLOAD_DRIVER)
   add_to_config(_hipInfo_build
     HIP_OFFLOAD_RDC_SUPPLEMENT_LINK_OPTIONS
-    "${HIP_RDC_SUPPLEMENT_LINK_FLAGS} -Xoffload-compiler-${OFFLOAD_TRIPLE} --hip-path=${CMAKE_BINARY_DIR}")
+    "${HIP_RDC_SUPPLEMENT_LINK_FLAGS}${RDC_EMITTER_SUPPLEMENT} -Xoffload-compiler-${OFFLOAD_TRIPLE} --hip-path=${CMAKE_BINARY_DIR}")
 else()
   add_to_config(_hipInfo_build
     HIP_OFFLOAD_RDC_SUPPLEMENT_LINK_OPTIONS
@@ -955,7 +1096,8 @@ endif()
 
 add_library(hip::host ALIAS host)
 add_library(hip::device ALIAS device)
-add_library(hiprtc-lib INTERFACE)
+add_library(hiprtc-lib SHARED src/stubs/hiprtc_stub.c)
+set_target_properties(hiprtc-lib PROPERTIES OUTPUT_NAME hiprtc)
 add_library(hiprtc::hiprtc ALIAS hiprtc-lib)
 
 INSTALL(TARGETS CHIP host device deviceRDC hiprtc-lib
@@ -989,7 +1131,11 @@ install(
   DESTINATION
   ${CONFIG_PACKAGE_INSTALL_DIR}
 )
-install(EXPORT hip-targets FILE hip-targets.cmake NAMESPACE hip:: DESTINATION lib/cmake/hip COMPONENT binary)
+# NOTE: hip-targets is exported once above (see INSTALL(EXPORT hip-targets ...))
+# to ${CONFIG_PACKAGE_INSTALL_DIR} in the default component. Do not add a second
+# install(EXPORT hip-targets ...) with a different component (e.g. COMPONENT
+# binary): a component/partial install (ccmake, cpack, --component) would then
+# ship hip-targets.cmake without hip-config.cmake, breaking find_package(hip).
 
 # Install hip-lang-config.cmake for CMake's native HIP language support
 install(FILES ${CMAKE_SOURCE_DIR}/cmake/hip-lang/hip-lang-config.cmake
@@ -1014,6 +1160,34 @@ set(_versionInfoHeader
 file(WRITE "${PROJECT_BINARY_DIR}/include/hip/hip_version.h" ${_versionInfoHeader})
 install(FILES "${PROJECT_BINARY_DIR}/include/hip/hip_version.h"
   DESTINATION ${INCLUDE_INSTALL_DIR}/hip)
+
+# Generate rocm_version.h.
+#
+# chipStar is not ROCm, but applications routinely probe ROCM_VERSION_* to gate
+# on HIP-implementation capabilities (Trilinos STK does this in
+# stk_ngp_test/GlobalReporter.hpp). Without this header they fail to compile and
+# need a source patch. Report the same level chipStar already claims through
+# HIP_VERSION_*, so the two cannot drift.
+#
+# Installed under both rocm-core/ (the modern rocm-core layout) and the include
+# root, because apps commonly try <rocm-core/rocm_version.h> and fall back to
+# <rocm_version.h>. Code that must distinguish chipStar from ROCm should test
+# __HIP_PLATFORM_SPIRV__ rather than these macros.
+set(_rocmVersionHeader
+"// Auto-generated by cmake\n
+#ifndef ROCM_VERSION_H
+#define ROCM_VERSION_H\n
+#define ROCM_VERSION_MAJOR ${HIP_VERSION_MAJOR}
+#define ROCM_VERSION_MINOR ${HIP_VERSION_MINOR}
+#define ROCM_VERSION_PATCH ${HIP_VERSION_PATCH}\n
+#endif\n
+")
+file(WRITE "${PROJECT_BINARY_DIR}/include/rocm_version.h" ${_rocmVersionHeader})
+file(WRITE "${PROJECT_BINARY_DIR}/include/rocm-core/rocm_version.h" ${_rocmVersionHeader})
+install(FILES "${PROJECT_BINARY_DIR}/include/rocm_version.h"
+  DESTINATION ${INCLUDE_INSTALL_DIR})
+install(FILES "${PROJECT_BINARY_DIR}/include/rocm-core/rocm_version.h"
+  DESTINATION ${INCLUDE_INSTALL_DIR}/rocm-core)
 
 # Generate .hipInfo
 file(WRITE "${PROJECT_BINARY_DIR}/share/.hipInfo_install" ${_hipInfo_install})
@@ -1054,11 +1228,39 @@ SET(HIP_PATH ${CMAKE_BINARY_DIR}) # pick up build sources, not install sources
 set(SAVED_WARN_DEPRECATED ${CMAKE_WARN_DEPRECATED})
 set(CMAKE_WARN_DEPRECATED OFF)
 if(CHIP_BUILD_TESTS)
+  # Catch2 installs its own SIGSEGV/SIGABRT handler to name the running test
+  # before re-raising. On Level Zero, managed memory is shared USM and the
+  # driver resolves page migration through its own SIGSEGV handler; Catch2's
+  # handler does not chain, so it would turn a migration fault into a fatal
+  # test failure. ctest already reports which test died, because
+  # catch_discover_tests registers one process per TEST_CASE, so the only
+  # thing given up is the SECTION context inside a crashing test.
+  #
+  # A subdirectory inherits a copy of this directory's COMPILE_DEFINITIONS when
+  # it is added, so set the definition, add the catch tree, then restore. Left
+  # set, it would land on every target in this directory, libCHIP included.
+  get_directory_property(CHIP_SAVED_COMPILE_DEFS COMPILE_DEFINITIONS)
+  add_compile_definitions(CATCH_CONFIG_NO_POSIX_SIGNALS)
+  if(CHIP_VOLATILE_LOWERING_ATOMIC)
+    add_compile_definitions(CHIP_VOLATILE_LOWERING_ATOMIC)
+  endif()
   if(CHIP_USE_EXTERNAL_HIP_TESTS)
     add_subdirectory(hip-tests/catch catch)
   else()
     add_subdirectory(HIP/tests/catch catch)
   endif()
+  set_directory_properties(PROPERTIES
+    COMPILE_DEFINITIONS "${CHIP_SAVED_COMPILE_DEFS}")
+  # The catch tree sets hipcc.bin as its compiler and never links CHIP, so
+  # it inherits none of the ordering that CHIP carries. Every catch
+  # executable is built on these object libraries, and the Ninja generator
+  # orders an executable's objects after those of the object libraries it
+  # consumes, so this reaches all of them.
+  foreach(CATCH_OBJECT_LIB KERNELS Main_Object Main_Object_Standalone)
+    if(TARGET ${CATCH_OBJECT_LIB})
+      add_dependencies(${CATCH_OBJECT_LIB} hip_device_toolchain)
+    endif()
+  endforeach()
   add_subdirectory(tests)
 endif()
 

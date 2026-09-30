@@ -1,102 +1,123 @@
 # chipStar LLVM Patches
 
+chipStar builds its compiler toolchain from upstream LLVM release branches plus
+a small set of patches, kept in one directory per supported LLVM version:
+
 ```
 llvm-patches/
-├── llvm/
-│   ├── 0001-Allow-up-to-v1.2-SPIR-V-features.patch
-│   ├── 0001-0004-spirv-version-and-extensions-llvm22.patch  (LLVM 22+ only)
-│   ├── 0002-fix-SPIR-V-data-layout.patch                    (LLVM 20 only)
-│   ├── 0002-fix-SPIR-V-data-layout-llvm21.patch             (LLVM 21 only)
-│   ├── 0003-Unbundle-SDL.patch                               (LLVM 17-21, upstream in 22+)
-│   ├── 0004-only-necessary-exts.patch                        (LLVM 17-21)
-│   ├── 0005-fix-archive-data-layout.patch
-│   ├── 0006-fix-macos-hip-spirv.patch                        (LLVM 17-21)
-│   └── 0006-macos-hip-spirv-llvm22.patch                     (LLVM 22+ only)
-├── spirv-translator/
-│   ├── 0001-Use-fp_fast_mode-extension.patch
-│   ├── 0002-Pretend-SPIR-ver-1.2.patch
-│   ├── 0002-Pretend-the-SPIR-ver-needed-by-shuffles-is-1.2-llvm17-18.patch
-│   ├── 0003-Fix-LoopMerge-error.patch                        (LLVM 17-21, upstream in 22+)
-│   └── 0004-fix-blockMerge.patch                              (LLVM 17-21, upstream in 22+)
-└── README.md
+├── llvm-21/
+│   ├── llvm/              patches applied in the llvm-project checkout
+│   └── spirv-translator/  patches applied in the SPIRV-LLVM-Translator checkout
+├── llvm-22/
+│   ├── llvm/
+│   └── spirv-translator/
+└── llvm-23/
+    ├── llvm/
+    └── spirv-translator/
 ```
+
+`scripts/configure_llvm.sh --version <21|22|23>` clones the matching
+upstream LLVM ref (`release/<version>.x`, except 23 which is pinned to the
+tag `llvmorg-23.1.2`) together with the translator branch
+`llvm_release_<version>0`, and applies every patch in the version's
+directory, in lexicographic (numeric) order, with `git apply`. There is no
+per-patch version gating: everything in a version directory applies to that
+version, and a failed patch is a hard error.
+
+`--version latest` (experimental) is different: it clones the maintained
+branch `chipStar-llvm-23` from
+[CHIP-SPV/llvm-project](https://github.com/CHIP-SPV/llvm-project) together
+with the translator branch `llvm_release_230`, and applies no patches. That
+branch carries the chipStar changes directly; patch directories exist only for
+the release-pinned versions.
 
 ## Supported Versions
 
-| LLVM Version | Status |
-|---|---|
-| 17-19 | Supported |
-| 20 | Supported |
-| 21 | Supported |
-| 22 | Supported (22.1.0-rc3+) |
+| LLVM Version | Source | Patches |
+|---|---|---|
+| 21 | `llvm/llvm-project` `release/21.x` | `llvm-patches/llvm-21/` |
+| 22 | `llvm/llvm-project` `release/22.x` | `llvm-patches/llvm-22/` |
+| 23 | `llvm/llvm-project` `llvmorg-23.1.2` | `llvm-patches/llvm-23/` |
+| latest (experimental) | `CHIP-SPV/llvm-project` `chipStar-llvm-23` | none |
 
-## Applying Patches
+LLVM 17 through 20 support was dropped.
 
-### Automatic Application
+## llvm-21
 
-The `scripts/configure_llvm.sh` script automatically applies the correct patches for each LLVM version. No manual intervention needed.
+The reference set the later versions are trimmed down from. The numbering
+gap is deliberate: 0002-preserve-device-debug-info was removed, since both
+SPIR-V producers reachable on 21 emit debug info that `spirv-val` rejects.
 
-```bash
-scripts/configure_llvm.sh --version 22 --install-dir /path/to/install
-```
+### llvm/
 
-### Manual Application
+| Patch | Purpose | Upstream status |
+|---|---|---|
+| 0001-spirv-version-and-extensions | Enable SPIR-V 1.2 (warp-level primitives via subgroup extensions) and restrict `--spirv-ext` to only the required extensions | Upstreamed in LLVM 23+ behind `Triple::ChipStar` ([llvm#179902](https://github.com/llvm/llvm-project/pull/179902)) |
+| 0003-unbundle-static-device-libraries | Enable RDC linking with static libraries containing device code | Upstream in LLVM 22+ ([llvm#136412](https://github.com/llvm/llvm-project/pull/136412), commit `ae0614de05ac`) |
+| 0004-fix-spirv-data-layout | Revert the `-n8:16:32:64` data layout change to avoid bitcode linking mismatches | chipStar-local revert of [llvm#110695](https://github.com/llvm/llvm-project/pull/110695), not upstreamable |
+| 0005-macos-hip-spirv | HIP SPIR-V compilation on macOS (Mach-O sections, Darwin toolchain guards, skip host stdlib for device) | Upstreamed via [llvm#183991](https://github.com/llvm/llvm-project/pull/183991) + [llvm#206902](https://github.com/llvm/llvm-project/pull/206902) |
 
-If you need to apply patches manually, see which patches apply to your version in the table below.
+### spirv-translator/
 
----
+| Patch | Purpose | Upstream status |
+|---|---|---|
+| 0001-pretend-subgroup-caps-are-spirv-1.2 | Report subgroup shuffle capabilities as requiring SPIR-V 1.2 instead of 1.3 | Deliberate spec deviation, permanent |
+| 0002-fix-loop-merge-placement | Fix LoopMerge instruction placement | Upstream in translator 220+ ([KhronosGroup#3277](https://github.com/KhronosGroup/SPIRV-LLVM-Translator/pull/3277)) |
+| 0003-fix-block-merge-innermost-loop | Fix block merging in innermost loops | Upstream in translator 220+ ([KhronosGroup#3280](https://github.com/KhronosGroup/SPIRV-LLVM-Translator/pull/3280)) |
 
-## LLVM Patches
+## llvm-22
 
-### 1. Allow up to v1.2 SPIR-V features (0001)
+Smaller set: the unbundle-SDL fix is already upstream in LLVM 22, the data
+layout revert is no longer needed, and the loop/block merge fixes are already
+upstream in translator 220+. As in llvm-21, the numbering gap is
+0002-preserve-device-debug-info, which was removed.
 
-**File:** `clang/lib/Driver/ToolChains/HIPSPV.cpp`
-**Versions:** LLVM 17-21 (use `0001-0004-*-llvm22.patch` for 22+)
-**Purpose:** Enable SPIR-V 1.2 for warp-level primitives via subgroup extensions
+### llvm/
 
-### 2. Fix SPIR-V data layout (0002)
+| Patch | Purpose | Upstream status |
+|---|---|---|
+| 0001-spirv-version-and-extensions | As in llvm-21 | Upstreamed in LLVM 23+ behind `Triple::ChipStar` ([llvm#179902](https://github.com/llvm/llvm-project/pull/179902)) |
+| 0003-macos-hip-spirv | As in llvm-21 | Upstreamed via [llvm#183991](https://github.com/llvm/llvm-project/pull/183991) + [llvm#206902](https://github.com/llvm/llvm-project/pull/206902) |
 
-**Files:** `clang/lib/Basic/Targets/SPIR.h`, `llvm/lib/Target/SPIRV/SPIRVTargetMachine.cpp`
-**Versions:** LLVM 20-21 only (not needed for 17-19 or 22+, fixed at chipStar level)
-**Purpose:** Fix bitcode linking data layout mismatches (`-n8:16:32:64` removal)
+### spirv-translator/
 
-### 3. Unbundle SDL - Static Device Libraries (0003)
+| Patch | Purpose | Upstream status |
+|---|---|---|
+| 0001-pretend-subgroup-caps-are-spirv-1.2 | As in llvm-21 | Deliberate spec deviation, permanent |
 
-**File:** `clang/lib/Driver/ToolChains/HIPSPV.cpp`
-**Versions:** LLVM 17-21 (upstream in 22+, commit `ae0614de05ac`)
-**Purpose:** Enable RDC linking with static libraries containing device code
+## llvm-23
 
-### 4. Restrict SPIR-V extensions (0004)
+Different in kind from the earlier sets. LLVM 23 already carries the SPIR-V
+version/extension selection (upstreamed behind `Triple::ChipStar`), the
+static-device-library unbundling, the data layout, and the macOS Mach-O
+support, so none of those patches are needed. What it does *not* carry is
+[llvm#213052](https://github.com/llvm/llvm-project/pull/213052), which
+landed after `release/23.x` was cut.
 
-**File:** `clang/lib/Driver/ToolChains/HIPSPV.cpp`
-**Versions:** LLVM 17-21 (use `0001-0004-*-llvm22.patch` for 22+)
-**Purpose:** Replace `--spirv-ext=+all` with only required extensions
+### llvm/
 
-### 5. Fix archive data layout (0005)
+| Patch | Purpose | Upstream status |
+|---|---|---|
+| 0001-hipspv-in-tree-spirv-backend | Drive the in-tree SPIR-V backend from the HIPSPV toolchain by default, falling back to `llvm-spirv` under `-fno-integrated-objemitter`; map the `chipstar` OS to the Kernel execution environment | Backport of [llvm#213052](https://github.com/llvm/llvm-project/pull/213052) (`7ef0ca2b13f9`), first ships in LLVM 24 |
+| 0002-preserve-device-debug-info | Honor `-g` for device code, but only when the in-tree backend is the effective emitter | The ungated form is upstream ([llvm#210504](https://github.com/llvm/llvm-project/pull/210504)); the backend gate is chipStar-specific |
 
-**File:** `llvm/tools/llvm-link/llvm-link.cpp`
-**Versions:** All
-**Purpose:** Fix llvm-link creating empty "ArchiveModule" with wrong data layout
+The gate in 0002 is why device `-g` works here and nowhere else: the
+translator's `DebugTypeComposite` `Parent` operand creates a cyclic forward
+reference that `spirv-val` rejects and IGC mis-handles, so `-g` must keep
+being stripped whenever the translator is the producer. Because the strip
+happens in `HIPSPVToolChain::adjustDebugInfoKind`, clang CodeGen never emits
+a `DICompileUnit` on that path.
 
-### 6. macOS HIP SPIR-V support (0006)
+### spirv-translator/
 
-**Files:** `clang/lib/CodeGen/CGCUDANV.cpp`, `clang/lib/CodeGen/HIPUtility.cpp`, `clang/lib/Driver/ToolChains/Darwin.cpp`, `clang/lib/Driver/ToolChains/Darwin.h`, `clang/lib/Driver/ToolChains/HIPSPV.cpp`
-**Versions:** LLVM 17-21 use `0006-fix-macos-hip-spirv.patch`; LLVM 22+ use `0006-macos-hip-spirv-llvm22.patch`
-**Purpose:** Support HIP SPIR-V compilation on macOS (Mach-O sections, Darwin target init, skip host stdlib for device)
+| Patch | Purpose | Upstream status |
+|---|---|---|
+| 0001-pretend-subgroup-caps-are-spirv-1.2 | As in llvm-21 | Deliberate spec deviation, permanent |
 
----
+## Removed in the layout change
 
-## SPIRV-LLVM-Translator Patches
-
-- **0001** - fp_fast_mode extension fix (all versions)
-- **0002** - Shuffle version requirement to 1.2 (all versions, version-specific patches for 17/18)
-- **0003** - Fix LoopMerge error (LLVM 17-21, upstream in 22+)
-- **0004** - Fix blockMerge (LLVM 17-21, upstream in 22+)
-
-## LLVM 22 Patch Summary
-
-For LLVM 22, only these patches are applied:
-- `0001-0004-spirv-version-and-extensions-llvm22.patch` (combined SPIR-V version + extensions)
-- `0005-fix-archive-data-layout.patch` (llvm-link fix)
-- `0006-macos-hip-spirv-llvm22.patch` (macOS support)
-- Translator: `0001` (fp_fast_mode) and `0002` (shuffle version)
+- **archive-data-layout patch** (`llvm-link` empty "ArchiveModule" data layout
+  fix): deleted; a no-op versus the upstream IRMover behavior.
+- **fp_fast_mode test patch** (translator): deleted; a no-op.
+- **LLVM 17 through 20 support** and their version-specific patch variants
+  were dropped.

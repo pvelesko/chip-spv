@@ -97,15 +97,64 @@ endif()
 
 add_library(LLVMHipStripUsedIntrinsics MODULE HipStripUsedIntrinsics.cpp)
 add_library(LLVMHipDefrost MODULE HipDefrost.cpp)
-add_library(LLVMHipPasses MODULE HipPasses.cpp
-    HipDynMem.cpp HipStripUsedIntrinsics.cpp HipDefrost.cpp
-    HipPrintf.cpp HipGlobalVariables.cpp HipCleanup.cpp HipTextureLowering.cpp HipAbort.cpp
-    HipEmitLoweredNames.cpp HipWarps.cpp HipKernelArgSpiller.cpp
-    HipLowerZeroLengthArrays.cpp HipSanityChecks.cpp HipLowerSwitch.cpp
-    HipLowerMemset.cpp HipIGBADetector.cpp HipPromoteInts.cpp
+# One source per line, alphabetically sorted, so that two branches each adding
+# a pass insert at different anchors and merge without a conflict.
+#
+# Order is not load-bearing, but only because every pass guards its standalone
+# llvmGetPassPluginInfo with CHIP_COMBINED_PASS_PLUGIN, leaving HipPasses.cpp
+# as the single definition here. A pass that forgets the guard adds a second
+# LLVM_ATTRIBUTE_WEAK definition, which the link resolves silently by position
+# rather than rejecting; PassPluginRegistersPipeline below catches that.
+add_library(LLVMHipPasses MODULE
+    HipAbort.cpp
+    HipCanonicalizeGEP.cpp
+    HipCleanup.cpp
+    HipCoalesceDuplicatePhiPreds.cpp
+    HipDefrost.cpp
+    HipDynMem.cpp
+    HipEmitLoweredNames.cpp
+    HipFunctionPointerAS.cpp
+    HipGlobalVariables.cpp
+    HipIGBADetector.cpp
+    HipKernelArgSpiller.cpp
+    HipLowerFPAtomicMinMax.cpp
+    HipLowerHintIntrinsics.cpp
+    HipLowerMemset.cpp
+    HipLowerOverflowIntrinsics.cpp
+    HipLowerPointerVectors.cpp
+    HipLowerRoundIntrinsics.cpp
+    HipLowerSubwordAtomics.cpp
+    HipLowerSwitch.cpp
+    HipLowerVolatileAccesses.cpp
+    HipLowerZeroLengthArrays.cpp
+    HipPasses.cpp
+    HipPrintf.cpp
+    HipPromoteInts.cpp
+    HipSanityChecks.cpp
     HipSpirvFunctionReorderPass.cpp
+    HipStripDebugInfo.cpp
+    HipStripUsedIntrinsics.cpp
+    HipTextureLowering.cpp
     HipVerify.cpp
+    HipWarps.cpp
     ${EXTRA_OBJS})
+
+# The plugin registers its pipeline through llvmGetPassPluginInfo, and the
+# ordering note above explains how easily that registration is lost: the link
+# still succeeds, the symbol is still exported, and only an actual opt run
+# notices. Without this test the failure surfaces as every hipcc invocation
+# reporting "unknown pass name" with no build error anywhere.
+find_program(LLVM_OPT NAMES opt-${LLVM_VERSION_MAJOR} opt NAMES_PER_DIR
+  NO_DEFAULT_PATH PATHS ${CLANG_ROOT_PATH_BIN} ENV PATH)
+if(LLVM_OPT)
+  set(PLUGIN_PROBE_IR ${CMAKE_CURRENT_BINARY_DIR}/plugin-probe.ll)
+  file(WRITE ${PLUGIN_PROBE_IR} "define void @probe() { ret void }\n")
+  add_test(NAME PassPluginRegistersPipeline
+    COMMAND ${LLVM_OPT} -load-pass-plugin $<TARGET_FILE:LLVMHipPasses>
+            -passes=hip-post-link-passes ${PLUGIN_PROBE_IR} -o /dev/null)
+else()
+  message(STATUS "opt not found; skipping the pass plugin registration test")
+endif()
 
 # macOS Linking Requirements:
 # On macOS, the linker requires all symbols to be resolved at link time for
@@ -135,6 +184,14 @@ if(APPLE)
   target_link_libraries(LLVMHipDefrost PRIVATE LLVM)
 endif()
 
+# In Debug builds, default HipVerify to "failures" mode so the IR/SPIR-V
+# validation pipeline runs automatically (see HipVerify.cpp::getVerificationMode).
+# Release builds keep it off due to the compile-time cost (CHIP-SPV/chipStar#1047).
+target_compile_definitions(LLVMHipPasses PRIVATE
+  $<$<CONFIG:Debug>:CHIP_DEBUG_BUILD>
+  $<$<BOOL:${CHIP_KEEP_KERNEL_DEBUG_INFO}>:CHIP_KEEP_KERNEL_DEBUG_INFO>
+  $<$<BOOL:${CHIP_LLVM_USE_INTERGRATED_SPIRV}>:CHIP_LLVM_USE_INTERGRATED_SPIRV>)
+
 # If trying to recompile with LLVM unloaded, the inlcude path is not found
 target_compile_options(LLVMHipDynMem PRIVATE -I/${LLVM_INCLUDE_DIRS})
 target_compile_options(LLVMHipStripUsedIntrinsics PRIVATE -I/${LLVM_INCLUDE_DIRS})
@@ -155,3 +212,10 @@ install(TARGETS LLVMHipDynMem LLVMHipStripUsedIntrinsics LLVMHipDefrost LLVMHipP
         LIBRARY DESTINATION lib/llvm
         ARCHIVE DESTINATION lib/llvm
         )
+target_compile_definitions(LLVMHipPasses PRIVATE CHIP_COMBINED_PASS_PLUGIN)
+
+# Selects the volatile access lowering baked into the pass. See the header of
+# HipLowerVolatileAccesses.cpp for why the default is cache controls.
+if(CHIP_VOLATILE_LOWERING_ATOMIC)
+  target_compile_definitions(LLVMHipPasses PRIVATE CHIP_ATOMICS_CACHE_BYPASS_WORKAROUND)
+endif()

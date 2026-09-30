@@ -85,6 +85,9 @@ endfunction()
 add_hipcc_test(TestNoinlineAttrs.hip HIPCC_OPTIONS -c)
 add_hipcc_test(TestAPIObjects.hip HIPCC_OPTIONS -c)
 
+# Calls HipPrintf builds must use their callee's convention (#1677).
+add_shell_test(TestFix1677PrintfCallConv.bash)
+
 # Test the hip_runtime.h header compiles in C++ mode. If the test
 # passes - the header probably is compilable by other regular C++
 # compilers too (e.g. g++).
@@ -92,26 +95,55 @@ add_hipcc_test(TestHipRuntimeHeaderInclude.cpp
   TEST_NAME hip-runtime-header-cpp-mode
   HIPCC_OPTIONS -x c++ -fsyntax-only)
 
+# A shared memory clone must not keep memory(argmem: none) (#1679).
+add_shell_test(TestFix1679DynMemCloneMemoryAttr.bash)
+
 add_hipcc_test(TestAtomicAddNoRet.hip HIPCC_OPTIONS -fsyntax-only)
 add_hipcc_test(TestFloat128Macros.hip TEST_NAME TestFloat128gnupp14
   HIPCC_OPTIONS -std=gnu++14 -fsyntax-only)
 
 add_hipcc_test(TestDoubleShuffleOverloads.hip HIPCC_OPTIONS -fsyntax-only)
+add_hipcc_test(TestFix797ShflHalf.hip HIPCC_OPTIONS -fsyntax-only)
 add_hipcc_test(TestHipComplexInclude.hip HIPCC_OPTIONS)
+
+add_shell_test(TestFix1650NonLoweredInitGlobalAddress.bash)
+if(CHIP_LLVM_USE_INTERGRATED_SPIRV)
+  # Fails the day the backend accepts the shape HipOffsetBeforeCastPass
+  # rewrites. Read its header before acting.
+  add_shell_test(CanaryGepOverCastInitializer.bash)
+  # Fails the day the backend stops taking an initializer's byte offset as an
+  # array index. Read its header before acting.
+  add_shell_test(CanaryByteOffsetInitializer.bash)
+endif()
 
 add_hipcc_test(TestHipccAcceptCcFiles.cc HIPCC_OPTIONS)
 add_hipcc_test(TestHipccAcceptCppFiles.cpp HIPCC_OPTIONS)
 
-# Test513Regression hits SPIRVLegalizePointerCast aggregate-store assertions
-# in the in-tree LLVM SPIR-V backend (handled by legacy llvm-spirv translator).
-# Skip under CHIP_USE_NATIVE_VULKAN_SPIRV.
+# HIP device kernel + host (CPU) OpenMP in one TU must compile and link with
+# -fopenmp.
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+  add_hipcc_test(TestHipccFopenmp.cc HIPCC_OPTIONS -fopenmp)
+endif()
+
+# -fopenmp-simd must stay host-only; on the device clang asserts (#1566).
+add_hipcc_test(TestHipccAcceptCcFiles.cc TEST_NAME TestFix1566FopenmpSimd
+  HIPCC_OPTIONS -fopenmp-simd)
+
+# In-tree SPIR-V backend asserts on this under the native Vulkan path.
 if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
   add_hipcc_test(Test513Regression.hip HIPCC_OPTIONS)
 endif()
 
+# The spilled kernel must call the original one the way it is declared.
+add_shell_test(TestFix1678SpillerCallConv.bash)
+
 add_test(NAME "TestHipccNeedsDashO"
   COMMAND ${CMAKE_BINARY_DIR}/bin/hipcc
   ${CMAKE_CURRENT_SOURCE_DIR}/TestHipccNeedDashO.cc)
+
+# A shared memory user that calls another user must be lowered once (#1662).
+add_shell_test(TestFix1662DynMemUserCallsUser.bash)
 
 add_hipcc_test(TestHipVersion.cc HIPCC_OPTIONS)
 
@@ -125,12 +157,39 @@ add_test(NAME "TestHipccHalfOperators"
 
 add_hipcc_test(TestFix1248HalfHostOps.hip HIPCC_OPTIONS -fsyntax-only)
 
+# A call to a shared memory user must pass the caller's argument (#1670).
+add_shell_test(TestFix1670DynMemCallArgs.bash)
+
+# A local array initialized with shared memory addresses must compile (#1692).
+add_hipcc_test(TestFix1692DynSharedLocalInit.hip HIPCC_OPTIONS -O2 -c)
+# TIMEOUT is a hang guard only; the test takes about a second.
+set_tests_properties(hipcc-TestFix1692DynSharedLocalInit PROPERTIES TIMEOUT 120)
+# Fails the day clang stops hoisting such an initializer, which is the signal to
+# delete HipSharedAddrLocalInitPass. Read its header before acting.
+add_shell_test(CanarySharedAddrInitHoisted.bash)
+# A static table of dynamic shared addresses cannot be lowered; hipcc must say so.
+add_hipcc_test(TestFix1692DynSharedStaticTable.hip HIPCC_OPTIONS -c)
+set_tests_properties(hipcc-TestFix1692DynSharedStaticTable PROPERTIES TIMEOUT 120
+  PASS_REGULAR_EXPRESSION "initialized with the address of dynamic shared memory")
+
+add_hipcc_test(TestHalfDeviceMathFuncs.hip HIPCC_OPTIONS -fsyntax-only)
+
+add_hipcc_test(TestFix1582StdTraitSpecialization.hip HIPCC_OPTIONS -fsyntax-only)
+
+add_hipcc_test(TestRocmVersionHeader.hip HIPCC_OPTIONS -fsyntax-only)
+
+# A call rewritten for shared memory must keep how it calls the callee (#1673).
+add_shell_test(TestFix1673DynMemCallConv.bash)
+
 add_hipcc_test(TestZeroLenArrayTypes.hip TEST_NAME TestZeroLenArrayTypes-O0
   HIPCC_OPTIONS -O0 -c)
 add_hipcc_test(TestZeroLenArrayTypes.hip TEST_NAME TestZeroLenArrayTypes-O1
   HIPCC_OPTIONS -O1 -c)
 add_hipcc_test(TestPrintfLonePercent.hip HIPCC_OPTIONS -c)
 add_hipcc_test(inputs/testIssue606.cpp HIPCC_OPTIONS -D__HIP_PLATFORM_SPIRV__ -x c++ -c)
+
+# Lowering a module with many shared memory users must be reproducible (#1661).
+add_shell_test(TestFix1661DynMemOrder.bash)
 
 add_shell_test(TestHipccCompileAndLink.bash)
 add_shell_test(TestHipccCompileThenLink.bash)
@@ -152,35 +211,104 @@ add_shell_test(TestHipcc692Regression.bash)
 add_shell_test(TestHipccFileOrderPreservation.bash)
 add_shell_test(TestHipcc945MacroSpace.bash)
 add_shell_test(TestHipccArgOrder.bash)
-# Separate compilation uses clang-offload-bundler which calls llvm-objcopy
-# with options not supported on MachO (macOS).
+add_shell_test(TestFix1631HipccClangFallback.bash)
+# Separate compilation and -fgpu-rdc use clang-offload-bundler which calls
+# llvm-objcopy with options not supported on MachO (macOS).
 if(NOT APPLE AND NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
   add_shell_test(TestSeparateCompilation.bash)
+  add_shell_test(TestRDCNoDataLayoutWarning.bash)
+  # Two translation units both including hip_bf16.h, device-linked with -fgpu-rdc.
+  add_shell_test(TestBFloat16RDC.bash)
 endif()
 add_subdirectory(rdcLink)
 add_test(NAME "TestHipccMultiSource" COMMAND 
   ${CMAKE_BINARY_DIR}/bin/hipcc ${CMAKE_CURRENT_SOURCE_DIR}/TestHipccCompileThenLinkMain.cpp ${CMAKE_CURRENT_SOURCE_DIR}/TestHipccCompileThenLinkKernel.cpp -o TestHipccMultiSource)
 add_shell_test(TestPrintfStaticString.bash)
 
+add_shell_test(TestFix1680DuplicatePhiPreds.bash)
+# Regression test for HipCoalesceDuplicatePhiPredsPass (#1680). Translates to
+# SPIR-V and runs spirv-val; skips when LLVM_SPIRV is NOT_NEEDED.
+add_shell_test(TestSpirvDuplicatePhiHip.bash)
+add_shell_test(TestFix1577PointerVectors.bash)
+# A constant zero length copy must not reach SPIR-V emission.
+add_shell_test(TestFix1634ZeroLengthCopy.bash)
+add_shell_test(TestFix1640AggregateInitGlobalAddress.bash)
+if(CHIP_LLVM_USE_INTERGRATED_SPIRV)
+  add_shell_test(TestFix1654FPContract.bash)
+  # Fails the day the backend stops forcing ContractionOff. Read its header.
+  add_shell_test(CanaryFPContractionOff.bash)
+endif()
+# Fails the day upstream stops rejecting <N x ptr>, which is the signal to
+# delete the hip-lower-pointer-vectors pass. Read its header before acting.
+add_shell_test(CanaryPointerVectorsRejected.bash)
+# Fails the day llvm-spirv stops rejecting one of the hint intrinsics, which is
+# the signal to delete that case. Read its header before acting. Needs the
+# translator, so it is not registered when LLVM_SPIRV is NOT_NEEDED.
+if(NOT LLVM_SPIRV STREQUAL "NOT_NEEDED")
+  add_shell_test(CanaryHintIntrinsicsRejected.bash)
+  # Fails once llvm-spirv carries KhronosGroup/SPIRV-LLVM-Translator#3866; read its header.
+  add_shell_test(CanaryDuplicatePhiPredecessors.bash)
+endif()
+
+add_shell_test(TestTextureUnsupportedMixedDim.bash)
+
 add_hipcc_test(TestLdg.hip HIPCC_OPTIONS -fsyntax-only)
 add_hipcc_test(TestSwitchCase.hip HIPCC_OPTIONS -O1 -c)
+# Device side C++ virtual dispatch (CHIP-SPV/chipStar#1373). Compile only: -c
+# already runs the device link that translates to SPIR-V, which is where the
+# unfixed compiler failed. The dispatch is executed by
+# tests/runtime/TestDeviceVirtualDispatch.hip on devices that can run it.
+add_hipcc_test(TestDeviceVirtualFunctions.hip HIPCC_OPTIONS -c)
+# Dead vtables of an explicit instantiation must not survive into the device
+# module (#1382). Inspects the lowered device bitcode.
+add_shell_test(TestDeadVTableVirtualBase.bash)
+# Program-scope variable init kernels must use their work items (#582).
+add_shell_test(TestFix582VarInitWorkItems.bash)
+add_hipcc_test(TestFix1647ShadowKernelNames.hip HIPCC_OPTIONS -c)
 add_hipcc_test(TestHostSideHIPVectors.hip HIPCC_OPTIONS -fsyntax-only)
 add_hipcc_test(TestAlignAttr.hip HIPCC_OPTIONS -fsyntax-only)
 # Check CHIP_FAST_MATH is set for -ffast-math and preprocessor guards
 # using it are not hiding errors.
 add_hipcc_test(TestFastMath.hip HIPCC_OPTIONS -fsyntax-only -ffast-math)
 add_hipcc_test(TestDim3Cast.hip HIPCC_OPTIONS -fsyntax-only)
-# TestPlacement triggers SPIRVLegalizePointerCast aggregate-load assertions
-# in the in-tree LLVM SPIR-V backend. Skip under CHIP_USE_NATIVE_VULKAN_SPIRV.
-if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
+# TestPlacement uses device-side new[]/delete[], which require device malloc
+# (the device heap program-scope global). Skip when that feature is disabled.
+if(CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS AND NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
   add_hipcc_test(TestPlacement.hip)
 endif()
 
 # Test for math header conflicts between system cmath and HIP device math
 add_hipcc_test(TestMathHeaderConsolidated.hip HIPCC_OPTIONS -fsyntax-only)
 
+# Builtins whose intrinsics reach the device link and fail there. -O0 only:
+# LLVM's LowerConstantIntrinsics folds llvm.objectsize away from -O1 up.
+foreach(HINT_TEST
+    TestBuiltinPrefetch
+    TestBuiltinReadCycleCounter
+    TestBuiltinReadSteadyCounter
+    TestBuiltinFltRounds
+    TestBuiltinAllowRuntimeCheck
+    TestBuiltinReturnAddress
+    TestBuiltinFrameAddress
+    TestBuiltinMemcpyInline
+    TestBuiltinObjectSize)
+  add_hipcc_test(${HINT_TEST}.hip HIPCC_OPTIONS -O0 -c)
+endforeach()
+# A prefetch on a global pointer reaches SPIR-V as a real OpenCL prefetch.
+add_shell_test(TestPrefetchLowering.bash)
+# __ballot_sync must call a __chip_ballot_sync of matching type (#1723).
+add_shell_test(TestFix1723BallotSyncType.bash)
+
 # Add the promoteInt tests
 add_subdirectory(promoteInt)
 
 # Add the IR verification tests
 add_subdirectory(irVerification)
+
+# Add the 8 and 16 bit atomic lowering pass tests
+add_subdirectory(subwordAtomics)
+
+# Add the untranslatable math intrinsic (llround / llrint / ldexp) pass tests
+add_subdirectory(mathIntrinsics)
+# Add the volatile global access lowering pass tests
+add_subdirectory(volatileAccesses)

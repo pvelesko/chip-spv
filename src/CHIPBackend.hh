@@ -44,6 +44,7 @@
 #include "logging.hh"
 #include "macros.hh"
 #include "CHIPException.hh"
+#include <memory>
 #include <utility>
 
 #include "SPVRegister.hh"
@@ -477,23 +478,21 @@ struct AllocationInfo {
   void *HostPtr;
   size_t Size;
   chipstar::HostAllocFlags Flags;
-  /// Flags originally requested by the user (without UVA / mapping bits the
-  /// runtime adds for its own bookkeeping). Returned by hipHostGetFlags so
-  /// that tests checking strict equality against the requested flag set pass.
-  chipstar::HostAllocFlags RequestedFlags;
   hipDevice_t Device;
   bool Managed = false;
   enum hipMemoryType MemoryType;
   bool RequiresMapUnmap = false;
   bool IsHostRegistered = false; ///< True if registered via hipHostRegister().
-  /// Process-unique id for hipPointerGetAttribute(BUFFER_ID).
-  uint64_t BufferId = 0;
 
   // Managed memory attributes
   int LastPrefetchLocation = -2; ///< Device ID where memory was last prefetched, -2 if never prefetched
   bool ReadMostly = false; ///< Whether memory range is marked as read-mostly
   int PreferredLocation = -2; ///< Preferred device location, -2 (hipInvalidDeviceId) if not set
   std::vector<int> AccessedBy; ///< List of device IDs that access this memory
+  /// hipMemAdviseSetCoarseGrain is in effect on a managed allocation. Only
+  /// hipMemRangeAttributeCoherencyMode reads it; the backends keep the range
+  /// coherent regardless.
+  bool CoarseGrain = false;
 
   /// True if the allocation is accessible from device.
   bool isDeviceAccessible() const {
@@ -543,6 +542,30 @@ public:
     this->PtrToAllocInfo_[HostPtr] = AllocInfo;
     AllocInfo->MemoryType = hipMemoryTypeManaged;
     AllocInfo->IsHostRegistered = true;
+    NumManagedAllocations_ += 1;
+  }
+
+  /**
+   * @brief Record a hipHostRegister'd pointer without yet allocating device
+   * memory. DevPtr is left null and filled in lazily by hipHostGetDevicePointer.
+   *
+   * @param HostPtr  User-provided host pointer (malloc'd by the caller)
+   * @param Device   Device ID the registration is associated with
+   * @param Size     Byte size of the host allocation
+   * @param Flags    Host allocation flags
+   */
+  void registerHostPointerDeferred(void *HostPtr, hipDevice_t Device,
+                                   size_t Size, chipstar::HostAllocFlags Flags) {
+    CHIPASSERT(HostPtr && "HostPtr is null");
+    LOCK(AllocationTrackerMtx);
+    if (PtrToAllocInfo_.count(HostPtr))
+      CHIPERR_LOG_AND_THROW("Host memory is already registered!",
+                            hipErrorHostMemoryAlreadyRegistered);
+    chipstar::AllocationInfo *AllocInfo = new chipstar::AllocationInfo{
+        nullptr, HostPtr, Size, Flags, Device, false, hipMemoryTypeManaged};
+    AllocInfo->IsHostRegistered = true;
+    AllocInfos_.insert(AllocInfo);
+    PtrToAllocInfo_[HostPtr] = AllocInfo;
     NumManagedAllocations_ += 1;
   }
 
@@ -673,9 +696,10 @@ private:
   // NOTE: The alignment infromation is not carried in __hipRegisterVar() calls
   // It have to be queried via shadow kernels.
   size_t Alignment_ = 0;
-  /// Tells if the variable has an initializer. NOTE: Variables are
-  /// initialized via a shadow kernel.
+  /// Tells if the variable has an initializer.
   bool HasInitializer_ = false;
+  /// CHIPVarInfo[2] reported for the variable.
+  int64_t InitKind_ = 0;
 
 public:
   DeviceVar(const SPVVariable *SrcVar) : SrcVar_(SrcVar) {}
@@ -693,14 +717,11 @@ public:
   }
   bool hasInitializer() const { return HasInitializer_; }
   void markHasInitializer(bool State = true) { HasInitializer_ = State; }
+  void setInitKind(int64_t Kind) { InitKind_ = Kind; }
+  bool hasGridStrideInit() const { return InitKind_ == ChipVarInitGridStride; }
+  bool isHostFilled() const { return InitKind_ == ChipVarInitHostFill; }
 
-  /// Phase I3 (Vulkan path): cached initializer bytes recovered from the
-  /// SPV's `__hipspv_dg_<sym>__sz_<n>__init_<hex>` OpName encoding. The
-  /// Module::allocateDeviceVariablesNoLock fast-path memcpys these into
-  /// the freshly-allocated device buffer; the Module::resetDeviceVariables
-  /// path re-applies them on hipDeviceReset. Empty for OpenCL-path vars
-  /// and for Vulkan vars whose initializer was zero/undef (the runtime
-  /// leaves the buffer at its alloc-default).
+  /// Initializer bytes reflected from Vulkan SPIR-V; empty on other paths.
   const std::vector<uint8_t> &getInitData() const { return InitData_; }
   void setInitData(std::vector<uint8_t> Bytes) {
     InitData_ = std::move(Bytes);
@@ -710,6 +731,8 @@ public:
 
 private:
   std::vector<uint8_t> InitData_;
+
+public:
 };
 
 class Event : public ihipEvent_t {
@@ -720,21 +743,6 @@ protected:
   chipstar::EventFlags Flags_;
   bool SignalEnqueued_ = false;
   bool Deleted_ = false;
-  // Set when the event was recorded on a stream that is capturing into a
-  // graph. hipStreamWaitEvent uses this to propagate the capture-active
-  // status from the recording stream to the waiting stream so a subsequent
-  // hipStreamBeginCapture on that stream is rejected (matching CUDA's
-  // capture-propagation contract). Cleared when the event is reset.
-  bool RecordedFromCapturingStream_ = false;
-  // CaptureId of the stream that recorded this event when capturing. Zero
-  // when the event was recorded outside of a capture. Propagated to a
-  // forked stream via hipStreamWaitEvent so EndCapture can reset that fork.
-  unsigned long long RecordedCaptureId_ = 0;
-  // Snapshot of the recording stream's LastNode_ at the moment
-  // hipEventRecord was called inside an active stream capture. A later
-  // hipStreamWaitEvent on a (possibly different) stream uses this to add a
-  // cross-stream dependency edge in the shared capture graph.
-  CHIPGraphNode *RecordedCaptureNode_ = nullptr;
 
   /**
    * @brief Events are always created with a context
@@ -742,16 +750,42 @@ protected:
    */
   chipstar::Context *ChipContext_;
 
+  /// The capturing stream this event was last recorded on, while that
+  /// capture is active; null when the event is not part of a capture.
+  Queue *CaptureQueue_ = nullptr;
+  /// The capture dependencies of CaptureQueue_ at the time of the record.
+  /// A stream that waits on this event continues from these nodes.
+  std::vector<CHIPGraphNode *> CaptureNodes_;
+
   /**
    * @brief hidden default constructor for Event. Only derived class
    * constructor should be called.
    *
    */
   Event() : TrackCalled_(false), UserEvent_(false) {}
-  virtual ~Event() { logTrace("~Event() {}", (void *)this); };
 
 public:
+  // Public so hipEventDestroy can delete through chipstar::Event* and reach this
+  // virtual destructor (see hipEventDestroy).
+  virtual ~Event() { logTrace("~Event() {}", (void *)this); };
+
   std::vector<std::shared_ptr<chipstar::Event>> DependsOnList;
+
+  /// Mark this event as recorded on capturing stream Queue at the point where
+  /// the capture's next node would depend on Nodes.
+  void setCapture(Queue *Q, const std::vector<CHIPGraphNode *> &Nodes) {
+    CaptureQueue_ = Q;
+    CaptureNodes_ = Nodes;
+  }
+  void clearCapture() {
+    CaptureQueue_ = nullptr;
+    CaptureNodes_.clear();
+  }
+  /// The capturing stream that recorded this event, or null.
+  Queue *getCaptureQueue() const { return CaptureQueue_; }
+  const std::vector<CHIPGraphNode *> &getCaptureNodes() const {
+    return CaptureNodes_;
+  }
   void setRecording() {
     isDeletedSanityCheck();
     EventStatus_ = EVENT_STATUS_RECORDING;
@@ -761,18 +795,6 @@ public:
   void setTrackCalled(bool Val) { TrackCalled_ = Val; }
   bool isUserEvent() { return UserEvent_; }
   void setUserEvent(bool Val) { UserEvent_ = Val; }
-  bool wasRecordedFromCapturingStream() const {
-    return RecordedFromCapturingStream_;
-  }
-  void setRecordedFromCapturingStream(bool Val) {
-    RecordedFromCapturingStream_ = Val;
-  }
-  unsigned long long getRecordedCaptureId() const {
-    return RecordedCaptureId_;
-  }
-  void setRecordedCaptureId(unsigned long long Id) { RecordedCaptureId_ = Id; }
-  CHIPGraphNode *getRecordedCaptureNode() const { return RecordedCaptureNode_; }
-  void setRecordedCaptureNode(CHIPGraphNode *N) { RecordedCaptureNode_ = N; }
   /// @brief Add an event on which this event depends, preventing that event
   /// from getting recycled
   /// @param Event
@@ -898,10 +920,12 @@ class Program {
   /// Include headers.
   std::map<std::string, std::string> Headers_;
 
-  /// Name expressions added before compilation as key to the
-  /// map. After compilation they point to their lowered/mangled
-  /// names. The map value may also be empty meaning the lowered name
-  /// is unknown.
+  /// Name expressions added before compilation are inserted as keys with an
+  /// empty value. After a successful compilation (or a successful HIPRTC
+  /// cache load) the value holds the lowered/mangled name. An empty value
+  /// after compilation indicates a pipeline error: hiprtcGetLoweredName
+  /// treats it as HIPRTC_ERROR_INTERNAL_ERROR rather than returning a
+  /// pointer to an empty string.
   std::map<std::string, std::string> NameExpressions_;
 
   std::string ProgramLog_; ///< Captured compilation log.
@@ -972,6 +996,12 @@ protected:
   std::mutex Mtx_;
   // Global variables
   std::vector<chipstar::DeviceVar *> ChipVars_;
+  /// Source descriptions of the device variables this module carries but the
+  /// host never registered with __hipRegisterVar, see
+  /// addUnregisteredDeviceVariables(). Owned per module: every module that
+  /// carries such a variable has its own copy of it and needs its own
+  /// storage bound to it.
+  std::vector<std::unique_ptr<SPVVariable>> UnregisteredVars_;
   // Kernels
   std::vector<chipstar::Kernel *> ChipKernels_;
   /// Binary representation extracted from FatBinary.
@@ -1090,6 +1120,11 @@ public:
 
   std::vector<chipstar::DeviceVar *> &getDeviceVariables() { return ChipVars_; }
 
+  /// Record a device variable for every __chip_var_info_<X> shadow kernel of
+  /// this module whose X has no device variable yet. Caller must hold
+  /// DeviceVarMtx.
+  void addUnregisteredDeviceVariables();
+
   hipError_t allocateDeviceVariablesNoLock(chipstar::Device *Device,
                                            chipstar::Queue *Queue);
   void prepareDeviceVariablesNoLock(chipstar::Device *Device,
@@ -1186,6 +1221,12 @@ public:
   virtual chipstar::Module *getModule() = 0;
   virtual const chipstar::Module *getModule() const = 0;
 };
+
+/// Resolve the storage address of the device global backing an implicit
+/// DeviceGlobal kernel argument (globals-as-kernel-args lowering). Throws
+/// hipErrorLaunchFailure if the global's storage is not allocated.
+void *getDeviceGlobalArgAddr(chipstar::Kernel *Kernel,
+                             const SPVFuncInfo::KernelArg &Arg);
 
 class ArgSpillBuffer {
   chipstar::Context *Ctx_; ///< A context to allocate device space from.
@@ -1298,6 +1339,18 @@ public:
   virtual chipstar::Kernel *getKernel() = 0;
 
   /**
+   * @brief Give this exec item a private, independent kernel handle.
+   *
+   * Used by persistent HIP graph kernel nodes so that two nodes launching the
+   * same kernel function bind their arguments to independent kernel handles
+   * instead of clobbering one shared handle (issue #782). Must be called after
+   * setKernel() and before setupAllArgs(). The default is a no-op: backends
+   * whose exec items already own a private handle (e.g. OpenCL borrows a unique
+   * cl_kernel in setKernel()) need no isolation.
+   */
+  virtual void useIndependentKernelHandle() {}
+
+  /**
    * @brief Get the Queue object
    *
    * @return Queue*
@@ -1356,6 +1409,11 @@ class Device {
   /// Modules compiled so far.
   std::unordered_map<const SPVModule *, chipstar::Module *>
       SrcModToCompiledMod_;
+  /// Source modules whose compilation failed, with the error the attempt
+  /// threw. A later request for such a module gets the same error back
+  /// without another compile attempt, which on a large module can take
+  /// minutes per API call.
+  std::unordered_map<const SPVModule *, CHIPError> FailedSrcMods_;
   /// Host pointer mapping to modules.
   std::unordered_map<const void *, chipstar::Module *> HostPtrToCompiledMod_;
 
@@ -1371,6 +1429,11 @@ protected:
   hipDeviceAttribute_t Attrs_;
   hipDeviceProp_t HipDeviceProps_;
 
+  /// Device-wide cache configuration hint. chipStar has no reconfigurable
+  /// cache, so this is stored and echoed back (a no-op hint) to match the
+  /// HIP set/get round-trip contract.
+  hipFuncCache_t CacheConfig_ = hipFuncCachePreferNone;
+
   size_t TotalUsedMem_;
   size_t MaxUsedMem_;
   size_t MaxMallocSize_ = 0;
@@ -1380,23 +1443,11 @@ protected:
 
   int Idx_ = -1; // Initialized with a value indicating unset ID.
 
-  /// Device-scope flags as set by hipSetDeviceFlags / hipCtxCreate.
-  unsigned int DeviceFlags_ = hipDeviceScheduleAuto;
-
-  /// Last-set L1/shared cache hint. Recorded so Get/Set round-trips
-  /// match the HIP/CUDA contract; cache behaviour itself is unaffected.
-  hipFuncCache_t CacheConfig_ = hipFuncCachePreferNone;
-
   // only callable from derived classes, because we need to call also init()
   Device(chipstar::Context *Ctx, int DeviceIdx);
   // initializer. may call virtual methods
   void init();
   bool PerThreadStreamUsed_ = false;
-
-public:
-  void setDeviceFlags(unsigned int Flags) { DeviceFlags_ = Flags; }
-  unsigned int getDeviceFlags() const { return DeviceFlags_; }
-protected:
 
 public:
   // atomic int for counting number of threads that were created
@@ -1591,11 +1642,6 @@ public:
    */
   void reset() {
     invalidateDeviceVariables();
-    // Restore device-scope hints to their defaults so a subsequent
-    // hipGetDeviceFlags / hipDeviceGetCacheConfig query reports the
-    // same values it would on a freshly-initialized device.
-    DeviceFlags_ = hipDeviceScheduleAuto;
-    CacheConfig_ = hipFuncCachePreferNone;
     // resetImpl();
   }
 
@@ -1840,6 +1886,10 @@ public:
   virtual void *
   allocateImpl(size_t Size, size_t Alignment, hipMemoryType MemType,
                chipstar::HostAllocFlags Flags = chipstar::HostAllocFlags()) = 0;
+
+
+  virtual void importHostMemory(void *HostPtr, size_t SizeBytes) = 0;
+  virtual void releaseHostMemory(void *HostPtr) = 0;
 
   /**
    * @brief Returns true if the pointer is mapped to virtual memory with
@@ -2179,23 +2229,21 @@ protected:
   hipStreamCaptureStatus CaptureStatus_ = hipStreamCaptureStatusNone;
   hipStreamCaptureMode CaptureMode_ = hipStreamCaptureModeGlobal;
   hipGraph_t CaptureGraph_ = nullptr;
-  /// Unique non-zero capture sequence ID assigned at hipStreamBeginCapture
-  /// and cleared (to 0) at hipStreamEndCapture. Reported by
-  /// hipStreamGetCaptureInfo / hipStreamGetCaptureInfo_v2.
-  unsigned long long CaptureId_ = 0;
-  /// Thread that called hipStreamBeginCapture. Used by hipStreamEndCapture
-  /// to enforce CUDA's same-thread rule for Global / ThreadLocal modes
-  /// (Unit_hipStreamEndCapture_Thread_Negative).
-  std::thread::id CaptureThread_{};
-  /// @brief  node for creating a dependency chain between subsequent record
-  /// events when in graph capture mode
-  CHIPGraphNode *LastNode_ = nullptr;
-  /// Cross-stream fork-in dependencies accumulated by hipStreamWaitEvent
-  /// during capture. The next captured node on this stream gains a
-  /// dependency on every node in this list, then the list is cleared.
-  /// Implements CUDA's "wait-event during capture creates a join edge,
-  /// not a graph node" semantics.
-  std::vector<CHIPGraphNode *> PendingCaptureDeps_;
+  /// The nodes the next node recorded on this stream depends on: the node
+  /// recorded last on this stream plus the nodes joined in by waiting on
+  /// events recorded by other streams of the same capture.
+  std::vector<CHIPGraphNode *> CaptureDeps_;
+  /// True for the stream hipStreamBeginCapture was called on; only that
+  /// stream may end the capture.
+  bool CaptureOrigin_ = false;
+  /// The capturing stream whose event this stream waited on to enter the
+  /// capture; null for the origin stream.
+  Queue *CaptureParent_ = nullptr;
+  /// Streams that entered this stream's capture by waiting on its events.
+  std::set<Queue *> CaptureForks_;
+  /// Events recorded on this stream during the capture. Waiting on one of
+  /// them from another stream joins that stream into the capture.
+  std::set<chipstar::Event *> CaptureEvents_;
   int Priority_;
   /**
    * @brief Maximum priority that can be had by a queue is 0; Priority range is
@@ -2337,69 +2385,54 @@ public:
     if (getCaptureStatus() == hipStreamCaptureStatusActive) {
       auto Graph = getCaptureGraph();
       auto Node = new GraphNodeType(ArgsPack...);
-      updateLastNode(Node);
+      chainCaptureNode(Node);
       Graph->addNode(Node);
       return true;
     }
     return false;
   }
 
-  void updateLastNode(CHIPGraphNode *NewNode);
-  void initCaptureGraph();
+  /// Make NewNode depend on the current capture dependencies and become the
+  /// sole dependency of whatever is recorded on this stream next.
+  void chainCaptureNode(CHIPGraphNode *NewNode);
+  /// Add Nodes to the current capture dependencies (a join from an event
+  /// recorded by another stream of the capture).
+  void addCaptureDependencies(const std::vector<CHIPGraphNode *> &Nodes);
+  const std::vector<CHIPGraphNode *> &getCaptureDependencies() const {
+    return CaptureDeps_;
+  }
+  /// Start a capture into a fresh graph with this stream as its origin.
+  void beginCapture(hipStreamCaptureMode Mode);
+  /// Enter the capture Parent is part of: record into the same graph,
+  /// starting with no dependencies (the caller adds the event's nodes).
+  void joinCapture(Queue *Parent);
+  /// Record Event as captured on this stream at the current dependencies.
+  void captureEvent(chipstar::Event *Event);
+  /// Forget Event (it was recorded outside the capture or destroyed).
+  void releaseCaptureEvent(chipstar::Event *Event);
+  /// Leave the capture: reset this stream's capture state, the state of every
+  /// stream forked from it, and the events recorded on them. Does not touch
+  /// the graph.
+  void endCapture();
+  bool isCaptureOrigin() const { return CaptureOrigin_; }
+  Queue *getCaptureParent() const { return CaptureParent_; }
 
   hipStreamCaptureStatus getCaptureStatus() const {
     return CaptureStatus_;
   }
 
+  /// An invalidated fork invalidates the whole capture, so the status is
+  /// propagated up to the origin stream.
   void setCaptureStatus(hipStreamCaptureStatus CaptureMode) {
     CaptureStatus_ = CaptureMode;
+    if (CaptureMode == hipStreamCaptureStatusInvalidated && CaptureParent_)
+      CaptureParent_->setCaptureStatus(CaptureMode);
   }
   hipStreamCaptureMode getCaptureMode() const { return CaptureMode_; }
   void setCaptureMode(hipStreamCaptureMode CaptureMode) {
     CaptureMode_ = CaptureMode;
   }
-  unsigned long long getCaptureId() const { return CaptureId_; }
-  void setCaptureId(unsigned long long Id) { CaptureId_ = Id; }
-  std::thread::id getCaptureThread() const { return CaptureThread_; }
-  void setCaptureThread(std::thread::id Id) { CaptureThread_ = Id; }
   CHIPGraph *getCaptureGraph() const;
-
-  /// Adopt another stream's capture graph as our own (e.g. when joining a
-  /// fork created by hipStreamWaitEvent during capture). Does not free the
-  /// existing graph — caller is responsible for ownership semantics.
-  void setCaptureGraph(CHIPGraph *G) {
-    CaptureGraph_ = reinterpret_cast<hipGraph_t>(G);
-  }
-
-  /// Record that the next captured node on this stream must depend on
-  /// @p Node (cross-stream join edge). Called by hipStreamWaitEvent in
-  /// capture mode.
-  void addPendingCaptureDep(CHIPGraphNode *Node) {
-    if (Node)
-      PendingCaptureDeps_.push_back(Node);
-  }
-
-  /// Drain the pending fork-in dependencies; returned by-value and
-  /// internally cleared so the next captured node consumes them once.
-  std::vector<CHIPGraphNode *> takePendingCaptureDeps() {
-    auto V = std::move(PendingCaptureDeps_);
-    PendingCaptureDeps_.clear();
-    return V;
-  }
-
-  CHIPGraphNode *getLastNode() const { return LastNode_; }
-
-  /// Tear down per-stream capture-time bookkeeping. Called at
-  /// hipStreamEndCapture for every queue that participated in the capture,
-  /// so a subsequent hipStreamBeginCapture on the same stream starts from
-  /// a clean slate. The owning queue's CaptureGraph_ pointer is handed off
-  /// to the user; forked queues share the same pointer and must drop it
-  /// here without freeing.
-  void clearCaptureState() {
-    CaptureGraph_ = nullptr;
-    LastNode_ = nullptr;
-    PendingCaptureDeps_.clear();
-  }
 
   chipstar::Device *PerThreadQueueForDevice = nullptr;
 

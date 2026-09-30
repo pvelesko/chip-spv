@@ -200,10 +200,10 @@ static void analyze(Value *V, TextureUseGroup &TexUseGroup,
   };
 
   if (TexUseGroupMap.count(V)) { // Already visited and processed?
-    // Check this analysis run does not overlap with a previous one.
-    // FIXME/TODO: Only accepted overlap is nodes that are classified as unknown
-    //             source and texture user.
-    assert(TexUseGroupMap[V] == &TexUseGroup);
+    // The same texture value can be reached from multiple texture calls in
+    // unsupported use cases such as a single texture object used as both 1D
+    // and 2D image. Do not assert/crash while analyzing those cases; the
+    // lowering step will diagnose unsupported groups below.
     return;
   }
 
@@ -402,7 +402,10 @@ static void lowerTextureObjectUses(Function *F,
     // 2) the texture use case can not be implemented using OpenCL image read
     //    functions. In this case the texture function calls should be emulated
     //    (which is not implemented).
-    llvm_unreachable("Don't know how to lower this texture use case.");
+    C.emitError("unsupported HIP texture object use in " + F->getName() +
+                ": a texture object must be used with exactly one "
+                "OpenCL-supported texture dimensionality");
+    return;
   }
 
   for (auto *ToErase : EraseList)
@@ -518,6 +521,7 @@ PreservedAnalyses HipTextureLoweringPass::run(Module &M,
                                   : PreservedAnalyses::all();
 }
 
+#ifndef CHIP_COMBINED_PASS_PLUGIN
 extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
 llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, PASS_ID, LLVM_VERSION_STRING,
@@ -533,3 +537,4 @@ llvmGetPassPluginInfo() {
                 });
           }};
 }
+#endif // CHIP_COMBINED_PASS_PLUGIN

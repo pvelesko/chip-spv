@@ -50,6 +50,9 @@ class CHIPGraph;
 class CHIPGraphNode : public hipGraphNode {
 protected:
   hipGraphNodeType Type_;
+  /// hipGraphNodeSetEnabled switch. It is consulted on the nodes of a
+  /// CHIPGraphExec's compiled graph: a disabled node is a no-op at launch.
+  bool Enabled_ = true;
   // nodes which depend on this node
   std::vector<CHIPGraphNode *> Dependendants_;
   // nodes on which this node depends
@@ -68,10 +71,13 @@ protected:
 public:
   std::string Msg; // TODO Graphs cleanup
   CHIPGraphNode(const CHIPGraphNode &Other)
-      : Type_(Other.Type_), Dependendants_(Other.Dependendants_),
+      : Type_(Other.Type_), Enabled_(Other.Enabled_),
+        Dependendants_(Other.Dependendants_),
         Dependencies_(Other.Dependencies_), Msg(Other.Msg) {}
 
   hipGraphNodeType getType() { return Type_; }
+  bool isEnabled() const { return Enabled_; }
+  void setEnabled(bool Enabled) { Enabled_ = Enabled; }
   virtual CHIPGraphNode *clone() const = 0;
 
   /**
@@ -148,20 +154,7 @@ public:
     if (FoundNode != Dependencies_.end()) {
       Dependencies_.erase(FoundNode);
     } else {
-      CHIPERR_LOG_AND_THROW("Failed to find", hipErrorInvalidValue);
-    }
-  }
-
-  /**
-   * @brief Remove a dependant from a node (best-effort; no-op if absent).
-   * Used when inlining a child-graph wrapper to detach edges before the
-   * wrapper is dropped.
-   */
-  void removeDependant(CHIPGraphNode *TheNode) {
-    auto FoundNode =
-        std::find(Dependendants_.begin(), Dependendants_.end(), TheNode);
-    if (FoundNode != Dependendants_.end()) {
-      Dependendants_.erase(FoundNode);
+      CHIPERR_LOG_AND_THROW("Failed to find", hipErrorTbd);
     }
   }
 
@@ -220,7 +213,14 @@ public:
   void updateDependencies(std::map<CHIPGraphNode *, CHIPGraphNode *> CloneMap) {
     std::vector<CHIPGraphNode *> NewDeps;
     for (auto Dep : Dependencies_) {
-      auto ClonedDep = CloneMap[Dep];
+      auto Found = CloneMap.find(Dep);
+      // A dependency on a node of another graph has no clone here, and a
+      // graph with such a node can never be scheduled.
+      if (Found == CloneMap.end())
+        CHIPERR_LOG_AND_THROW("Graph node " + Msg +
+                                  " depends on a node outside its graph",
+                              hipErrorInvalidValue);
+      auto ClonedDep = Found->second;
       logDebug("{} {} Replacing dependency {} with {}", (void *)this, this->Msg,
                (void *)Dep, (void *)ClonedDep);
       NewDeps.push_back(ClonedDep);
@@ -245,7 +245,12 @@ public:
   void updateDependants(std::map<CHIPGraphNode *, CHIPGraphNode *> CloneMap) {
     std::vector<CHIPGraphNode *> NewDeps;
     for (auto Dep : Dependendants_) {
-      auto ClonedDep = CloneMap[Dep];
+      auto Found = CloneMap.find(Dep);
+      // A dependant in another graph is not part of this graph; the clone
+      // keeps only the edges inside it.
+      if (Found == CloneMap.end())
+        continue;
+      auto ClonedDep = Found->second;
       logDebug("{} {} Replacing dependant {} with {}", (void *)this, this->Msg,
                (void *)Dep, (void *)ClonedDep);
       NewDeps.push_back(ClonedDep);
@@ -281,7 +286,7 @@ private:
   std::vector<void *> ArgList_;
 
   hipKernelNodeParams Params_;
-  chipstar::ExecItem *ExecItem_;
+  chipstar::ExecItem *ExecItem_ = nullptr;
 
 public:
   CHIPGraphNodeKernel(const CHIPGraphNodeKernel &Other);
@@ -291,13 +296,22 @@ public:
   CHIPGraphNodeKernel(const void *HostFunction, dim3 GridDim, dim3 BlockDim,
                       void **Args, size_t SharedMem);
 
-  virtual ~CHIPGraphNodeKernel() override {}
+  virtual ~CHIPGraphNodeKernel() override;
 
   virtual void execute(chipstar::Queue *Queue) const override;
 
   hipKernelNodeParams getParams() const { return Params_; }
 
-  void setParams(const hipKernelNodeParams Params);
+  std::string getKernelName() const;
+
+  /**
+   * @brief Set the kernel, launch configuration and arguments.
+   *
+   * Copies the argument bytes, so Params.kernelParams only has to stay valid
+   * for the call, and rebuilds the exec item so that the next execute()
+   * launches with these parameters.
+   */
+  void setParams(const hipKernelNodeParams &Params);
   /**
    * @brief Createa a copy of this node
    * Must copy over all the arguments
@@ -312,16 +326,12 @@ public:
 
 class CHIPGraphNodeMemcpy : public CHIPGraphNode {
 private:
-  hipMemcpy3DParms Params_{};
+  hipMemcpy3DParms Params_;
 
-  // Default-initialize so the 3D-Params constructors don't leave these
-  // members holding indeterminate values; execute() uses (Dst_ && Src_)
-  // to discriminate between the 1D and 3D code paths and would otherwise
-  // dereference garbage when constructed via the hipMemcpy3DParms ctors.
-  void *Dst_ = nullptr;
-  const void *Src_ = nullptr;
-  size_t Count_ = 0;
-  hipMemcpyKind Kind_ = hipMemcpyDefault;
+  void *Dst_;
+  const void *Src_;
+  size_t Count_;
+  hipMemcpyKind Kind_;
 
 public:
   CHIPGraphNodeMemcpy(const CHIPGraphNodeMemcpy &Other)
@@ -345,11 +355,6 @@ public:
 
   hipMemcpy3DParms getParams() { return Params_; }
 
-  // 1D-path accessor: returns hipMemcpyDefault for nodes constructed via
-  // the 3D-Params path. Used by hipGraphExecMemcpyNodeSetParams1D to enforce
-  // the CUDA contract that the copy direction cannot change after instantiation.
-  hipMemcpyKind get1DKind() const { return Kind_; }
-  bool is1D() const { return (Dst_ != nullptr) || (Src_ != nullptr); }
   // 1D MemCpy
   void setParams(void *Dst, const void *Src, size_t Count, hipMemcpyKind Kind) {
     Dst_ = Dst;
@@ -434,33 +439,27 @@ public:
 
 class CHIPGraphNodeGraph : public CHIPGraphNode {
 private:
+  /// The node's own copy of the child graph, cloned at construction and by
+  /// setGraph(), so the graph the caller passed in can be edited, destroyed
+  /// or even be the parent graph itself without affecting this node.
   CHIPGraph *SubGraph_;
 
 public:
-  CHIPGraphNodeGraph(CHIPGraph *Graph)
-      : CHIPGraphNode(hipGraphNodeTypeGraph), SubGraph_(Graph) {}
+  CHIPGraphNodeGraph(const CHIPGraph *Graph);
 
-  CHIPGraphNodeGraph(const CHIPGraphNodeGraph &Other)
-      : CHIPGraphNode(Other), SubGraph_(Other.SubGraph_) {}
+  CHIPGraphNodeGraph(const CHIPGraphNodeGraph &Other);
 
-  virtual ~CHIPGraphNodeGraph() override {}
+  virtual ~CHIPGraphNodeGraph() override;
 
-  virtual void execute(chipstar::Queue *Queue) const override {
-    // ExtractSubGraphs_ is meant to inline a CHIPGraphNodeGraph's child
-    // nodes into the parent before launch, but compile() currently
-    // iterates OriginalGraph_->getNodes() which still contains the
-    // wrapper node. Treat execute() as a no-op for this wrapper rather
-    // than throw — a self-referencing or already-inlined child graph
-    // produces no work at this point. The actual child-graph nodes
-    // execute via the parent graph's normal scheduling.
-    logDebug("CHIPGraphNodeGraph::execute() — wrapper, no-op");
-  }
+  virtual void execute(chipstar::Queue *Queue) const override;
+
   virtual CHIPGraphNode *clone() const override {
     auto NewNode = new CHIPGraphNodeGraph(*this);
     return NewNode;
   }
 
-  void setGraph(CHIPGraph *Graph) { SubGraph_ = Graph; }
+  /// Replace the embedded graph with a clone of Graph.
+  void setGraph(const CHIPGraph *Graph);
 
   CHIPGraph *getGraph() { return SubGraph_; }
 };
@@ -562,7 +561,7 @@ public:
     Symbol_ = const_cast<void *>(Symbol);
     SizeBytes_ = SizeBytes;
     Offset_ = Offset;
-    Kind = Kind_;
+    Kind_ = Kind;
   }
 
   virtual CHIPGraphNode *clone() const override {
@@ -606,7 +605,7 @@ public:
     Symbol_ = const_cast<void *>(Symbol);
     SizeBytes_ = SizeBytes;
     Offset_ = Offset;
-    Kind = Kind_;
+    Kind_ = Kind;
   }
 };
 
@@ -639,29 +638,34 @@ public:
   std::vector<CHIPGraphNode *> getLeafNodes();
   std::vector<CHIPGraphNode *> getRootNodes();
   CHIPGraphNode *getClonedNodeFromOriginal(CHIPGraphNode *OriginalNode) {
-    auto It = CloneMap_.find(OriginalNode);
-    if (It != CloneMap_.end())
-      return It->second;
-    // CHIPGraphExec stores the OriginalGraph by pointer (without copy-
-    // constructing it), so its CloneMap_ is empty: lookups for nodes that
-    // were inserted directly into the original graph will miss. Treat the
-    // original node itself as the resolved target in that case so callers
-    // can mutate it in place; the actual clone in CompiledGraph_ is rebuilt
-    // from the original on launch via the copy constructor.
-    if (std::find(Nodes_.begin(), Nodes_.end(), OriginalNode) != Nodes_.end())
-      return OriginalNode;
-    CHIPERR_LOG_AND_THROW("Failed to find the node in clone",
-                          hipErrorInvalidValue);
+    if (!CloneMap_.count(OriginalNode)) {
+      CHIPERR_LOG_AND_THROW("Failed to find the node in clone", hipErrorTbd);
+    } else {
+      return CloneMap_[OriginalNode];
+    }
   }
 
   std::vector<CHIPGraphNode *> &getNodes() { return Nodes_; }
 
+  /**
+   * @brief Write the graph in DOT format (hipGraphDebugDotPrint).
+   *
+   * @param Out stream to write to
+   * @param Flags hipGraphDebugDotFlags selecting the per-node details
+   */
+  void writeDot(std::ostream &Out, unsigned Flags);
+
+  /**
+   * @brief Collect the graph's edges as (from, to) pairs.
+   * A node's dependencies are the nodes it runs after, so each dependency
+   * is the from end of an edge that ends at the node.
+   */
   std::vector<std::pair<CHIPGraphNode *, CHIPGraphNode *>> getEdges() {
     std::set<std::pair<CHIPGraphNode *, CHIPGraphNode *>> Edges;
     for (auto Node : Nodes_) {
       for (auto Dep : Node->getDependencies()) {
         auto FromToPair =
-            std::pair<CHIPGraphNode *, CHIPGraphNode *>(Node, Dep);
+            std::pair<CHIPGraphNode *, CHIPGraphNode *>(Dep, Node);
         Edges.insert(FromToPair);
       }
     }
@@ -692,9 +696,6 @@ class CHIPGraphExec : public hipGraphExec {
 protected:
   CHIPGraph *OriginalGraph_;
   CHIPGraph CompiledGraph_;
-  // Set after the first compile() call so that subsequent launches do not
-  // re-traverse OriginalGraph_, which the user may have already destroyed.
-  bool Compiled_ = false;
 
   /**
    * @brief each element in this queue represents represents a sequence of nodes
@@ -702,13 +703,6 @@ protected:
    *
    */
   std::queue<std::set<CHIPGraphNode *>> ExecQueues_;
-
-  /**
-   * @brief For every CHIPGraphNodeGraph in CompiledGraph_, replace this node
-   * with its contents.
-   *
-   */
-  void ExtractSubGraphs_();
 
   /**
    * @brief remove unnecessary dependencies
@@ -727,50 +721,24 @@ public:
       : OriginalGraph_(Graph), /* Copy the pointer to the original graph */
         CompiledGraph_(CHIPGraph(*Graph)) /* invoke the copy constructor to make
                                              a clone of the graph */
-  {
-    std::lock_guard<std::mutex> Lk(liveSetMtx());
-    liveSet().insert(this);
-  }
+  {}
 
-  ~CHIPGraphExec() {
-    std::lock_guard<std::mutex> Lk(liveSetMtx());
-    liveSet().erase(this);
-  }
-
-  /// Returns true if @p Exec has not been destroyed via hipGraphExecDestroy.
-  /// Used by the bindings to surface hipErrorInvalidValue when the user
-  /// passes a stale handle instead of dereferencing freed memory.
-  static bool isAlive(const CHIPGraphExec *Exec) {
-    std::lock_guard<std::mutex> Lk(liveSetMtx());
-    return liveSet().count(Exec) != 0;
-  }
+  ~CHIPGraphExec() {}
 
   void launch(chipstar::Queue *Queue);
 
-private:
-  static std::unordered_set<const CHIPGraphExec *> &liveSet();
-  static std::mutex &liveSetMtx();
-public:
   CHIPGraph *getOriginalGraphPtr() const { return OriginalGraph_; }
-  CHIPGraph *getCompiledGraphPtr() { return &CompiledGraph_; }
 
   /**
-   * @brief Resolve a user-supplied original-graph node to its clone in
-   * CompiledGraph_.
+   * @brief Look up the executable copy of a node of the original graph.
    *
-   * The compiled graph copy-constructs from the original at instantiation,
-   * so its CloneMap_ holds Original->Clone for every original node. Callers
-   * that mutate a node post-instantiation must operate on the clone owned by
-   * the executable graph; otherwise their changes never reach the launched
-   * graph. Returns nullptr if the original node is unknown to this graph
-   * exec, allowing callers to surface hipErrorInvalidValue.
+   * @param OriginalNode handle of a node in the graph this executable graph
+   * was instantiated from
+   * @return CHIPGraphNode* the corresponding node in the compiled graph, or
+   * nullptr if the node was not part of the graph at instantiation
    */
-  CHIPGraphNode *findOrLookupNode(CHIPGraphNode *Node) {
-    if (auto *Cloned = CompiledGraph_.nodeLookup(Node))
-      return Cloned;
-    if (OriginalGraph_ && OriginalGraph_->findNode(Node))
-      return Node;
-    return nullptr;
+  CHIPGraphNode *getExecNode(CHIPGraphNode *OriginalNode) {
+    return CompiledGraph_.nodeLookup(OriginalNode);
   }
 
   /**

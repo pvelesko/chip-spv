@@ -1,0 +1,165 @@
+name: Unit tests (ARM64 Mali)
+
+# salami: ARM64 Linux with a Mali-G52 iGPU, OpenCL only (no Level Zero).
+#
+# salami builds chipStar in 61 minutes and runs the tests in 4, so the build
+# happens on an x86 runner in a container and only the tests run on salami.
+# Both SPIR-V producers are covered; each is a separate cross build.
+#
+# The two jobs share nothing on disk. The handoff is an rsync to
+# salami:~/ci-stage/pr-<N>-<variant>/, one tree per pull request that each push
+# rewrites in place, and .github/workflows/reap-ci-scratch.yml deletes when the
+# pull request closes.
+# See scripts/cross-aarch64/README.md for how the cross build works and
+# which tests it deliberately leaves to the x86 gate.
+
+on:
+  pull_request:
+    paths-ignore: "docs/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cross-compile:
+    name: cross-compile for salami (${{ matrix.variant }})
+    runs-on: [self-hosted, Linux, X64]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: native
+            integrated_spirv: "ON"
+          - variant: translator
+            integrated_spirv: "OFF"
+    outputs:
+      tree: ${{ steps.tree.outputs.tree }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      # Named after the pull request, which survives a force push; a dispatch
+      # has no pull request and is named after its head instead.
+      - id: tree
+        env:
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -n "$PR" ]; then TREE="pr-$PR"; else TREE="manual-$(git rev-parse --short=12 HEAD)"; fi
+          echo "tree=$TREE" >> "$GITHUB_OUTPUT"
+
+      # The image bakes in an LLVM 23 built from llvm-patches/llvm-23, so a
+      # change to any patch changes the compiler that builds the Mali test
+      # binaries. The tag is a digest of the patch series, configure_llvm.sh
+      # and the image recipe, so a changed input yields a tag that does not
+      # exist locally and the image is rebuilt (~40 min); an unchanged one is
+      # a cache hit and costs nothing. Tagging by content rather than by a
+      # fixed name is what stops Mali validating device code built by a
+      # compiler that predates the patch under test.
+      - name: Ensure cross image
+        run: |
+          set -euo pipefail
+          W=/space/pvelesko/cross-chipstar-work
+          [ -d /space ] || W=$HOME/cross-chipstar-work
+          mkdir -p "$W"
+          echo "CROSS_WORK=$W" >> "$GITHUB_ENV"
+          # The image GC below must not delete the tag this run needs. Cheap
+          # text processing, so check it before an image build, not after.
+          tests/cross_image_gc.bash .github/workflows/unit-tests-arm64-mali.yml
+          TAG=$(scripts/cross-aarch64/image-tag.sh)
+          echo "CROSS_IMAGE=chipstar-cross-aarch64:$TAG" >> "$GITHUB_ENV"
+          if docker image inspect "chipstar-cross-aarch64:$TAG" >/dev/null 2>&1; then
+            echo "image chipstar-cross-aarch64:$TAG present"; exit 0
+          fi
+          echo "building chipstar-cross-aarch64:$TAG"
+          docker build -t chipstar-cross-aarch64:base scripts/cross-aarch64
+          U="$(id -u):$(id -g)"
+          rm -rf "$W/x86-stage" "$W/spirv-stage"
+          docker run --rm --user "$U" -e HOME=/work -v "$PWD":/chipstar:ro -v "$W":/work \
+            chipstar-cross-aarch64:base /chipstar/scripts/cross-aarch64/image-llvm.sh
+          docker run --rm --user "$U" -e HOME=/work -v "$PWD/scripts/cross-aarch64":/s:ro -v "$W":/work \
+            chipstar-cross-aarch64:base /s/image-spirv-tools.sh
+          rm -rf "$W/image-ctx" && mkdir -p "$W/image-ctx/opt"
+          cp -a "$W"/x86-stage/opt/* "$W"/spirv-stage/opt/* "$W/image-ctx/opt/"
+          docker build -f scripts/cross-aarch64/Dockerfile.chipstar \
+            -t "chipstar-cross-aarch64:$TAG" "$W/image-ctx"
+          # Trim cross images, each ~1.6 GB: keep the two newest plus the one
+          # this run needs, so at most three non-base tags survive. Never the
+          # one this run needs: CreatedAt is the image's own timestamp, and a
+          # rebuild that hits the layer cache produces the SAME image, so the
+          # tag just written inherits a date that can sort it straight into the
+          # delete list. That untags the image between this step and the next,
+          # which then fails with "Unable to find image ... locally".
+          docker images chipstar-cross-aarch64 --format '{{.Tag}} {{.CreatedAt}}' \
+            | grep -v '^base ' | grep -v "^$TAG " | sort -k2 -r | tail -n +3 \
+            | awk '{print $1}' \
+            | xargs -r -I{} docker rmi "chipstar-cross-aarch64:{}" || true
+        timeout-minutes: 90
+
+      - name: Cross-compile chipStar + tests (${{ matrix.variant }})
+        run: |
+          set -euo pipefail
+          JOBS=$(nproc); JOBS=$(( JOBS > 1 ? JOBS - 1 : 1 ))
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/work \
+            -e INTEGRATED_SPIRV=${{ matrix.integrated_spirv }} \
+            -e STAGE_PREFIX=/home/pvelesko/ci-stage/${{ steps.tree.outputs.tree }}-${{ matrix.variant }} \
+            -v "$PWD":/chipstar:ro -v "$CROSS_WORK":/work \
+            "$CROSS_IMAGE" \
+            /chipstar/scripts/cross-aarch64/cross-chipstar.sh \
+              ${{ steps.tree.outputs.tree }}-${{ matrix.variant }} "$JOBS"
+        timeout-minutes: 30
+
+      - name: Ship to salami
+        run: |
+          set -euo pipefail
+          scripts/cross-aarch64/ship-to-salami.sh \
+            "$CROSS_WORK/cross-${{ steps.tree.outputs.tree }}-${{ matrix.variant }}" \
+            ${{ steps.tree.outputs.tree }}-${{ matrix.variant }}
+        timeout-minutes: 15
+
+      # Compile tests salami drops, with the aarch64 Linux host ABI; -E: those the x86 builder cannot run.
+      - name: Compile tests for aarch64 host (${{ matrix.variant }})
+        run: |
+          set -euo pipefail
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/work -v "$CROSS_WORK":/work \
+            "$CROSS_IMAGE" ctest --output-on-failure -j"$(( $(nproc) > 1 ? $(nproc) - 1 : 1 ))" \
+              --test-dir /work/cross-${{ steps.tree.outputs.tree }}-${{ matrix.variant }}/tests/compiler \
+              -E '^(TestHipccAcceptCFiles|TestRDCWithSingleHipccCmd|TestRDCWithMultipleHipccCmds|TestWholeProgramCompilation|TestSeparateCompilation|TestBFloat16RDC|TestPrintfStaticString|TestStaticLibRDC|TestStaticLibRDCOffloadArch|hipSubwordAtomics-subword-atomics|hipVolatileAccesses-volatile-accesses|TestSpirvDuplicatePhiHip)$'
+        timeout-minutes: 10
+
+  test-mali:
+    name: run on Mali (${{ matrix.variant }})
+    needs: cross-compile
+    runs-on: [self-hosted, Linux, ARM64]
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [native, translator]
+    env:
+      CHIP_MODULE_CACHE_DIR: ""
+      CHIP_LOGLEVEL: err
+      POCL_KERNEL_CACHE: "0"
+    steps:
+      - name: Test igpu opencl (${{ matrix.variant }})
+        run: |
+          set -euo pipefail
+          T=$HOME/ci-stage/${{ needs.cross-compile.outputs.tree }}-${{ matrix.variant }}
+          [ -x "$T/hipInfo" ] || { echo "::error::no cross-built tree at $T"; exit 1; }
+          cd "$T"
+          rm -rf ~/.cache/chipStar
+          nt=$(cat /opt/actions-runner/num-threads.txt 2>/dev/null || nproc)
+          LD_LIBRARY_PATH=$PWD python3 src/scripts/check.py ./ igpu opencl --num-threads=$nt --timeout=1800
+        timeout-minutes: 30
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-logs-salami-${{ matrix.variant }}
+          path: |
+            ~/ci-stage/${{ needs.cross-compile.outputs.tree }}-${{ matrix.variant }}/checkpy_*.txt
+            ~/ci-stage/${{ needs.cross-compile.outputs.tree }}-${{ matrix.variant }}/Testing/**/LastTest.log
+          if-no-files-found: ignore

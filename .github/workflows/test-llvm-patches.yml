@@ -1,15 +1,26 @@
 name: Test LLVM Patches
 
 on:
+  # Only main: every job that runs on a push is gated on the main branch
+  # (they install the built toolchains). Without this, pushing a PR branch
+  # starts a second run that shares the concurrency group below with the
+  # pull_request run and cancels it, and every job reports as failed.
   push:
+    branches: [main]
     paths:
       - 'llvm-patches/**'
       - 'scripts/configure_llvm.sh'
+      - 'scripts/cross-aarch64/Dockerfile'
+      - 'scripts/cross-aarch64/cross-build.sh'
+      - 'scripts/cross-aarch64/aarch64-toolchain.cmake'
       - '.github/workflows/test-llvm-patches.yml'
   pull_request:
     paths:
       - 'llvm-patches/**'
       - 'scripts/configure_llvm.sh'
+      - 'scripts/cross-aarch64/Dockerfile'
+      - 'scripts/cross-aarch64/cross-build.sh'
+      - 'scripts/cross-aarch64/aarch64-toolchain.cmake'
       - '.github/workflows/test-llvm-patches.yml'
   workflow_dispatch:
 
@@ -18,32 +29,95 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Policy: test only the versions whose patch series changed; configure_llvm.sh
+  # or workflow changes test everything (as does a manual dispatch). Each
+  # toolchain rebuild costs hours of self-hosted runner time, so an
+  # llvm-23-only change must not rebuild 21/22. Runs on GitHub-hosted ubuntu
+  # so it never queues behind the self-hosted build runners.
+  detect:
+    name: Detect changed LLVM versions
+    runs-on: ubuntu-latest
+    outputs:
+      any: ${{ steps.diff.outputs.any }}
+      run_21: ${{ steps.diff.outputs.run_21 }}
+      run_22: ${{ steps.diff.outputs.run_22 }}
+      run_23: ${{ steps.diff.outputs.run_23 }}
+      matrix1: ${{ steps.diff.outputs.matrix1 }}
+      matrix2: ${{ steps.diff.outputs.matrix2 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - id: diff
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BASE="$PR_BASE_SHA"
+          elif [ "$EVENT_NAME" = "push" ]; then
+            BASE="$PUSH_BEFORE_SHA"
+          else
+            BASE=""   # workflow_dispatch: test everything
+          fi
+          # New branches push with an all-zero before-sha; an unknown base
+          # object cannot be diffed either. Both mean: treat as all-changed.
+          case "$BASE" in
+            ""|0000000000000000000000000000000000000000) BASE="" ;;
+            *) git cat-file -e "$BASE" 2>/dev/null || BASE="" ;;
+          esac
+          if [ -z "$BASE" ] || ! git diff --quiet "$BASE"...HEAD -- scripts/configure_llvm.sh .github/workflows/test-llvm-patches.yml; then
+            v21=true; v22=true; v23=true
+          else
+            v21=false; v22=false; v23=false
+            git diff --quiet "$BASE"...HEAD -- llvm-patches/llvm-21 || v21=true
+            git diff --quiet "$BASE"...HEAD -- llvm-patches/llvm-22 || v22=true
+            git diff --quiet "$BASE"...HEAD -- llvm-patches/llvm-23 || v23=true
+            # Only the two files that determine the aarch64 LLVM itself: the
+            # base image it builds in, and the script that builds it. The rest
+            # of scripts/cross-aarch64 cross-builds chipStar, not LLVM, and
+            # must not cost a toolchain rebuild. Feeds the 23 lane alone.
+            git diff --quiet "$BASE"...HEAD -- \
+                scripts/cross-aarch64/Dockerfile \
+                scripts/cross-aarch64/cross-build.sh \
+                scripts/cross-aarch64/aarch64-toolchain.cmake || v23=true
+          fi
+          any=false
+          { $v21 || $v22 || $v23; } && any=true
+          echo "run_21=$v21" >> "$GITHUB_OUTPUT"
+          echo "run_22=$v22" >> "$GITHUB_OUTPUT"
+          echo "run_23=$v23" >> "$GITHUB_OUTPUT"
+          echo "any=$any" >> "$GITHUB_OUTPUT"
+          m1="["; m2="["
+          $v21 && { m1="$m1{\"llvm-version\":21,\"build-id\":\"21\",\"install-suffix\":\"\",\"variant-flag\":\"\"},"; m2="$m2{\"llvm-version\":21,\"build-id\":\"21\",\"install-suffix\":\"\"},"; }
+          $v22 && { m1="$m1{\"llvm-version\":22,\"build-id\":\"22-translator\",\"install-suffix\":\"-translator\",\"variant-flag\":\"--variant translator\"},{\"llvm-version\":22,\"build-id\":\"22-native\",\"install-suffix\":\"-native\",\"variant-flag\":\"--variant native\"},"; m2="$m2{\"llvm-version\":22,\"build-id\":\"22-translator\",\"install-suffix\":\"-translator\"},{\"llvm-version\":22,\"build-id\":\"22-native\",\"install-suffix\":\"-native\"},"; }
+          $v23 && { m1="$m1{\"llvm-version\":23,\"build-id\":\"23\",\"install-suffix\":\"\",\"variant-flag\":\"--variant native\"},"; m2="$m2{\"llvm-version\":23,\"build-id\":\"23\",\"install-suffix\":\"\"},"; }
+          m1="${m1%,}]"; m2="${m2%,}]"
+          echo "matrix1=$m1" >> "$GITHUB_OUTPUT"
+          echo "matrix2=$m2" >> "$GITHUB_OUTPUT"
+          echo "changed: 21=$v21 22=$v22 23=$v23 (base: ${BASE:-<none, all versions>})"
+
   step1-configure-all:
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    needs: detect
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+      && needs.detect.outputs.any == 'true'
     name: 'Step 1: Configure all LLVM versions and verify patches'
     runs-on:
       - self-hosted
       - Linux
       - X64
     strategy:
+      # Matrix entries come from the detect job; only changed versions appear.
+      # LLVM 23 needs only one build: chipStar patches in llvm#213052, so the
+      # SPIRV-target build also serves the translator and the producer is
+      # chosen per compilation by -f[no-]integrated-objemitter.
       matrix:
-        include:
-          - llvm-version: 20
-            build-id: "20"
-            install-suffix: ""
-            variant-flag: ""
-          - llvm-version: 21
-            build-id: "21"
-            install-suffix: ""
-            variant-flag: ""
-          - llvm-version: 22
-            build-id: "22-translator"
-            install-suffix: "-translator"
-            variant-flag: "--variant translator"
-          - llvm-version: 22
-            build-id: "22-native"
-            install-suffix: "-native"
-            variant-flag: "--variant native"
+        include: ${{ fromJSON(needs.detect.outputs.matrix1) }}
       fail-fast: true
     steps:
       - uses: actions/checkout@v3
@@ -51,9 +125,22 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           submodules: 'recursive'
-      - name: Configure LLVM ${{ matrix.build-id }}
+      - name: Check the pinned-ref fetch guard
+        # configure_llvm.sh runs next and prepares the LLVM source. This asserts
+        # the guard that stops it re-fetching an already-pinned llvm-project
+        # tag; the translator ref is a branch and is still fetched, so the step
+        # is not offline. Needs only git, so it costs a second and fails before
+        # an hour of building rather than after.
         run: |
-          rm -rf $HOME/llvm-builds/${{ matrix.build-id }}
+          tests/configure_llvm_pinned_fetch.bash scripts/configure_llvm.sh
+      - name: Configure LLVM ${{ matrix.build-id }}
+        # The source tree is kept between runs. configure_llvm.sh resets and
+        # cleans an existing checkout before it re-applies the patch series, so
+        # deleting it buys nothing and costs two full clones per run, one of
+        # them llvm-project. It also makes the pinned-ref fetch skip the step
+        # above tests for unreachable, since that path only runs when the
+        # checkout already exists.
+        run: |
           mkdir -p $HOME/llvm-builds/${{ matrix.build-id }}
           cd $HOME/llvm-builds/${{ matrix.build-id }}
           rm -rf scripts llvm-patches
@@ -65,8 +152,10 @@ jobs:
             ${{ matrix.variant-flag }} --configure-only
 
   step2-build-test:
-    needs: step1-configure-all
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    needs: [detect, step1-configure-all]
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+      && needs.detect.outputs.any == 'true'
     name: Build LLVM ${{ matrix.build-id }} and test chipStar
     runs-on:
       - self-hosted
@@ -80,20 +169,9 @@ jobs:
       POCL_KERNEL_CACHE: 0
       CHIP_L0_EVENT_TIMEOUT: 1790
     strategy:
+      # Matrix entries come from the detect job; only changed versions appear.
       matrix:
-        include:
-          - llvm-version: 20
-            build-id: "20"
-            install-suffix: ""
-          - llvm-version: 21
-            build-id: "21"
-            install-suffix: ""
-          - llvm-version: 22
-            build-id: "22-translator"
-            install-suffix: "-translator"
-          - llvm-version: 22
-            build-id: "22-native"
-            install-suffix: "-native"
+        include: ${{ fromJSON(needs.detect.outputs.matrix2) }}
       fail-fast: false
     steps:
       - uses: actions/checkout@v3
@@ -103,7 +181,6 @@ jobs:
           submodules: 'recursive'
       - name: Build LLVM ${{ matrix.build-id }}
         id: build_llvm
-        continue-on-error: true
         run: |
           BUILD_DIR="$HOME/llvm-builds/${{ matrix.build-id }}/llvm-project/llvm/build_${{ matrix.llvm-version }}"
           if [ ! -d "$BUILD_DIR" ]; then
@@ -134,18 +211,90 @@ jobs:
           module use ~/modulefiles
           module load oneapi/2025.0.4 opencl/dgpu
 
-          LLVM_BIN="$HOME/llvm-builds/${{ matrix.build-id }}/llvm-project/llvm/build_${{ matrix.llvm-version }}/bin"
+          # Build/test against the INSTALLED LLVM toolchain (staged above), not
+          # the build tree. The build tree's clang resource dir lacks
+          # install-only runtime headers such as omp.h, which made
+          # TestHipccFopenmp fail with "'omp.h' file not found".
+          LLVM_PREFIX="$HOME/install/llvm/${{ matrix.llvm-version }}.0${{ matrix.install-suffix }}"
+          LLVM_STAGE="$HOME/llvm-stage/${{ matrix.build-id }}${LLVM_PREFIX}"
+          LLVM_BIN="${LLVM_STAGE}/bin"
           test -f "${LLVM_BIN}/clang" || exit 1
+
+          # The staged binaries are thin drivers; all the driver logic lives in
+          # libclang-cpp.so / libLLVM.so. Their RUNPATH points at the *final*
+          # install prefix ($HOME/install/llvm/<ver>), not at the stage, so by
+          # default the staged clang loads the previously installed libraries
+          # and silently runs old code. That makes this lane test the installed
+          # toolchain rather than the one just built from llvm-patches/, which
+          # is precisely what this workflow exists to validate. Pin the loader
+          # to the stage, and persist it to the test steps via GITHUB_ENV since
+          # chipStar invokes clang again at test time.
+          export LD_LIBRARY_PATH="${LLVM_STAGE}/lib:${LLVM_STAGE}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
+          # Fail loudly if the pin did not take effect, rather than silently
+          # validating the wrong toolchain again.
+          RESOLVED=$(ldd "${LLVM_BIN}/clang" 2>/dev/null | awk '/libclang-cpp/{print $3}')
+          case "$RESOLVED" in
+            "${LLVM_STAGE}"/*) echo "OK: clang resolves libclang-cpp from the stage" ;;
+            "") echo "NOTE: clang does not link libclang-cpp dynamically; nothing to pin" ;;
+            *) echo "ERROR: clang resolves libclang-cpp from '$RESOLVED', not the stage"; exit 1 ;;
+          esac
+          test -f "${LLVM_BIN}/../lib/clang/${{ matrix.llvm-version }}/include/omp.h" \
+            || { echo "ERROR: omp.h missing from LLVM install toolchain at ${LLVM_BIN}"; exit 1; }
           cd ${{ github.workspace }}
           rm -rf build-llvm${{ matrix.build-id }}
           mkdir -p build-llvm${{ matrix.build-id }}
           cd build-llvm${{ matrix.build-id }}
           cmake .. -DLLVM_CONFIG_BIN=${LLVM_BIN}/llvm-config -GNinja \
             -DCMAKE_BUILD_TYPE=Debug \
+            -DCHIP_ATOMICS_CACHE_BYPASS_WORKAROUND=ON \
             -DCHIP_BUILD_SAMPLES=ON -DCHIP_BUILD_TESTS=ON
           ninja all install -j$(nproc)
           ninja build_tests install -j$(nproc)
         timeout-minutes: 60
+      - name: Gate the cache-control volatile lowering (LLVM 23 only)
+        # Every other configure passes -DCHIP_ATOMICS_CACHE_BYPASS_WORKAROUND=ON,
+        # so the pass's default lowering, SPV_INTEL_cache_controls decorations,
+        # is never exercised. Only the LLVM 23 series carries the patch that
+        # puts the extension in clang's HIPSPV allow list, so only here does the
+        # configure probe leave the workaround off and select that lowering.
+        #
+        # This is the only lane that runs the volatile gates against it, so it
+        # runs all three: the compiler fixture on the emitted IR, and the two
+        # shell gates that follow the accesses into the SPIR-V module and then
+        # into the ISA ocloc generates for five Intel parts. hipcc and the
+        # device bitcode are what those need beyond the plugin; ocloc is an
+        # offline compiler, so still no runtime and no GPU.
+        if: matrix.llvm-version == 23 && steps.build_chipstar.outcome == 'success'
+        run: |
+          LLVM_PREFIX="$HOME/install/llvm/${{ matrix.llvm-version }}.0${{ matrix.install-suffix }}"
+          LLVM_BIN="$HOME/llvm-stage/${{ matrix.build-id }}${LLVM_PREFIX}/bin"
+          test -f "${LLVM_BIN}/clang" || { echo "ERROR: no staged clang at ${LLVM_BIN}"; exit 1; }
+          cd ${{ github.workspace }}
+          rm -rf build-cachectl-llvm${{ matrix.build-id }}
+          mkdir -p build-cachectl-llvm${{ matrix.build-id }}
+          cd build-cachectl-llvm${{ matrix.build-id }}
+          cmake .. -DLLVM_CONFIG_BIN=${LLVM_BIN}/llvm-config -GNinja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCHIP_BUILD_SAMPLES=OFF -DCHIP_BUILD_TESTS=ON
+          if ! grep -q "CHIP_CACHE_CONTROLS_SUPPORTED:INTERNAL=ON" CMakeCache.txt; then
+            echo "ERROR: the configure probe did not find SPV_INTEL_cache_controls in this"
+            echo "       toolchain, so the build fell back to the atomic lowering and the"
+            echo "       cache-control lowering is still ungated. Check llvm-patches/llvm-23."
+            exit 1
+          fi
+          for T in ocloc spirv-dis; do
+            command -v $T >/dev/null || {
+              echo "ERROR: $T is not on PATH. Without ocloc the ISA gate reports"
+              echo "       itself skipped, and without spirv-dis the decoration"
+              echo "       count never runs, so this lane would go green without"
+              echo "       establishing that any cache control was emitted."
+              exit 1; }
+          done
+          ninja LLVMHipPasses hipcc.bin devicelib_bc -j$(nproc)
+          ctest -R 'hipVolatileAccesses|TestFixVolatileLoadLowering' --output-on-failure
+        timeout-minutes: 20
       - name: Test chipStar with LLVM ${{ matrix.build-id }} (iGPU OpenCL)
         if: always() && steps.build_chipstar.outcome == 'success'
         continue-on-error: true
@@ -155,6 +304,9 @@ jobs:
           elif [ -f /etc/profile.d/lmod.sh ]; then source /etc/profile.d/lmod.sh &> /dev/null
           else source /etc/profile.d/modules.sh &> /dev/null; fi
           module use ~/modulefiles
+          # IGC 2.36.3/2.38.2 miscompile chipStar kernels under their
+          # optimizer (TestSnakeMiscompileO2); this build carries the fix.
+          module load igc/all-fixes-2026.07.30
           module load opencl/igpu
           cd ${{ github.workspace }}/build-llvm${{ matrix.build-id }}
           ../scripts/check.py ./ igpu opencl
@@ -168,6 +320,9 @@ jobs:
           elif [ -f /etc/profile.d/lmod.sh ]; then source /etc/profile.d/lmod.sh &> /dev/null
           else source /etc/profile.d/modules.sh &> /dev/null; fi
           module use ~/modulefiles
+          # IGC 2.36.3/2.38.2 miscompile chipStar kernels under their
+          # optimizer (TestSnakeMiscompileO2); this build carries the fix.
+          module load igc/all-fixes-2026.07.30
           module load level-zero/igpu
           cd ${{ github.workspace }}/build-llvm${{ matrix.build-id }}
           ../scripts/check.py ./ igpu level0
@@ -180,6 +335,9 @@ jobs:
           elif [ -f /etc/profile.d/lmod.sh ]; then source /etc/profile.d/lmod.sh &> /dev/null
           else source /etc/profile.d/modules.sh &> /dev/null; fi
           module use ~/modulefiles
+          # IGC 2.36.3/2.38.2 miscompile chipStar kernels under their
+          # optimizer (TestSnakeMiscompileO2); this build carries the fix.
+          module load igc/all-fixes-2026.07.30
           module load level-zero/dgpu
           cd ${{ github.workspace }}/build-llvm${{ matrix.build-id }}
           ../scripts/check.py ./ dgpu level0
@@ -192,6 +350,9 @@ jobs:
           elif [ -f /etc/profile.d/lmod.sh ]; then source /etc/profile.d/lmod.sh &> /dev/null
           else source /etc/profile.d/modules.sh &> /dev/null; fi
           module use ~/modulefiles
+          # IGC 2.36.3/2.38.2 miscompile chipStar kernels under their
+          # optimizer (TestSnakeMiscompileO2); this build carries the fix.
+          module load igc/all-fixes-2026.07.30
           module load opencl/dgpu
           cd ${{ github.workspace }}/build-llvm${{ matrix.build-id }}
           ../scripts/check.py ./ dgpu opencl
@@ -204,10 +365,22 @@ jobs:
           elif [ -f /etc/profile.d/lmod.sh ]; then source /etc/profile.d/lmod.sh &> /dev/null
           else source /etc/profile.d/modules.sh &> /dev/null; fi
           module use ~/modulefiles
+          # IGC 2.36.3/2.38.2 miscompile chipStar kernels under their
+          # optimizer (TestSnakeMiscompileO2); this build carries the fix.
+          module load igc/all-fixes-2026.07.30
           module load opencl/cpu
           cd ${{ github.workspace }}/build-llvm${{ matrix.build-id }}
           ../scripts/check.py ./ cpu opencl --num-tries=3
         timeout-minutes: 60
+      # install-llvm-on-main promotes a stage to the live toolchain that every
+      # other PR then compiles against, so it must only ever promote one that
+      # got this far. The stage is written before the tests because the tests
+      # run against it, which means its mere existence proves nothing.
+      - name: Mark the stage as validated
+        if: success()
+        run: |
+          echo "${{ github.event.pull_request.head.sha || github.sha }}" \
+            > "$HOME/llvm-stage/${{ matrix.build-id }}/.chipstar-validated"
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
@@ -217,7 +390,13 @@ jobs:
             ${{ github.workspace }}/build-llvm${{ matrix.build-id }}/Testing/Temporary/LastTest.log
 
   install-llvm-on-main:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: detect
+    # Gated on 'any' (not per-version) because this one job installs all
+    # versions; each matrix entry consults its own run_NN flag and is a no-op
+    # for a version this merge did not touch.
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.detect.outputs.any == 'true'
     name: Install LLVM ${{ matrix.build-id }} on main branch
     runs-on:
       - self-hosted
@@ -226,10 +405,6 @@ jobs:
     strategy:
       matrix:
         include:
-          - llvm-version: 20
-            build-id: "20"
-            install-suffix: ""
-            module-name: "20.0"
           - llvm-version: 21
             build-id: "21"
             install-suffix: ""
@@ -242,20 +417,87 @@ jobs:
             build-id: "22-native"
             install-suffix: "-native"
             module-name: "22.0-native"
+          - llvm-version: 23
+            build-id: "23"
+            install-suffix: ""
+            module-name: "23.0"
       fail-fast: false
     steps:
       - name: Install LLVM ${{ matrix.build-id }}
+        id: install_llvm
+        env:
+          RUN_21: ${{ needs.detect.outputs.run_21 }}
+          RUN_22: ${{ needs.detect.outputs.run_22 }}
+          RUN_23: ${{ needs.detect.outputs.run_23 }}
         run: |
+          set -euo pipefail
           STAGED="$HOME/llvm-stage/${{ matrix.build-id }}"
           INSTALL_DIR="$HOME/install/llvm/${{ matrix.llvm-version }}.0${{ matrix.install-suffix }}"
-          rm -rf "$INSTALL_DIR"
-          mv "${STAGED}${INSTALL_DIR}" "$INSTALL_DIR"
+
+          # Whether the merge being installed actually rebuilt this version.
+          case "${{ matrix.llvm-version }}" in
+            21) CHANGED="$RUN_21" ;;
+            22) CHANGED="$RUN_22" ;;
+            23) CHANGED="$RUN_23" ;;
+            *)  CHANGED=false ;;
+          esac
+
+          # This job runs on every push to main, but the stage is produced by a
+          # *prior* pull_request run of this workflow. A version this merge did
+          # not touch legitimately has no stage. A version it *did* touch must
+          # have one: silently skipping there leaves main's toolchain older than
+          # the patches on main, and every later PR is then validated against a
+          # compiler that does not match the tree.
+          if [ ! -d "${STAGED}${INSTALL_DIR}" ]; then
+            if [ "$CHANGED" = "true" ]; then
+              echo "::error::LLVM ${{ matrix.build-id }} changed in this merge but has no staged build at ${STAGED}${INSTALL_DIR}. The PR run never staged it."
+              exit 1
+            fi
+            echo "LLVM ${{ matrix.build-id }} unchanged by this merge and not staged; leaving $INSTALL_DIR untouched."
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Written by the PR run only after chipStar built and its dGPU and CPU
+          # test lanes passed against this very stage. Without it the stage is
+          # just "LLVM compiled", which is not enough to hand every other PR.
+          if [ ! -f "${STAGED}/.chipstar-validated" ]; then
+            echo "::error::Stage at ${STAGED} carries no .chipstar-validated marker; refusing to promote an untested toolchain."
+            exit 1
+          fi
+          echo "Promoting stage built from $(cat "${STAGED}/.chipstar-validated")"
+
+          # Keep the previous toolchain until the new one is in place, so a
+          # failure here is recoverable.
+          BACKUP="${INSTALL_DIR}.prev"
+          rm -rf "$BACKUP"
+          if [ -d "$INSTALL_DIR" ]; then
+            mv "$INSTALL_DIR" "$BACKUP"
+          fi
+
+          if ! mv "${STAGED}${INSTALL_DIR}" "$INSTALL_DIR"; then
+            echo "Install failed; restoring previous toolchain."
+            rm -rf "$INSTALL_DIR"
+            [ -d "$BACKUP" ] && mv "$BACKUP" "$INSTALL_DIR"
+            exit 1
+          fi
+          echo "installed=true" >> "$GITHUB_OUTPUT"
         timeout-minutes: 5
       - name: Verify LLVM ${{ matrix.build-id }} installation
+        if: steps.install_llvm.outputs.installed == 'true'
         run: |
-          test -f $HOME/install/llvm/${{ matrix.llvm-version }}.0${{ matrix.install-suffix }}/bin/clang || exit 1
-          $HOME/install/llvm/${{ matrix.llvm-version }}.0${{ matrix.install-suffix }}/bin/clang --version
+          set -euo pipefail
+          INSTALL_DIR="$HOME/install/llvm/${{ matrix.llvm-version }}.0${{ matrix.install-suffix }}"
+          BACKUP="${INSTALL_DIR}.prev"
+          if [ ! -x "$INSTALL_DIR/bin/clang" ]; then
+            echo "Installed toolchain has no usable clang; restoring previous."
+            rm -rf "$INSTALL_DIR"
+            [ -d "$BACKUP" ] && mv "$BACKUP" "$INSTALL_DIR"
+            exit 1
+          fi
+          "$INSTALL_DIR/bin/clang" --version
       - name: Generate modulefile for LLVM ${{ matrix.build-id }}
+        if: steps.install_llvm.outputs.installed == 'true'
         run: |
           MODULE_DIR="$HOME/modulefiles/llvm"
           INSTALL_DIR="$HOME/install/llvm/${{ matrix.llvm-version }}.0${{ matrix.install-suffix }}"
@@ -281,65 +523,159 @@ jobs:
             echo 'prepend-path CMAKE_PREFIX_PATH $install_dir/lib/cmake'
           } > "$MODULE_DIR/${{ matrix.module-name }}"
           echo "Created modulefile: $MODULE_DIR/${{ matrix.module-name }}"
-      - name: Cleanup staged install
-        if: always()
-        run: rm -rf $HOME/llvm-stage/${{ matrix.build-id }}
+      # Only reap on success. Reaping unconditionally used to discard the stage
+      # even when the install had failed, so the next attempt had nothing to
+      # install from.
+      - name: Cleanup staged install and backup
+        if: success() && steps.install_llvm.outputs.installed == 'true'
+        run: |
+          rm -rf "$HOME/llvm-stage/${{ matrix.build-id }}"
+          rm -rf "$HOME/install/llvm/${{ matrix.llvm-version }}.0${{ matrix.install-suffix }}.prev"
 
+  # The rusticl runner (AMD W6400, container on cupcake) builds the LLVM that
+  # unit-tests-amd-rusticl.yml uses, in a writable bind mount of its own.
+  build-test-rusticl:
+    needs: detect
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+      && needs.detect.outputs.run_21 == 'true'
+    name: Build LLVM 21 and test chipStar (rusticl W6400)
+    runs-on: [rusticl]
+    env:
+      CI_LLVM: /space/pvelesko/rusticl-ci-llvm
+      LLVM_STAGE: /space/pvelesko/rusticl-ci-llvm/llvm-stage/21/space/pvelesko/rusticl-ci-llvm/install/llvm/21.0
+      RUSTICL_ENABLE: radeonsi
+      OCL_ICD_VENDORS: /home/runner/.rusticl-icd
+      LD_LIBRARY_PATH: /space/pvelesko/install/ocl-icd-loder/lib:/space/pvelesko/install/llvm/22.0-native-amd/lib:/space/pvelesko/install/libdrm/2.4.134/lib/x86_64-linux-gnu:/space/pvelesko/install/oneapi/2025.3.2/lib:/space/pvelesko/install/oneapi/2025.3.2/lib64
+      CHIP_BE: opencl
+      CHIP_PLATFORM: "0"
+      CHIP_DEVICE: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          submodules: recursive
+      - name: Build and stage LLVM 21
+        run: |
+          set -euo pipefail
+          mkdir -p $CI_LLVM/llvm-builds/21 && cd $CI_LLVM/llvm-builds/21
+          rm -rf scripts llvm-patches
+          cp -r ${{ github.workspace }}/scripts ${{ github.workspace }}/llvm-patches .
+          # The container sees host /usr/local/lib but not /usr/local/bin, which
+          # SPIRV-Tools' cmake config references; build the translator without it.
+          echo 'set(CMAKE_DISABLE_FIND_PACKAGE_SPIRV-Tools-tools ON)' > $RUNNER_TEMP/tc.cmake
+          CMAKE_TOOLCHAIN_FILE=$RUNNER_TEMP/tc.cmake ./scripts/configure_llvm.sh --version 21 \
+            --install-dir $CI_LLVM/install/llvm/21.0 --configure-only
+          # Shared host: leave a core idle and ~2 GB of RAM per job.
+          JOBS=$(( $(nproc) - 1 )); MEM=$(awk '/MemAvailable/{print int($2/2097152)}' /proc/meminfo)
+          [ "$MEM" -lt "$JOBS" ] && JOBS=$MEM
+          cmake --build llvm-project/llvm/build_21 -j$JOBS
+          rm -rf $CI_LLVM/llvm-stage/21
+          DESTDIR=$CI_LLVM/llvm-stage/21 cmake --install llvm-project/llvm/build_21
+        timeout-minutes: 300
+      - name: Build chipStar with the staged LLVM 21
+        run: |
+          set -euo pipefail
+          # The staged clang's RUNPATH names the live install; load the stage's libraries.
+          export LD_LIBRARY_PATH=$LLVM_STAGE/lib:$LD_LIBRARY_PATH
+          ldd $LLVM_STAGE/bin/clang | grep "$LLVM_STAGE/lib/libclang-cpp"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=$LLVM_STAGE/bin/clang \
+            -DCMAKE_CXX_COMPILER=$LLVM_STAGE/bin/clang++ \
+            -DLLVM_CONFIG_BIN=$LLVM_STAGE/bin/llvm-config \
+            -DCHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS=OFF \
+            -DCHIP_ATOMICS_CACHE_BYPASS_WORKAROUND=ON \
+            -DCMAKE_INSTALL_PREFIX=build/install
+          cmake --build build -j$(nproc)
+          cmake --build build --target build_tests -j$(nproc)
+        timeout-minutes: 60
+      - name: Test chipStar with LLVM 21 (rusticl W6400)
+        run: |
+          export LD_LIBRARY_PATH=$LLVM_STAGE/lib:$LD_LIBRARY_PATH
+          cd build
+          ../scripts/check.py ./ dgpu opencl --num-threads 4 --timeout 180
+        timeout-minutes: 90
+      - name: Mark the stage as validated
+        run: |
+          echo "${{ github.event.pull_request.head.sha || github.sha }}" \
+            > $CI_LLVM/llvm-stage/21/.chipstar-validated
+
+  install-llvm-on-main-rusticl:
+    needs: detect
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.detect.outputs.run_21 == 'true'
+    name: Install LLVM 21 on main branch (rusticl)
+    runs-on: [rusticl]
+    steps:
+      - name: Promote the validated LLVM 21 stage
+        run: |
+          set -euo pipefail
+          P=/space/pvelesko/rusticl-ci-llvm/install/llvm/21.0
+          S=/space/pvelesko/rusticl-ci-llvm/llvm-stage/21
+          test -f $S/.chipstar-validated && test -d $S$P \
+            || { echo "::error::no validated LLVM 21 stage at $S"; exit 1; }
+          rm -rf $P.prev; [ ! -e $P ] || mv $P $P.prev
+          mv $S$P $P
+          $P/bin/clang --version || { rm -rf $P; mv $P.prev $P; exit 1; }
+          rm -rf $S $P.prev
+
+  # macOS (pastrami) and Linux ARM64 (salami) build only the latest LLVM (23);
+  # only the x86 Linux runner keeps building every version. LLVM 23 needs a
+  # single native build: chipStar patches in llvm#213052, so the SPIRV-target
+  # build also serves the translator and the producer is chosen per compilation
+  # by -f[no-]integrated-objemitter.
   step1-configure-all-macos:
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
-    name: 'Step 1: Configure LLVM 22 (macOS)'
+    needs: detect
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+      && needs.detect.outputs.run_23 == 'true'
+    name: 'Step 1: Configure LLVM 23 (macOS)'
     runs-on: [self-hosted, ARM64, MacOS]
-    strategy:
-      matrix:
-        variant: [translator, native]
-      fail-fast: true
     steps:
       - uses: actions/checkout@v3
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           submodules: 'recursive'
-      - name: Configure LLVM 22 (${{ matrix.variant }})
+      - name: Configure LLVM 23
         shell: /bin/bash {0}
         run: |
           export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
-          BUILD_DIR="$HOME/llvm-builds/22-${{ matrix.variant }}"
-          rm -rf "$BUILD_DIR"
+          BUILD_DIR="$HOME/llvm-builds/23"
           mkdir -p "$BUILD_DIR"
           cd "$BUILD_DIR"
           rm -rf scripts llvm-patches
           cp -r ${{ github.workspace }}/scripts .
           cp -r ${{ github.workspace }}/llvm-patches .
           chmod +x scripts/configure_llvm.sh
-          ./scripts/configure_llvm.sh --version 22 \
-            --install-dir $HOME/install/llvm/22.0-${{ matrix.variant }} \
-            --variant ${{ matrix.variant }} --configure-only
+          ./scripts/configure_llvm.sh --version 23 \
+            --install-dir $HOME/install/llvm/23.0 \
+            --variant native --configure-only
 
   step2-build-test-macos:
-    needs: step1-configure-all-macos
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
-    name: Build LLVM 22 (${{ matrix.variant }}) (macOS) and test chipStar
+    needs: [detect, step1-configure-all-macos]
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+      && needs.detect.outputs.run_23 == 'true'
+    name: Build LLVM 23 (macOS) and test chipStar
     runs-on: [self-hosted, ARM64, MacOS]
     env:
       CHIP_DEVICE_TYPE: pocl
       CHIP_MODULE_CACHE_DIR: ""
-    strategy:
-      matrix:
-        variant: [translator, native]
-      fail-fast: false
     steps:
       - uses: actions/checkout@v3
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           submodules: 'recursive'
-      - name: Build LLVM 22 (${{ matrix.variant }})
+      - name: Build LLVM 23
         id: build_llvm
         shell: /bin/bash {0}
-        continue-on-error: true
         run: |
           export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
-          BUILD_DIR="$HOME/llvm-builds/22-${{ matrix.variant }}/llvm-project/llvm/build_22"
+          BUILD_DIR="$HOME/llvm-builds/23/llvm-project/llvm/build_23"
           if [ ! -d "$BUILD_DIR" ]; then
             echo "Error: Build directory $BUILD_DIR does not exist. Step 1 may have failed."
             exit 1
@@ -352,9 +688,9 @@ jobs:
         shell: /bin/bash {0}
         run: |
           export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
-          rm -rf $HOME/llvm-stage/22-${{ matrix.variant }}
-          DESTDIR=$HOME/llvm-stage/22-${{ matrix.variant }} cmake --install $HOME/llvm-builds/22-${{ matrix.variant }}/llvm-project/llvm/build_22
-      - name: Test chipStar with LLVM 22 (${{ matrix.variant }}) (PoCL OpenCL)
+          rm -rf $HOME/llvm-stage/23
+          DESTDIR=$HOME/llvm-stage/23 cmake --install $HOME/llvm-builds/23/llvm-project/llvm/build_23
+      - name: Test chipStar with LLVM 23 (PoCL OpenCL)
         if: steps.build_llvm.outcome == 'success'
         shell: /bin/bash {0}
         run: |
@@ -362,8 +698,28 @@ jobs:
           export MODULEPATH="/Users/paulius/modulefiles:$MODULEPATH"
           module load pocl
 
-          LLVM_BIN="$HOME/llvm-builds/22-${{ matrix.variant }}/llvm-project/llvm/build_22/bin"
+          # Build/test against the INSTALLED LLVM toolchain (staged above), not
+          # the build tree, which lacks install-only runtime headers such as
+          # omp.h (breaks TestHipccFopenmp with "'omp.h' file not found").
+          LLVM_PREFIX="$HOME/install/llvm/23.0"
+          LLVM_STAGE="$HOME/llvm-stage/23${LLVM_PREFIX}"
+          LLVM_BIN="${LLVM_STAGE}/bin"
           test -f "${LLVM_BIN}/clang" || exit 1
+          test -f "${LLVM_BIN}/../lib/clang/23/include/omp.h" \
+            || { echo "ERROR: omp.h missing from LLVM install toolchain at ${LLVM_BIN}"; exit 1; }
+
+          # configure_llvm.sh builds with LLVM_LINK_LLVM_DYLIB=ON and
+          # CMAKE_INSTALL_RPATH pinned to the final install prefix, so a staged
+          # (DESTDIR) clang resolves libclang-cpp/libLLVM from the previously
+          # installed toolchain and runs old driver code. Pin the loader to the
+          # stage so this lane tests what it just built. DYLD_LIBRARY_PATH (not
+          # DYLD_FALLBACK_LIBRARY_PATH) is required: fallback is consulted only
+          # after @rpath resolution fails, and here it succeeds with the wrong
+          # library. Diagnostic only, not fatal, since the macOS linkage layout
+          # is not verified here the way the Linux one is.
+          export DYLD_LIBRARY_PATH="${LLVM_STAGE}/lib${DYLD_LIBRARY_PATH:+:${DYLD_LIBRARY_PATH}}"
+          echo "clang links against:"
+          otool -L "${LLVM_BIN}/clang" 2>/dev/null | grep -iE "clang-cpp|libLLVM" || true
 
           export PATH="/Users/paulius/.pyenv/shims:/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
           export CHIP_DEVICE_TYPE=pocl
@@ -372,11 +728,12 @@ jobs:
           export CMAKE_PREFIX_PATH="${SPIRV_TOOLS_PREFIX}:${CMAKE_PREFIX_PATH}"
 
           cd ${{ github.workspace }}
-          rm -rf build-22-${{ matrix.variant }}
-          mkdir -p build-22-${{ matrix.variant }}
-          cd build-22-${{ matrix.variant }}
+          rm -rf build-23
+          mkdir -p build-23
+          cd build-23
           /opt/homebrew/bin/cmake .. \
             -DLLVM_CONFIG_BIN=${LLVM_BIN}/llvm-config \
+            -DCHIP_ATOMICS_CACHE_BYPASS_WORKAROUND=ON \
             -DOpenCL_LIBRARY=/Users/paulius/install/pocl/lib/libpocl.dylib \
             -GNinja -DCMAKE_BUILD_TYPE=Debug
           ninja CHIP
@@ -384,39 +741,84 @@ jobs:
           ninja
           ../scripts/check.py ./ pocl opencl
         timeout-minutes: 60
+      # See the Linux lane: the stage exists from before the tests ran, so only
+      # this marker distinguishes a validated toolchain from a merely compiled
+      # one.
+      - name: Mark the stage as validated
+        if: success()
+        run: |
+          echo "${{ github.event.pull_request.head.sha || github.sha }}" \
+            > "$HOME/llvm-stage/23/.chipstar-validated"
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
-          name: test-logs-macos-llvm22-${{ matrix.variant }}
+          name: test-logs-macos-llvm23
           path: |
-            build-22-${{ matrix.variant }}/checkpy_*.txt
-            build-22-${{ matrix.variant }}/Testing/Temporary/LastTest.log
+            build-23/checkpy_*.txt
+            build-23/Testing/Temporary/LastTest.log
 
   install-llvm-on-main-macos:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    name: Install LLVM 22 (${{ matrix.variant }}) on main branch (macOS)
+    needs: detect
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.detect.outputs.run_23 == 'true'
+    name: Install LLVM 23 on main branch (macOS)
     runs-on: [self-hosted, ARM64, MacOS]
-    strategy:
-      matrix:
-        variant: [translator, native]
-      fail-fast: false
     steps:
-      - name: Install LLVM 22 (${{ matrix.variant }})
+      - name: Install LLVM 23
+        id: install_llvm_macos
         run: |
-          STAGED="$HOME/llvm-stage/22-${{ matrix.variant }}"
-          INSTALL_DIR="$HOME/install/llvm/22.0-${{ matrix.variant }}"
-          rm -rf "$INSTALL_DIR"
-          mv "${STAGED}${INSTALL_DIR}" "$INSTALL_DIR"
+          set -euo pipefail
+          STAGED="$HOME/llvm-stage/23"
+          INSTALL_DIR="$HOME/install/llvm/23.0"
+
+          # This job only runs when LLVM 23 changed, so a missing stage means
+          # the PR run never produced one rather than that there is nothing to
+          # do. Never delete the live toolchain before we know we have a
+          # replacement for it.
+          if [ ! -d "${STAGED}${INSTALL_DIR}" ]; then
+            echo "::error::LLVM 23 changed in this merge but has no staged build at ${STAGED}${INSTALL_DIR}. The PR run never staged it."
+            exit 1
+          fi
+          if [ ! -f "${STAGED}/.chipstar-validated" ]; then
+            echo "::error::Stage at ${STAGED} carries no .chipstar-validated marker; refusing to promote an untested toolchain."
+            exit 1
+          fi
+          echo "Promoting stage built from $(cat "${STAGED}/.chipstar-validated")"
+
+          BACKUP="${INSTALL_DIR}.prev"
+          rm -rf "$BACKUP"
+          if [ -d "$INSTALL_DIR" ]; then
+            mv "$INSTALL_DIR" "$BACKUP"
+          fi
+
+          if ! mv "${STAGED}${INSTALL_DIR}" "$INSTALL_DIR"; then
+            echo "Install failed; restoring previous toolchain."
+            rm -rf "$INSTALL_DIR"
+            [ -d "$BACKUP" ] && mv "$BACKUP" "$INSTALL_DIR"
+            exit 1
+          fi
+          echo "installed=true" >> "$GITHUB_OUTPUT"
         timeout-minutes: 5
-      - name: Verify LLVM 22 (${{ matrix.variant }}) installation
+      - name: Verify LLVM 23 installation
+        if: steps.install_llvm_macos.outputs.installed == 'true'
         run: |
-          test -f $HOME/install/llvm/22.0-${{ matrix.variant }}/bin/clang || exit 1
-          $HOME/install/llvm/22.0-${{ matrix.variant }}/bin/clang --version
-      - name: Generate modulefile for LLVM 22 (${{ matrix.variant }})
+          set -euo pipefail
+          INSTALL_DIR="$HOME/install/llvm/23.0"
+          BACKUP="${INSTALL_DIR}.prev"
+          if [ ! -x "$INSTALL_DIR/bin/clang" ]; then
+            echo "Installed toolchain has no usable clang; restoring previous."
+            rm -rf "$INSTALL_DIR"
+            [ -d "$BACKUP" ] && mv "$BACKUP" "$INSTALL_DIR"
+            exit 1
+          fi
+          "$INSTALL_DIR/bin/clang" --version
+      - name: Generate modulefile for LLVM 23
+        if: steps.install_llvm_macos.outputs.installed == 'true'
         shell: /bin/bash {0}
         run: |
           MODULE_DIR="$HOME/modulefiles/llvm"
-          INSTALL_DIR="$HOME/install/llvm/22.0-${{ matrix.variant }}"
+          INSTALL_DIR="$HOME/install/llvm/23.0"
           mkdir -p "$MODULE_DIR"
           {
             echo '#%Module'
@@ -440,8 +842,207 @@ jobs:
             echo 'prepend-path CPATH $install_dir/include'
             echo 'prepend-path PKG_CONFIG_PATH $install_dir/lib/pkgconfig'
             echo 'prepend-path CMAKE_PREFIX_PATH $install_dir/lib/cmake'
-          } > "$MODULE_DIR/22.0-${{ matrix.variant }}"
-          echo "Created modulefile: $MODULE_DIR/22.0-${{ matrix.variant }}"
-      - name: Cleanup staged install
-        if: always()
-        run: rm -rf $HOME/llvm-stage/22-${{ matrix.variant }}
+          } > "$MODULE_DIR/23.0"
+          echo "Created modulefile: $MODULE_DIR/23.0"
+      # Only reap on success; see the Linux job.
+      - name: Cleanup staged install and backup
+        if: success() && steps.install_llvm_macos.outputs.installed == 'true'
+        run: |
+          rm -rf "$HOME/llvm-stage/23"
+          rm -rf "$HOME/install/llvm/23.0.prev"
+
+  # Linux ARM64 (salami) cannot build LLVM itself: an ODROID-N2+ with 6 slow
+  # cores and 3.6 GB RAM needs ~15 h for a native LLVM build and most likely
+  # runs out of memory at link time. Instead an x86 runner cross-compiles the
+  # toolchain in an Ubuntu 22.04 container (whose aarch64 cross compiler
+  # targets glibc 2.35 / gcc 11, i.e. salami's exact userland, so no sysroot is
+  # needed) and rsyncs the staged install over. See scripts/cross-aarch64/.
+  #
+  # Prerequisites on the x86 runner, none of them automated here:
+  #   1. docker usable without sudo by the runner user;
+  #   2. non-interactive ssh access to salami as user pvelesko (runner's public
+  #      key in salami's authorized_keys, salami's host key in the runner's
+  #      known_hosts, and a `Host salami` block in the runner's ~/.ssh/config);
+  #   3. ~40 GB of scratch space somewhere the workspace step can find.
+  # All three are already in place on meatloaf and ramen; this is the checklist
+  # for any future x86 node, not pending work.
+  cross-build-llvm23-aarch64:
+    needs: detect
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+      && needs.detect.outputs.run_23 == 'true'
+    name: 'Cross-build LLVM 23 for salami (aarch64)'
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          # No submodules: this job reads only scripts/, llvm-patches/
+          # and tests/.
+      - name: Pick a scratch workspace with room for the build
+        run: |
+          set -euo pipefail
+          # A completed build measures ~12 GB (sources + build tree + stage);
+          # 40 is the threshold with headroom. Where that fits differs per
+          # node: ramen's / has ~48 GB free and a history of filling up but
+          # carries a separate 3.6 TB /space, while meatloaf has no separate
+          # /space and ~76 GB on /. So resolve the location at runtime instead
+          # of hardcoding $HOME or runner.temp, and refuse to start rather than
+          # dying mid-link with ENOSPC.
+          NEED_GB=40
+          USER_NAME="$(id -un)"
+          PICK=""
+          for CAND in "/space/$USER_NAME/llvm-cross-build" \
+                      "$HOME/llvm-cross-aarch64" \
+                      "${RUNNER_TEMP:-/tmp}/llvm-cross-aarch64"; do
+            [ -d "$(dirname "$CAND")" ] || continue
+            mkdir -p "$CAND" 2>/dev/null || continue
+            AVAIL=$(df -BG --output=avail "$CAND" | tail -1 | tr -dc '0-9')
+            echo "candidate $CAND: ${AVAIL:-0} GB free"
+            if [ "${AVAIL:-0}" -ge "$NEED_GB" ]; then PICK="$CAND"; break; fi
+          done
+          if [ -z "$PICK" ]; then
+            echo "ERROR: no candidate workspace has ${NEED_GB} GB free."
+            echo "Free space on this runner, or add a large scratch filesystem."
+            df -h
+            exit 1
+          fi
+          echo "Using cross-build workspace: $PICK"
+          echo "CROSS_WORK=$PICK" >> "$GITHUB_ENV"
+      - name: Check the pinned-ref fetch guard
+        # The container runs configure_llvm.sh to prepare the LLVM source, and
+        # its fetch is what fails when this runner is throttled. Assert the
+        # guard here too, on the host, before an image build and an hour of
+        # cross-compiling. Needs only git.
+        run: |
+          tests/configure_llvm_pinned_fetch.bash scripts/configure_llvm.sh
+      - name: Build the cross-compilation container
+        run: |
+          docker build -t chipstar-llvm-cross-aarch64 \
+            ${{ github.workspace }}/scripts/cross-aarch64
+        timeout-minutes: 30
+      - name: Cross-build LLVM 23 for aarch64
+        run: |
+          set -euo pipefail
+          # Leave one core for the runner itself; the x86 nodes differ (8 on
+          # meatloaf, 16 on ramen), so size this from nproc, never pinned.
+          JOBS=$(nproc); JOBS=$(( JOBS > 1 ? JOBS - 1 : 1 ))
+          # Run as the runner user so the staged tree stays rsync-able and
+          # removable without root; /work persists so rebuilds are incremental.
+          docker run --rm \
+            --user "$(id -u):$(id -g)" -e HOME=/work \
+            -v "${{ github.workspace }}":/chipstar:ro \
+            -v "$CROSS_WORK":/work \
+            chipstar-llvm-cross-aarch64 \
+            /chipstar/scripts/cross-aarch64/cross-build.sh "$JOBS"
+        # ~29 min at -j26 on a 32-core box; 8-16 core nodes take a few hours.
+        timeout-minutes: 420
+      - name: Ship the toolchain to salami
+        run: |
+          set -euo pipefail
+          STAGE="$CROSS_WORK/stage/home/pvelesko/install/llvm/23.0"
+          test -x "$STAGE/bin/clang"
+          # Installed straight to the final prefix rather than staged and
+          # promoted on main like the x86/macOS lanes: CMAKE_INSTALL_RPATH is
+          # baked to this path, so running from anywhere else needs
+          # LD_LIBRARY_PATH gymnastics. No other salami lane uses llvm/23.0
+          # today (check-unit-tests-arm.yml is on llvm-21), so a PR's toolchain
+          # landing here cannot break another job.
+          ssh salami 'mkdir -p ~/install/llvm/23.0 ~/modulefiles/llvm'
+          rsync -a --delete "$STAGE/" salami:install/llvm/23.0/
+          # Modulefile mirrors the one the x86 install-on-main job generates.
+          # The prefix is literal because it is also baked into the binaries'
+          # RPATH by the cross build.
+          INSTALL_DIR="/home/pvelesko/install/llvm/23.0"
+          {
+            echo '#%Module'
+            echo ''
+            echo "set install_dir $INSTALL_DIR"
+            echo 'pushenv llvm_PATH $install_dir'
+            echo 'pushenv llvm_ROOT $install_dir'
+            echo 'pushenv llvm_DIR $install_dir'
+            echo 'pushenv LLVM_PATH $install_dir'
+            echo 'pushenv LLVM_ROOT $install_dir'
+            echo 'pushenv LLVM_DIR $install_dir'
+            echo ''
+            echo 'prepend-path PATH $install_dir/bin'
+            echo 'prepend-path LD_LIBRARY_PATH $install_dir/lib'
+            echo 'prepend-path LD_LIBRARY_PATH $install_dir/lib64'
+            echo 'prepend-path LIBRARY_PATH $install_dir/lib'
+            echo 'prepend-path LIBRARY_PATH $install_dir/lib64'
+            echo 'prepend-path CPATH $install_dir/include'
+            echo 'prepend-path PKG_CONFIG_PATH $install_dir/lib/pkgconfig'
+            echo 'prepend-path CMAKE_PREFIX_PATH $install_dir/lib/cmake'
+          } > "$RUNNER_TEMP/llvm-23.0.modulefile"
+          scp "$RUNNER_TEMP/llvm-23.0.modulefile" salami:modulefiles/llvm/23.0
+          # Smoke test: proves the cross-built binaries actually run on salami
+          # and resolve their RPATH'd libraries there.
+          ssh salami "$INSTALL_DIR/bin/clang --version"
+        timeout-minutes: 60
+
+  step2-build-test-salami:
+    needs: [detect, cross-build-llvm23-aarch64]
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+      && needs.detect.outputs.run_23 == 'true'
+    name: Test chipStar on salami with cross-built LLVM 23
+    runs-on: [self-hosted, Linux, ARM64]
+    env:
+      CHIP_LOGLEVEL: err
+      CHIP_MODULE_CACHE_DIR: ""
+      POCL_KERNEL_CACHE: 0
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          submodules: 'recursive'
+      - name: Build chipStar with LLVM 23
+        id: build_chipstar
+        run: |
+          # No `set -e` here, matching the other lanes in this workflow: the
+          # Environment Modules shell functions do not survive `set -u`.
+          if [ -f "$HOME/.local/init/bash" ]; then
+            export MODULESHOME=$HOME/.local; source "$MODULESHOME/init/bash"
+          elif [ -f /etc/profile.d/lmod.sh ]; then source /etc/profile.d/lmod.sh &> /dev/null
+          else source /etc/profile.d/modules.sh &> /dev/null; fi
+          module use ~/modulefiles
+          module load llvm/23.0
+          cd ${{ github.workspace }}
+          rm -rf build-23
+          mkdir -p build-23
+          cd build-23
+          # Native SPIR-V backend (LLVM 23 carries llvm#213052), Mali-G52
+          # workarounds, and no fp64: the Mali blob has no double support.
+          cmake .. -GNinja -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_CONFIG_BIN=$HOME/install/llvm/23.0/bin/llvm-config \
+            -DCHIP_LLVM_USE_INTERGRATED_SPIRV=ON \
+            -DCHIP_MALI_GPU_WORKAROUNDS=ON \
+            -DCHIP_ATOMICS_CACHE_BYPASS_WORKAROUND=ON \
+            -DCHIP_SKIP_TESTS_WITH_DOUBLES=ON \
+            -DCHIP_BUILD_SAMPLES=ON -DCHIP_BUILD_TESTS=ON
+          # -j4, not nproc: salami has 3.6 GB RAM and OOMs at higher
+          # parallelism.
+          ninja all install -j4
+          ninja build_tests install -j4
+        timeout-minutes: 300
+      - name: Test chipStar with LLVM 23 (iGPU OpenCL)
+        if: steps.build_chipstar.outcome == 'success'
+        run: |
+          if [ -f "$HOME/.local/init/bash" ]; then
+            export MODULESHOME=$HOME/.local; source "$MODULESHOME/init/bash"
+          elif [ -f /etc/profile.d/lmod.sh ]; then source /etc/profile.d/lmod.sh &> /dev/null
+          else source /etc/profile.d/modules.sh &> /dev/null; fi
+          module use ~/modulefiles
+          module load llvm/23.0
+          cd ${{ github.workspace }}/build-23
+          ../scripts/check.py ./ igpu opencl
+        timeout-minutes: 180
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-logs-salami-llvm23
+          path: |
+            ${{ github.workspace }}/build-23/checkpy_*.txt
+            ${{ github.workspace }}/build-23/Testing/Temporary/LastTest.log

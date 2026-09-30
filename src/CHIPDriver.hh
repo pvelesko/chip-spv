@@ -109,6 +109,13 @@ extern hipError_t CHIPReinitialize(const uintptr_t *NativeHandles,
                                    int NumHandles);
 
 /**
+ * True when CHIP_UNRESTRICTED_ALLOC_SIZE=1, i.e. the user has opted in to
+ * allocating a single buffer larger than the device's reported
+ * maxMemAllocSize. Applies to both the OpenCL and Level Zero backends.
+ */
+bool chipUnrestrictedAllocSize();
+
+/**
  * Number of fat binaries registerer through __hipRegisterFatBinary(). On
  * program exit this value (non-zero) will postpone chipStar runtime
  * uninitialization until the all the registered binaries have been
@@ -229,6 +236,7 @@ public:
 };
 
 class EnvVars {
+public:
 private:
   int PlatformIdx_ = 0;
   DeviceType Device_{DeviceType::GPU};
@@ -287,7 +295,6 @@ public:
   const std::optional<std::string> &getDumpProcessedSpirvDir() const {
     return DumpProcessedSpirvDir_;
   }
-
   bool isManualDeviceSelection() const {
     return PlatformIdxSet_ || DeviceIdxSet_;
   }
@@ -342,7 +349,10 @@ private:
         DumpProcessedSpirvDir_ = value;
     }
 
-    if (readEnvVar("CHIP_MODULE_CACHE_DIR", value, true)) {
+    // Lower = false: this is a filesystem path, and lowercasing it either
+    // sends the cache somewhere the user did not ask for or, if that path is
+    // not creatable, aborts the process.
+    if (readEnvVar("CHIP_MODULE_CACHE_DIR", value, false)) {
       if (value.size())
         ModuleCacheDir_ = value;
     } else {

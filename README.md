@@ -64,7 +64,7 @@ These libraries are ported for Intel GPUs using oneAPI MKL as backend:
 ## Applications
 
 chipStar has so far been tested using the following applications:
-- [libCEED](https://github.com/CHIP-SPV/libCEED) Our fork includes some workarounds. 
+- [libCEED](https://github.com/CEED/libCEED)
 - [GAMESS](https://www.msg.chem.iastate.edu/gamess/) Source code is not public.
 - [HeCBench](https://github.com/zjin-lcf/HeCBench) CUDA Benchmarks. 
 
@@ -75,18 +75,18 @@ If you want to build everything yourself, you can follow a detailed [Getting Sta
 
 ## Development Status and Maturity
 
-While chipStar 1.1 can already be used to run various large HPC applications successfully, it is still heavily in development mode with plenty of known issues and unimplemented features. There are also known low-performance optimizations that are still to be done. However, we consider chipStar ready for wider-range testing and welcome community contributions in form of reproducible bug reports and good quality pull requests.
+While chipStar 1.3 can already be used to run various large HPC applications successfully, it is still heavily in development mode with plenty of known issues and unimplemented features. There are also known low-performance optimizations that are still to be done. However, we consider chipStar ready for wider-range testing and welcome community contributions in form of reproducible bug reports and good quality pull requests.
 
-Release notes for [1.1](docs/release_notes/chipStar_1.1.rst), [1.0](docs/release_notes/chipStar_1.0.rst) and [0.9](docs/release_notes/release-0.9.txt).
+Release notes for [1.3](docs/release_notes/chipStar_1.3.rst), [1.2](docs/release_notes/chipStar_1.2.rst), [1.1](docs/release_notes/chipStar_1.1.rst), [1.0](docs/release_notes/chipStar_1.0.rst) and [0.9](docs/release_notes/release-0.9.txt).
 
 ## Prerequisites
 
 * Cmake >= 3.20.0
-* Clang and LLVM 18, 19, 20
-  * Can be installed, for example, by adding the [LLVM's Debian/Ubuntu repository](https://apt.llvm.org/) and installing packages 'clang-19 llvm-19 clang-tools-19'.
-  * For the best results, install Clang/LLVM from a chipStar LLVM/Clang [branch](https://github.com/CHIP-SPV/llvm-project/tree/chipStar-llvm-18) which has fixes that are not yet in the LLVM upstream project. See below for a scripted way to build and install the patched versions.
+* Clang and LLVM 21, 22, 23 (plus an experimental `latest` option tracking the maintained [chipStar-llvm-23](https://github.com/CHIP-SPV/llvm-project/tree/chipStar-llvm-23) branch)
+  * Can be installed, for example, by adding the [LLVM's Debian/Ubuntu repository](https://apt.llvm.org/) and installing packages 'clang-21 llvm-21 clang-tools-21'.
+  * For the best results, build Clang/LLVM with the chipStar patches applied (from `llvm-patches/llvm-<version>/`). See below for a scripted way to build and install the patched versions.
 * SPIRV-LLVM-Translator from a branch matching the LLVM major version:
-  (e.g. llvm\_release\_180 for LLVM 18, llvm\_release\_190 for LLVM 19)
+  (e.g. llvm\_release\_210 for LLVM 21, llvm\_release\_220 for LLVM 22)
 ,  [llvm-spirv](https://github.com/KhronosGroup/SPIRV-LLVM-Translator).
   * Make sure the built llvm-spirv binary is installed into the same path as clang binary, otherwise clang might find and use a different llvm-spirv, leading to errors.
 * SPIRV-Tools and SPIRV-Headers:
@@ -95,31 +95,33 @@ Release notes for [1.1](docs/release_notes/chipStar_1.1.rst), [1.0](docs/release
 
 ### Compiling Clang, LLVM and SPIRV-LLVM-Translator
 
-It's recommended to use the chipStar fork of LLVM which has a few patches not yet upstreamed.
+It's recommended to build LLVM with the chipStar patches applied (a few fixes not yet in the upstream release branches).
 For this you can use a script included in the chipStar repository:
 
 ```bash
 ./scripts/configure_llvm.sh
-Usage: ./scripts/configure_llvm.sh --version <version> --install-dir <dir> --link-type static(default)/dynamic --only-necessary-spirv-exts <on|off> --binutils-header-location <path>
---version: LLVM version 18, 19 or 20
+Usage: ./scripts/configure_llvm.sh --version <version> --install-dir <dir> --link-type static/dynamic(default) [--variant translator|native] [--with-binutils [path]] [--configure-only] [-N]
+--version: LLVM version 21, 22, 23, or latest (experimental, tracks the maintained chipStar-llvm-23 branch, no patches)
 --install-dir: installation directory
---link-type: static or dynamic (default: static)
---only-necessary-spirv-exts: on or off (default: off)
---binutils-header-location: path to binutils header (default: empty)
+--link-type: static or dynamic (default: dynamic)
 
-./scripts/configure_llvm.sh --version 19 --install-dir /opt/install/llvm/19.0
-cd llvm-project/llvm/build_17
+./scripts/configure_llvm.sh --version 22 --install-dir /opt/install/llvm/22.0
+cd llvm-project/llvm/build_22
 make -j 16
 <sudo> make install
 ```
 
-Or you can do the steps manually:
+Or you can do the steps manually (clone the release branches, apply the patches from `llvm-patches/llvm-<version>/`, then build):
 
 ```bash
-git clone --depth 1 https://github.com/CHIP-SPV/llvm-project.git -b chipStar-llvm-19
-cd llvm-project/llvm/projects
-git clone --depth 1 https://github.com/CHIP-SPV/SPIRV-LLVM-Translator.git -b chipStar-llvm-19
-cd ../..
+git clone --depth 1 https://github.com/llvm/llvm-project.git -b release/22.x
+cd llvm-project
+for p in /path/to/chipStar/llvm-patches/llvm-22/llvm/*.patch; do git apply "$p"; done
+cd llvm/projects
+git clone --depth 1 https://github.com/KhronosGroup/SPIRV-LLVM-Translator.git -b llvm_release_220
+cd SPIRV-LLVM-Translator
+for p in /path/to/chipStar/llvm-patches/llvm-22/spirv-translator/*.patch; do git apply "$p"; done
+cd ../../..
 
 # DLLVM_ENABLE_PROJECTS="clang;openmp" OpenMP is optional but many apps use it
 # DLLVM_TARGETS_TO_BUILD Speed up compilation by building only the necessary CPU host target
@@ -129,7 +131,7 @@ cmake -S llvm -B build \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_ENABLE_PROJECTS="clang;openmp" \
   -DLLVM_TARGETS_TO_BUILD=X86 \
-  -DCMAKE_INSTALL_PREFIX=$HOME/local/llvm-19
+  -DCMAKE_INSTALL_PREFIX=$HOME/local/llvm-22
 make -C build -j8 all install
 ```
 
@@ -175,6 +177,34 @@ make all build_tests install -j8
 ```
 
 NOTE: If you don't have libOpenCL.so (for example from the `ocl-icd-opencl-dev` package), but only libOpenCL.so.1 installed, CMake fails to find it and disables the OpenCL backend. This [issue](https://github.com/CHIP-SPV/chipStar/issues/542) describes a workaround.
+
+### Build Options
+
+#### `CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS` (default: `ON`)
+
+Controls whether chipStar emits program-scope (SPIR-V `CrossWorkgroup`) global
+variables for device-side features that require them:
+
+* device-side dynamic memory allocation (`malloc`/`free`, backed by the
+  `__chipspv_device_heap` global), and
+* `clock()` / `clock64()` / `wall_clock()` / `wall_clock64()` (backed by the
+  `__chip_clk_counter` global).
+
+Program-scope globals are initialized at module load through shadow kernels, and
+some OpenCL drivers (for example rusticl/radeonsi) cannot consume them at all
+([#1279](https://github.com/CHIP-SPV/chipStar/issues/1279)). Disabling this
+option omits those globals, which avoids their per-module initialization
+overhead ([#582](https://github.com/CHIP-SPV/chipStar/issues/582)) and restores
+compatibility with such drivers, at the following cost:
+
+* device-side `malloc`/`free` become unavailable, and
+* `clock*` / `wall_clock*` remain callable but return `0`.
+
+To build with these features disabled:
+
+```bash
+cmake .. -DCHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS=OFF ...
+```
 
 ### Building on ARM + Mali
 
@@ -354,6 +384,28 @@ export CHIP_DEVICE=0
 
 *NOTE: Level Zero doesn't have a clinfo equivalent. Normally if you have more than one Level Zero device, there will only be a single platform so set CHIP_PLATFORM=0 and then CHIP_DEVICE to the device you want to use.*
 *You can check the name of the device by running a sample which prints the name such as `build/samples/0_MatrixMultiply/MatrixMultiply`
+
+### Module Cache
+
+Compiled device binaries are cached under `CHIP_MODULE_CACHE_DIR` (default
+`$HOME/.cache/chipStar`). The cache key covers the SPIR-V, the option strings
+the driver receives, the linked device-library modules, device identity, the
+set of libraries the runtime loaded during initialization (so upgrading or
+`LD_LIBRARY_PATH`-swapping the driver or the Intel Graphics Compiler
+invalidates entries, even when the driver version string does not change),
+and compiler-relevant environment variables. Known limitations:
+
+* Intel Compute Runtime settings supplied through an `igdrcl.config` /
+  `neo.config` file in the working directory are **not** part of the key.
+  Note NEO reads that file *instead of* the environment when it exists, so
+  the same variable set via the file and via the environment produce
+  different driver behavior with the file route invisible to the cache. If
+  you use these files, disable the cache or clear it when changing them.
+* Library observation uses `/proc/self/maps` (Linux only), and only sees
+  libraries loaded during chipStar's backend initialization. If the
+  application initializes OpenCL or Level Zero itself before the first HIP
+  call, the compiler identity degrades to a fixed token and a
+  compiler-only upgrade will not invalidate the cache (a warning is logged).
 
 ## Troubleshooting
 

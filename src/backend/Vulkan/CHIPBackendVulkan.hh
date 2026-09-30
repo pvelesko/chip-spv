@@ -548,6 +548,8 @@ class CHIPContextVulkan : public chipstar::Context {
   std::unordered_map<const void *, DevPtrEntry> DevPtrToEntry_;
 
 public:
+  void importHostMemory(void *HostPtr, size_t SizeBytes) override {}
+  void releaseHostMemory(void *HostPtr) override {}
   CHIPContextVulkan();
   virtual ~CHIPContextVulkan() override;
 

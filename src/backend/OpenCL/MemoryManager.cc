@@ -161,14 +161,12 @@ std::shared_ptr<void> MemoryManager::allocateUSM(size_t Size, size_t Alignment,
                                         Alignment, &Err);
     break;
   case hipMemoryTypeManaged:
-  case hipMemoryTypeUnified:
-    // Use host memory for managed/unified allocations to ensure host
-    // accessibility is maintained even when GPU accesses the memory.
-    // Intel's USM shared allocations use page migration that can leave
-    // host mappings invalid after device access, causing segfaults.
-    // Host memory remains accessible from both host and device.
     RawPtr =
         USM_.clHostMemAllocINTEL(Context_(), nullptr, Size, Alignment, &Err);
+    break;
+  case hipMemoryTypeUnified:
+    RawPtr = USM_.clSharedMemAllocINTEL(Context_(), Device_(), nullptr, Size,
+                                        Alignment, &Err);
     break;
   }
 
@@ -260,17 +258,19 @@ void *MemoryManager::allocate(size_t Size, size_t Alignment,
   assert(Allocations_.find(Ptr) == Allocations_.end());
   Allocations_.emplace(Ptr, Size);
 
-  // Set the appropriate bool based on the MemType
+  // Record which USM kinds exist so annotateIndirectPointers() can set the
+  // matching CL_KERNEL_EXEC_INFO_INDIRECT_*_ACCESS_INTEL flags; each must match
+  // the kind allocateUSM() used, or the Intel CPU runtime rejects the launch.
   switch (MemType) {
   case hipMemoryTypeHost:
+  case hipMemoryTypeManaged:
     hostAllocUsed = true;
+    break;
+  case hipMemoryTypeUnified:
+    sharedAllocUsed = true;
     break;
   case hipMemoryTypeDevice:
     deviceAllocUsed = true;
-    break;
-  case hipMemoryTypeManaged:
-  case hipMemoryTypeUnified:
-    sharedAllocUsed = true;
     break;
   default:
     // Handle unexpected memory type

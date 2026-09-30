@@ -34,6 +34,7 @@
 
 #include <hip/driver_types.h>
 #include <hip/spirv_hip_host_defines.h>
+#include "chipStarConfig.hh"
 
 #if defined(__clang__) && defined(__HIP__)
 #include "spirv_hip_devicelib.hh"
@@ -52,8 +53,28 @@ extern "C" {
 // abort request.
 __attribute__((weak)) __device__ int32_t __chipspv_abort_called;
  
-// Global pointer for the device heap for device-side malloc/free
+// The message of a failed device-side assertion, in the format
+// _cl_assert_fail_print prints it. Device printf only reaches stdout, so
+// __assert_fail also records the message here for the runtime to copy to the
+// host and write to stderr when it services the abort request
+// (handleAbortRequest); stderr is where ROCm reports it and where gtest death
+// tests look for it. Claimed is taken atomically by the first work-item that
+// records a message so concurrent failures do not interleave in Text. The
+// runtime treats the variable as raw bytes and reads Text at offset
+// sizeof(int) (ChipDeviceAbortMsgTextOffset in src/common.hh).
+struct __chipspv_abort_msg_t {
+  int Claimed;
+  char Text[508];
+};
+__attribute__((weak)) __device__ __chipspv_abort_msg_t __chipspv_abort_msg;
+
+// Global pointer for the device heap for device-side malloc/free.
+// Gated behind CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS: this is a program-scope
+// global which some OpenCL drivers (e.g. rusticl/radeonsi) cannot consume
+// (issue #1279).
+#ifdef CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS
 __attribute__((weak)) __device__ void* __chipspv_device_heap;
+#endif
 
 __device__ void __chipspv_abort(int32_t *abort_flag);
 
@@ -154,6 +175,46 @@ extern "C" __device__ int printf(const char *fmt, ...)
     __attribute__((format(printf, 1, 2)));
 extern "C" __device__ void abort();
 
+static inline __device__ void __chipspv_abort_msg_append(unsigned &Pos,
+                                                         const char *S) {
+  while (*S && Pos < sizeof(__chipspv_abort_msg.Text) - 1)
+    __chipspv_abort_msg.Text[Pos++] = *S++;
+}
+
+// Records a failed assertion in __chipspv_abort_msg for the runtime to report
+// on stderr. Only the first work-item to claim the buffer writes it; the text
+// is bounded by the buffer and NUL-terminated.
+static inline __device__ void
+__chipspv_record_assert_msg(const char *file, unsigned int line,
+                            const char *function, const char *assertion) {
+  if (atomicCAS(&__chipspv_abort_msg.Claimed, 0, 1) != 0)
+    return;
+
+  // Decimal digits of the line number, least significant first.
+  char Digits[10];
+  unsigned NumDigits = 0;
+  do {
+    Digits[NumDigits++] = '0' + line % 10;
+    line /= 10;
+  } while (line);
+  char LineStr[11];
+  unsigned I = 0;
+  while (NumDigits)
+    LineStr[I++] = Digits[--NumDigits];
+  LineStr[I] = 0;
+
+  unsigned Pos = 0;
+  __chipspv_abort_msg_append(Pos, file);
+  __chipspv_abort_msg_append(Pos, ":");
+  __chipspv_abort_msg_append(Pos, LineStr);
+  __chipspv_abort_msg_append(Pos, ": ");
+  __chipspv_abort_msg_append(Pos, function);
+  __chipspv_abort_msg_append(Pos, ": Device-side assertion `");
+  __chipspv_abort_msg_append(Pos, assertion);
+  __chipspv_abort_msg_append(Pos, "' failed.");
+  __chipspv_abort_msg.Text[Pos] = 0;
+}
+
 // The assert part mimiced from amd_device_functions.h of amdhip.  We
 // assume assert.h defines assert such that it calls __assert_fail
 // when it fails. Some users forward declares the __assert_fail, with
@@ -162,6 +223,16 @@ extern "C" __device__ void abort();
 // compiler may give obscure warnings about it.
 
 extern "C" {
+// Message printing is delegated to _cl_assert_fail_print in chipStar's device
+// library (bitcode/_cl_print_str.cl). Printing there (OpenCL C) keeps the
+// printf format strings in the constant address space; emitting them from a
+// HIP C++ device function would place the literals in the generic address
+// space and force SPV_EXT_relaxed_printf_string_address_space, which the Intel
+// runtime rejects at clBuildProgram. Aborting stays here so abort() resolves
+// to the flag-based __chipspv_abort path (handled by the HipAbort pass).
+__device__ void _cl_assert_fail_print(const char *file, unsigned int line,
+                                      const char *function,
+                                      const char *assertion);
 #if defined(_WIN32) || defined(_WIN64)
 __device__ __attribute__((noinline)) __attribute__((weak)) void
 _wassert(const wchar_t *_msg, const wchar_t *_file, unsigned _line)
@@ -170,15 +241,40 @@ _wassert(const wchar_t *_msg, const wchar_t *_file, unsigned _line)
   // FIXME: Need `wchar_t` support to generate assertion message.
   abort();
 }
-#else  // defined(_WIN32) || defined(_WIN64)
+#elif defined(__APPLE__)
+// On macOS, assert() expands to __assert_rtn instead of __assert_fail.
+__device__ __attribute__((noinline)) __attribute__((weak)) void
+__assert_rtn(const char *function, const char *file, int line,
+             const char *assertion) {
+  _cl_assert_fail_print(file, line, function, assertion);
+  __chipspv_record_assert_msg(file, line, function, assertion);
+  abort();
+}
+#else  // defined(_WIN32) || defined(_WIN64) || defined(__APPLE__)
 __device__ __attribute__((noinline)) __attribute__((weak)) void
 __assert_fail(const char *assertion, const char *file, unsigned int line,
               const char *function) {
-  printf("%s:%u: %s: Device-side assertion `%s' failed.\n", file, line,
-         function, assertion);
+  _cl_assert_fail_print(file, line, function, assertion);
+  __chipspv_record_assert_msg(file, line, function, assertion);
   abort();
 }
-#endif // defined(_WIN32) || defined(_WIN64)
+#endif // defined(_WIN32) || defined(_WIN64) || defined(__APPLE__)
+
+// Clang materialises a reference to __cxa_pure_virtual in the vtable of every
+// class that still has an unoverridden pure virtual member. The symbol has to
+// resolve on the device even when the slot can never be reached, otherwise the
+// SPIR-V consumer rejects the whole module with
+//   unresolved external symbol #__cxa_pure_virtual in data segment
+// and every kernel in the program fails to build. ROCm supplies it from its
+// device libs; on the SPIR-V platform there is no equivalent, so define it here
+// with the same semantics: calling a pure virtual function is a hard error.
+// No printf here on purpose: it would put a device printf into every
+// translation unit, and each one costs HipVerify's pre-lowering checkpoints a
+// crashing llvm-spirv run in debug builds (about 13 s per TU).
+__device__ __attribute__((noinline)) __attribute__((weak)) void
+__cxa_pure_virtual() {
+  abort();
+}
 } // extern "C"
 #endif // defined(__clang__) && defined(__HIP__)
 

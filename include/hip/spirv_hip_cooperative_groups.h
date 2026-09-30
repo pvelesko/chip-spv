@@ -37,7 +37,12 @@ THE SOFTWARE.
 #include <hip/spirv_hip_cooperative_groups_helper.h>
 #endif
 
+#ifdef __APPLE__
+// On macOS, assert() expands to __assert_rtn which is not available in device code.
+#define __hip_assert(cond) do { if (!(cond)) __builtin_trap(); } while(0)
+#else
 #define __hip_assert assert
+#endif
 
 namespace cooperative_groups {
 
@@ -434,6 +439,12 @@ public:
   template <class T> __CG_QUALIFIER__ T shfl(T var, int srcRank) const {
     static_assert(is_valid_type<T>::value, "Neither an integer or float type.");
 
+    // Singleton coalesced group (chipStar SPIR-V fallback when the active-
+    // lane mask is unavailable): the only valid source rank is 0 and the
+    // result is the caller's own value.
+    if (size() == 1)
+      return var;
+
     srcRank = srcRank % static_cast<int>(size());
 
     int lane = (size() == __AMDGCN_WAVEFRONT_SIZE) ? srcRank
@@ -508,7 +519,12 @@ public:
  */
 
 __CG_QUALIFIER__ coalesced_group coalesced_threads() {
-  return cooperative_groups::coalesced_group(__builtin_amdgcn_read_exec());
+  // chipStar's SPIR-V backend has no way to query the active-lane mask
+  // (the AMDGCN exec register), so we conservatively model each thread
+  // as its own coalesced group of size 1. This keeps semantics correct
+  // for common patterns such as warp-aggregated atomics (atomicAggInc)
+  // at the cost of the warp-level optimisation.
+  return cooperative_groups::coalesced_group(static_cast<lane_mask>(1));
 }
 
 /**

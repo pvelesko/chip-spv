@@ -133,11 +133,7 @@ getFormatStringPieces(Value *FmtStrArg, unsigned &NumberOfFormatSpecs) {
       dyn_cast<ConstantDataSequential>(OrigFmtStr->getInitializer());
 
   if (FmtStrData == nullptr) {
-#if LLVM_VERSION_MAJOR >= 23
     assert(OrigFmtStr->getInitializer()->isNullValue());
-#else
-    assert(OrigFmtStr->getInitializer()->isZeroValue());
-#endif
     FmtStrPieces.push_back("");
     NumberOfFormatSpecs = 0;
     return FmtStrPieces;
@@ -430,9 +426,22 @@ PreservedAnalyses HipPrintfToOpenCLPrintfPass::run(Module &Mod,
   GlobalValue *Printf = Mod.getNamedValue("printf");
   GlobalValue *HipPrintf = Mod.getNamedValue(ORIG_PRINTF_FUNC_NAME);
 
-  // No printf decl in the module, no printf calls to handle.
-  // 1 use if the "printf" is only used by "_cl_printf"
-  if (Printf == nullptr || Printf->getNumUses() == 1)
+  // No printf decl in the module: no printf calls to handle.
+  if (Printf == nullptr)
+    return PreservedAnalyses::all();
+
+  // If the pass already ran on this module it created the "_cl_print_str"
+  // helper, whose body contains the only remaining printf("%c", ...) call.
+  // In that case the single printf use is already in the lowered (constant
+  // address space) form and there is nothing more to do. We must NOT use a
+  // bare "getNumUses() == 1" test here: a module with exactly one *genuine*
+  // printf call and no _cl_print_str yet (e.g. only the device-side
+  // __assert_fail printf) also has a single use, and skipping it would leave
+  // the format string in a non-constant address space. That forces the
+  // SPIR-V translator to emit SPV_EXT_relaxed_printf_string_address_space,
+  // which the consumer (e.g. IGC) then rejects at module load time.
+  if (Mod.getNamedValue(ORIG_PRINT_STRING_FUNC_NAME) != nullptr &&
+      Printf->getNumUses() == 1)
     return PreservedAnalyses::all();
   LLVM_DEBUG(dbgs() << "Found printf decl: "; Printf->dump());
 
@@ -499,7 +508,8 @@ PreservedAnalyses HipPrintfToOpenCLPrintfPass::run(Module &Mod,
                      << "  Invalid format string or missing arguments?\n");
           Value *ErrorFmt = getOrCreateStrLiteralArg(
               "Error: Invalid printf format string\n", B);
-          CallInst::Create(OpenCLPrintfF, ArrayRef(ErrorFmt), "", &OrigCall);
+          CallInst::Create(OpenCLPrintfF, ArrayRef(ErrorFmt), "", &OrigCall)
+              ->setCallingConv(llvm::CallingConv::SPIR_FUNC);
           auto *PoisonInt = PoisonValue::get(Type::getInt32Ty(Ctx));
           OrigCall.replaceAllUsesWith(PoisonInt);
           EraseList.insert(&OrigCall);
@@ -581,7 +591,8 @@ PreservedAnalyses HipPrintfToOpenCLPrintfPass::run(Module &Mod,
             if (!toAdd.empty()) {
               Args.insert(Args.begin(), getOrCreateStrLiteralArg(toAdd, B));
               toAdd.clear();
-              CallInst::Create(OpenCLPrintfF, Args, "", &OrigCall);
+              CallInst::Create(OpenCLPrintfF, Args, "", &OrigCall)
+                  ->setCallingConv(llvm::CallingConv::SPIR_FUNC);
               Args.clear();
             }
 
@@ -596,7 +607,8 @@ PreservedAnalyses HipPrintfToOpenCLPrintfPass::run(Module &Mod,
                 B.CreateAddrSpaceCast(OrigArg, GenericPtrTy, "str.generic");
 
             Args.push_back(GenericPtr);
-            CallInst::Create(getOrCreatePrintStringF(), Args, "", &OrigCall);
+            CallInst::Create(getOrCreatePrintStringF(), Args, "", &OrigCall)
+                ->setCallingConv(llvm::CallingConv::SPIR_FUNC);
             Args.clear();
             continue;
           }
@@ -612,7 +624,8 @@ PreservedAnalyses HipPrintfToOpenCLPrintfPass::run(Module &Mod,
         if (!toAdd.empty()) {
           Args.insert(Args.begin(), getOrCreateStrLiteralArg(toAdd, B));
           toAdd.clear();
-          CallInst::Create(OpenCLPrintfF, Args, "", &OrigCall);
+          CallInst::Create(OpenCLPrintfF, Args, "", &OrigCall)
+              ->setCallingConv(llvm::CallingConv::SPIR_FUNC);
           Args.clear();
         }
 
@@ -639,6 +652,7 @@ PreservedAnalyses HipPrintfToOpenCLPrintfPass::run(Module &Mod,
 
 namespace {
 
+#ifndef CHIP_COMBINED_PASS_PLUGIN
 extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
 llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "hip-printf", LLVM_VERSION_STRING,
@@ -654,4 +668,5 @@ llvmGetPassPluginInfo() {
                 });
           }};
 }
+#endif // CHIP_COMBINED_PASS_PLUGIN
 } // namespace

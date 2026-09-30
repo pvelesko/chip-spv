@@ -23,15 +23,21 @@ THE SOFTWARE.
 
 #include <hip/hiprtc.h>
 // #include "macros.hh"
+#include "chipStarConfig.hh"
 #include "CHIPBackend.hh"
 #include "Utils.hh"
 #include "logging.hh"
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <regex>
 #include <set>
+#include <vector>
 #include <chrono>
+#include <unistd.h>
 
 struct CompileOptions {
   std::vector<std::string> Options; /// All accepted user options.
@@ -112,7 +118,9 @@ static bool processOptions(chipstar::Program &Program, int NumOptions,
     if (Match(OptionIn, "-D.*") || Match(OptionIn, "--?std=[cC][+][+][0-9]*") ||
         Match(OptionIn, "-I.*") || Match(OptionIn, "-g") ||
         Match(OptionIn, "-fno-eliminate-unused-debug-types") ||
-        Match(OptionIn, "-fno-eliminate-unused-debug-symbols")) {
+        Match(OptionIn, "-fno-eliminate-unused-debug-symbols") ||
+        Match(OptionIn, "-ffast-math") ||
+        Match(OptionIn, "-munsafe-fp-atomics")) {
       logDebug("hiprtc: accept option '{}'", std::string(OptionIn));
       OptionsOut.Options.emplace_back(OptionIn);
       continue;
@@ -152,7 +160,8 @@ static std::string escapeWithSingleQuotes(const std::string &Str) {
 static std::string createCompileCommand(const CompileOptions &Options,
                                         const fs::path &WorkingDirectory,
                                         const fs::path &SourceFile,
-                                        const fs::path &OutputFile) {
+                                        const fs::path &OutputFile,
+                                        bool PreprocessOnly = false) {
 
   std::string CompileCommand;
 
@@ -202,7 +211,21 @@ static std::string createCompileCommand(const CompileOptions &Options,
   if (!Options.HasO)
     Append("-O2");
 
-  Append("-c");
+  if (PreprocessOnly) {
+    Append("-E");
+    // Preprocess-only with options for determinism:
+    //  -P suppresses line markers, which would otherwise embed absolute
+    //     temp paths and make the output non-deterministic.
+    Append("-P"); 
+    // The source lives in a per-run (random) temp dir. This maps the
+    // temp dir to "." so those expand deterministically. assert() macro
+    // expansion to __FILE__ is probably the most likely case where this mapping
+    // is needed. (Supported by Clang >= 10 / GCC >= 8, within chipStar's
+    // toolchain baseline.)
+    Append("-ffile-prefix-map=" + WorkingDirectory.string() + "=.");
+  } else {
+    Append("-c");
+  }
 
   Append(SourceFile.string());
   Append("-o");
@@ -241,6 +264,48 @@ static bool executeCommand(const fs::path &WorkingDirectory,
   return ReturnCode == 0;
 }
 
+// Runs the compiler in preprocess-only mode over the user program so the cache
+// key can reflect the *content* of #included headers in the RTC source.
+// Returns the preprocessed translation unit, or nullopt if preprocessing
+// did not succeed.
+static std::optional<std::string>
+preprocessForCacheKey(const chipstar::Program &Program,
+                      const CompileOptions &Options,
+                      const fs::path &WorkingDirectory) {
+  auto SourceFile = WorkingDirectory / "pp_input.hip";
+  auto OutputFile = WorkingDirectory / "pp_output.i";
+  auto LogFile = WorkingDirectory / "pp.log";
+
+  // Write the in-memory headers and the raw user source.
+  if (!createHeaderFiles(Program, WorkingDirectory))
+    return std::nullopt;
+  {
+    std::ofstream F(SourceFile);
+    F << Program.getSource() << "\n";
+    // Name expressions too, so macros they use are expanded into the key.
+    for (auto &Kv : Program.getNameExpressionMap())
+      F << Kv.first << ";\n";
+    if (!F.good())
+      return std::nullopt;
+  }
+
+  std::string Cmd = createCompileCommand(Options, WorkingDirectory, SourceFile,
+                                         OutputFile, /*PreprocessOnly=*/true);
+  if (!executeCommand(WorkingDirectory, Cmd, LogFile)) {
+    // The caller only reports that caching was disabled; surface the compiler's
+    // own diagnostics here so the reason (e.g. a toolchain rejecting the
+    // preprocess-only invocation) is visible instead of silently swallowed.
+    if (auto Log = readFromFile(LogFile); Log && !Log->empty())
+      logWarn("hiprtc: preprocessing for the cache key failed:\n{}", *Log);
+    else
+      logWarn("hiprtc: preprocessing for the cache key failed (no compiler "
+              "output captured).");
+    return std::nullopt;
+  }
+
+  return readFromFile(OutputFile);
+}
+
 static void getLoweredNameExpressions(chipstar::Program &Program,
                                       const fs::path &WorkingDirectory,
                                       const fs::path &LoweredNamesFile) {
@@ -260,6 +325,10 @@ static void getLoweredNameExpressions(chipstar::Program &Program,
 
 // Compiles sources stored in 'chipstar::Program'. Uses 'WorkingDirectory' for
 // temporary compilation I/O.
+//
+// 'ProcessedOptions' is produced by the caller rather than here, because
+// processOptions() also writes diagnostics to the program log and the caller
+// must do that before consulting the cache; see hiprtcCompileProgram().
 static hiprtcResult compile(chipstar::Program &Program,
                             const CompileOptions &ProcessedOptions,
                             fs::path WorkingDirectory) {
@@ -376,13 +445,85 @@ hiprtcResult hiprtcAddNameExpression(hiprtcProgram Prog,
   return HIPRTC_SUCCESS;
 }
 
-/// Compute a cache key for HIPRTC output based on source, headers, and options.
-/// The key is a hash of all inputs that affect the SPIRV output.
-static std::string computeHiprtcCacheKey(const chipstar::Program &Program,
-                                         int NumOptions,
-                                         const char *const *Options) {
+// fnv1a64 lives in Utils.hh: the module cache needs the same stable hash, and
+// two copies would be free to drift.
+
+static void appendFileStamp(std::string &Out, const fs::path &File) {
+  std::error_code EC;
+  Out += File.string() + "|" + std::to_string(fs::file_size(File, EC)) + "|" +
+         // libc++'s file_time_type counts in __int128, which to_string lacks.
+         std::to_string(static_cast<int64_t>(
+             fs::last_write_time(File, EC).time_since_epoch().count())) +
+         "\n";
+}
+
+// Size and mtime of the toolchain files hipcc compiles with.
+static std::string hipccToolchainStamp() {
+  std::string Stamp;
+  auto AppendDir = [&](const fs::path &Dir, std::string_view Prefix) {
+    std::error_code EC;
+    std::vector<fs::path> Files;
+    for (fs::directory_iterator It(Dir, EC), End; !EC && It != End;
+         It.increment(EC)) {
+      auto Name = It->path().filename().string();
+      if (Name.rfind(Prefix, 0) == 0 && It->path().extension() != ".a")
+        Files.push_back(It->path());
+    }
+    std::sort(Files.begin(), Files.end());
+    for (const auto &F : Files)
+      appendFileStamp(Stamp, F);
+  };
+  if (auto Hipcc = getHIPCCPath()) {
+    auto Root = Hipcc->parent_path().parent_path();
+    for (const auto &F :
+         {*Hipcc, Root / "share/.hipInfo", Root / "lib/libLLVMHipSpvPasses.so",
+          Root / "lib/llvm/libLLVMHipSpvPasses.so"})
+      appendFileStamp(Stamp, F);
+    AppendDir(Root / "lib/hip-device-lib", "");
+  }
+#ifdef LLVM_TOOLS_BINARY_DIR
+  for (const char *Tool :
+       {"clang", "clang++", "llvm-link", "opt", "llvm-spirv"})
+    appendFileStamp(Stamp, fs::path(LLVM_TOOLS_BINARY_DIR) / Tool);
+#endif
+#ifdef LLVM_LIBRARY_DIR
+  AppendDir(LLVM_LIBRARY_DIR, "libLLVM");
+  AppendDir(LLVM_LIBRARY_DIR, "libclang-cpp");
+#endif
+  // hipcc's environment overrides (HIPCC src/hipBin_base.h readEnvVariables).
+  auto Env = [](const char *Name) -> std::string {
+    const char *Value = std::getenv(Name);
+    return Value ? Value : "";
+  };
+  Stamp += "flags|" + Env("HIPCC_COMPILE_FLAGS_APPEND") + "\n";
+  if (auto Bin = Env("HIP_COMPILER_BIN"); !Bin.empty())
+    appendFileStamp(Stamp, Bin);
+  if (auto Dir = Env("HIP_CLANG_PATH"); !Dir.empty())
+    for (const char *Tool : {"clang", "clang++"})
+      appendFileStamp(Stamp, fs::path(Dir) / Tool);
+  if (auto Dir = Env("HIP_PATH"); !Dir.empty())
+    appendFileStamp(Stamp, fs::path(Dir) / "share/.hipInfo");
+  return Stamp;
+}
+
+/// Compute a cache key for HIPRTC output based on source, headers, options,
+/// and registered name expressions.
+/// The key is a portable, stable hash of all inputs that affect the SPIRV
+/// output AND the set of name expressions that need a lowered-name mapping.
+/// Without including name expressions, two compilations with the same
+/// source/options but a different set of registered name expressions would
+/// alias to the same cache entry, leaving some lowered-name lookups unmapped
+/// on cache hit.
+static std::string
+computeHiprtcCacheKey(const chipstar::Program &Program, int NumOptions,
+                      const char *const *Options,
+                      const std::optional<std::string> &PreprocessedSource =
+                          std::nullopt) {
   std::string combined;
-  combined += Program.getSource();
+  // When available, hash the preprocessed translation unit instead of the raw
+  // source: it embeds the content of every #included header (including ones
+  // resolved from -I filesystem paths), so header edits invalidate the cache.
+  combined += PreprocessedSource ? *PreprocessedSource : Program.getSource();
   combined += "\n---headers---\n";
   // std::map is sorted by key, so iteration order is deterministic
   for (auto &[name, content] : Program.getHeaders()) {
@@ -394,37 +535,137 @@ static std::string computeHiprtcCacheKey(const chipstar::Program &Program,
       combined += Options[i];
     combined += "\n";
   }
-  std::hash<std::string> hasher;
-  return std::to_string(hasher(combined));
+  combined += "\n---name-expressions---\n";
+  // Map values are empty at hash time (filled in only after compilation), so
+  // only keys (the expressions) contribute. std::map iteration is sorted.
+  for (auto &[expr, lowered] : Program.getNameExpressionMap()) {
+    combined += expr + "\n";
+  }
+
+  // Compiler identity. An LLVM/Clang or chipStar upgrade changes the produced
+  // SPIR-V (frontend codegen, optimizations); without this, a warm cache would
+  // silently serve SPIR-V compiled by the old toolchain after an upgrade.
+  combined += "\n---compiler---\n";
+#ifdef CHIP_LLVM_VERSION_STRING
+  combined += CHIP_LLVM_VERSION_STRING;
+#endif
+  combined += "/";
+#ifdef CHIPSTAR_VERSION
+  combined += CHIPSTAR_VERSION;
+#endif
+  combined += "\n";
+  combined += hipccToolchainStamp();
+
+  return std::to_string(fnv1a64(combined));
+}
+
+// Cache file format (binary, little-endian):
+//   magic[4]      = 'C','H','C','1'
+//   spirv_size    = uint32_t
+//   spirv_bytes   = spirv_size bytes
+//   name_count    = uint32_t
+//   for each entry:
+//     expr_len    = uint32_t
+//     expr_bytes  = expr_len bytes (UTF-8)
+//     lowered_len = uint32_t
+//     lowered_bytes = lowered_len bytes (UTF-8)
+//
+// 'CHC1' marks format v1. A future schema change should bump to 'CHC2' etc.
+// loadHiprtcCache rejects any file lacking the magic — old (pre-fix) caches
+// are auto-evicted on first use.
+static constexpr char kCacheMagic[4] = {'C', 'H', 'C', '1'};
+
+static void writeU32LE(std::ostream &out, uint32_t v) {
+  char b[4];
+  b[0] = (char)(v & 0xff);
+  b[1] = (char)((v >> 8) & 0xff);
+  b[2] = (char)((v >> 16) & 0xff);
+  b[3] = (char)((v >> 24) & 0xff);
+  out.write(b, 4);
+}
+
+static bool readU32LE(std::istream &in, uint32_t &v) {
+  unsigned char b[4];
+  if (!in.read((char *)b, 4))
+    return false;
+  v = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) |
+      ((uint32_t)b[3] << 24);
+  return true;
 }
 
 /// Try to load a cached HIPRTC compilation result.
-/// Returns true and populates Program.Code_ if a cache hit is found.
+/// Returns true and populates Program.Code_ and the name-expression map if a
+/// cache hit is found. Returns false on miss, missing magic (old format), or
+/// any read/parse error (treated as cache miss).
 static bool loadHiprtcCache(chipstar::Program &Program,
-                             const std::string &cacheKey) {
+                            const std::string &cacheKey) {
   if (!ChipEnvVars.getModuleCacheDir().has_value())
     return false;
-  auto cacheFile = fs::path(ChipEnvVars.getModuleCacheDir().value())
-                   / "hiprtc" / cacheKey;
-  std::ifstream in(cacheFile, std::ios::binary | std::ios::ate);
+  auto cacheFile =
+      fs::path(ChipEnvVars.getModuleCacheDir().value()) / "hiprtc" / cacheKey;
+  std::ifstream in(cacheFile, std::ios::binary);
   if (!in)
     return false;
-  auto size = in.tellg();
-  if (size <= 0)
+
+  char magic[sizeof(kCacheMagic)];
+  if (!in.read(magic, sizeof(magic)) ||
+      std::memcmp(magic, kCacheMagic, sizeof(kCacheMagic)) != 0) {
+    logDebug("hiprtc: cache file '{}' has missing/old magic; ignoring",
+             cacheFile.string());
     return false;
-  in.seekg(0);
-  std::string content(size, '\0');
-  in.read(content.data(), size);
-  if (!in)
+  }
+
+  uint32_t spirvSize = 0;
+  if (!readU32LE(in, spirvSize))
     return false;
-  Program.addCode(content);
-  logInfo("hiprtc: Loaded SPIRV from cache (key={})", cacheKey);
+  std::string spirv(spirvSize, '\0');
+  if (spirvSize && !in.read(spirv.data(), spirvSize))
+    return false;
+
+  uint32_t nameCount = 0;
+  if (!readU32LE(in, nameCount))
+    return false;
+  // Stage parsed names locally; only commit to Program after a fully
+  // successful read so a partial/corrupt cache file doesn't leave half-set
+  // state on the program object.
+  std::vector<std::pair<std::string, std::string>> names;
+  names.reserve(nameCount);
+  for (uint32_t i = 0; i < nameCount; i++) {
+    uint32_t exprLen = 0;
+    if (!readU32LE(in, exprLen))
+      return false;
+    std::string expr(exprLen, '\0');
+    if (exprLen && !in.read(expr.data(), exprLen))
+      return false;
+    uint32_t loweredLen = 0;
+    if (!readU32LE(in, loweredLen))
+      return false;
+    std::string lowered(loweredLen, '\0');
+    if (loweredLen && !in.read(lowered.data(), loweredLen))
+      return false;
+    names.emplace_back(std::move(expr), std::move(lowered));
+  }
+
+  Program.addCode(spirv);
+  // Populate the name-expression map. The user-registered expressions are
+  // already present (with empty values) from prior hiprtcAddNameExpression()
+  // calls; we fill in the lowered names from the cache.
+  auto &NameExprMap = Program.getNameExpressionMap();
+  for (auto &[expr, lowered] : names) {
+    auto It = NameExprMap.find(expr);
+    if (It != NameExprMap.end())
+      It->second = lowered;
+  }
+  logInfo("hiprtc: Loaded SPIRV from cache (key={}, names={})", cacheKey,
+          nameCount);
   return true;
 }
 
 /// Save HIPRTC compilation result to cache.
+/// Writes both the SPIR-V binary and the name-expression -> lowered-name
+/// table so subsequent cache hits can satisfy hiprtcGetLoweredName().
 static void saveHiprtcCache(const chipstar::Program &Program,
-                             const std::string &cacheKey) {
+                            const std::string &cacheKey) {
   if (!ChipEnvVars.getModuleCacheDir().has_value())
     return;
   auto cacheDir = fs::path(ChipEnvVars.getModuleCacheDir().value()) / "hiprtc";
@@ -435,14 +676,52 @@ static void saveHiprtcCache(const chipstar::Program &Program,
     return;
   }
   auto cacheFile = cacheDir / cacheKey;
-  std::ofstream out(cacheFile, std::ios::binary);
-  if (!out) {
-    logDebug("hiprtc: Could not open cache file for writing: {}", cacheFile.string());
+  // Write to a per-process temp file then atomically rename. The PID suffix
+  // prevents two concurrent writers from interleaving into the same temp
+  // file; the rename step then races safely (both produce the same content
+  // since the cache key is content-derived).
+  auto tmpFile = cacheFile;
+  tmpFile += "." + std::to_string(getpid()) + ".tmp";
+  {
+    std::ofstream out(tmpFile, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      logDebug("hiprtc: Could not open cache temp file for writing: {}",
+               tmpFile.string());
+      return;
+    }
+    out.write(kCacheMagic, sizeof(kCacheMagic));
+    const auto &code = Program.getCode();
+    if (code.size() > UINT32_MAX) {
+      logDebug("hiprtc: SPIR-V too large for cache file format ({} bytes)",
+               code.size());
+      fs::remove(tmpFile, ec);
+      return;
+    }
+    writeU32LE(out, (uint32_t)code.size());
+    out.write(code.data(), code.size());
+    const auto &NameExprMap = Program.getNameExpressionMap();
+    writeU32LE(out, (uint32_t)NameExprMap.size());
+    for (auto &[expr, lowered] : NameExprMap) {
+      writeU32LE(out, (uint32_t)expr.size());
+      out.write(expr.data(), expr.size());
+      writeU32LE(out, (uint32_t)lowered.size());
+      out.write(lowered.data(), lowered.size());
+    }
+    if (!out) {
+      logDebug("hiprtc: Error while writing cache temp file: {}",
+               tmpFile.string());
+      fs::remove(tmpFile, ec);
+      return;
+    }
+  }
+  fs::rename(tmpFile, cacheFile, ec);
+  if (ec) {
+    logDebug("hiprtc: Could not rename cache temp file: {}", ec.message());
+    fs::remove(tmpFile, ec);
     return;
   }
-  const auto &code = Program.getCode();
-  out.write(code.data(), code.size());
-  logInfo("hiprtc: Saved SPIRV to cache (key={})", cacheKey);
+  logInfo("hiprtc: Saved SPIRV to cache (key={}, names={})", cacheKey,
+          Program.getNameExpressionMap().size());
 }
 
 hiprtcResult hiprtcCompileProgram(hiprtcProgram Prog, int NumOptions,
@@ -464,34 +743,72 @@ hiprtcResult hiprtcCompileProgram(hiprtcProgram Prog, int NumOptions,
   try {
     auto &Program = *(chipstar::Program *)Prog;
 
-    // Process options up front so "warning: ignored option ..." entries
-    // are appended to the program log regardless of cache hit/miss
-    // (TestHiprtcOptions exercises this).
+    std::optional<fs::path> TmpDir;
+    std::optional<std::string> Preprocessed;
+    // A bare HIP_COMPILER_BIN resolves through PATH, which the key cannot stamp.
+    const char *CompilerBin = std::getenv("HIP_COMPILER_BIN");
+    bool CacheUsable = !CompilerBin || !*CompilerBin ||
+                       fs::path(CompilerBin).has_parent_path();
+    if (!CacheUsable)
+      logWarn("hiprtc: HIP_COMPILER_BIN has no directory; compiling without "
+              "caching.");
+
+    // Process the user options exactly once, before the cache is consulted.
+    //
+    // processOptions() does more than build a command line: it records
+    // "warning: ignored option" entries in the program log, which the client
+    // reads back with hiprtcGetProgramLog(). That log is part of the program's
+    // observable state and must not depend on whether the SPIR-V came from
+    // clang or from the cache, so it cannot be produced on the miss path only.
+    //
+    // Doing it here also keeps it from happening twice: the preprocess pass
+    // below and compile() both need the processed options, and when each
+    // derived its own copy an include-bearing source with an ignored option
+    // logged the same warning two times.
     CompileOptions ProcessedOptions;
     if (processOptions(Program, NumOptions, Options, ProcessedOptions))
       return HIPRTC_ERROR_INVALID_INPUT;
 
-    // Check HIPRTC output cache before invoking clang.
-    auto cacheKey = computeHiprtcCacheKey(Program, NumOptions, Options);
-    auto t0 = std::chrono::steady_clock::now();
-    if (loadHiprtcCache(Program, cacheKey)) {
-      auto t1 = std::chrono::steady_clock::now();
-      double elapsed = std::chrono::duration<double>(t1 - t0).count();
-      logInfo("hiprtc: Cache hit — skipped clang compilation ({:.3f}s saved)", elapsed);
-      return HIPRTC_SUCCESS;
-    }
-
-    // Create temporary directory for compilation I/O.
-    auto TmpDir = createTemporaryDirectory();
+    // Always preprocess: even an include-free source force-includes headers.
+    TmpDir = createTemporaryDirectory();
     if (!TmpDir) {
       logError(
           "hiprtc: Failed to create a temporary directory for compilation.");
       return HIPRTC_ERROR_COMPILATION;
     }
+    Preprocessed = preprocessForCacheKey(Program, ProcessedOptions, *TmpDir);
+    if (!Preprocessed) {
+      // We could not build a key that reflects #include content. Keying on
+      // the raw source instead would ignore header edits and could serve
+      // stale SPIR-V — the exact bug #1335 is about — so disable the cache
+      // for this compilation entirely: no lookup, and no new entry written.
+      logWarn("hiprtc: could not preprocess source for the cache key; "
+              "compiling without caching for this program.");
+      CacheUsable = false;
+    }
+
+    // Check the HIPRTC output cache before invoking clang, unless caching was
+    // disabled above because we have no trustworthy key.
+    std::string cacheKey;
+    if (CacheUsable) {
+      cacheKey = computeHiprtcCacheKey(Program, NumOptions, Options,
+                                       Preprocessed);
+      auto t0 = std::chrono::steady_clock::now();
+      if (loadHiprtcCache(Program, cacheKey)) {
+        auto t1 = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(t1 - t0).count();
+        logInfo("hiprtc: Cache hit — skipped clang compilation ({:.3f}s saved)",
+                elapsed);
+        if (!ChipEnvVars.getSaveTemps()) {
+          std::error_code IgnoreErrors;
+          fs::remove_all(*TmpDir, IgnoreErrors);
+        }
+        return HIPRTC_SUCCESS;
+      }
+    }
 
     logDebug("hiprtc: Temp directory: '{}'", TmpDir->string());
     hiprtcResult Result = compile(Program, ProcessedOptions, *TmpDir);
-
     if (!ChipEnvVars.getSaveTemps()) {
       assert(!TmpDir->empty() && *TmpDir != TmpDir->root_path() &&
              "Attempted to delete a root directory!");
@@ -501,8 +818,9 @@ hiprtcResult hiprtcCompileProgram(hiprtcProgram Prog, int NumOptions,
       fs::remove_all(*TmpDir, IgnoreErrors);
     }
 
-    // Cache the compiled SPIRV for future runs.
-    if (Result == HIPRTC_SUCCESS)
+    // Cache the compiled SPIRV for future runs, unless caching was disabled
+    // because we could not compute a reliable key for this program.
+    if (Result == HIPRTC_SUCCESS && CacheUsable)
       saveHiprtcCache(Program, cacheKey);
 
     return Result;
@@ -587,6 +905,17 @@ hiprtcResult hiprtcGetLoweredName(hiprtcProgram WrappedProg,
   const auto &NameExprMap = Prog.getNameExpressionMap();
   auto It = NameExprMap.find(NameExpression);
   if (It != NameExprMap.end()) {
+    if (It->second.empty()) {
+      // Defensive: a populated map entry should never have an empty lowered
+      // name. If it does, the compilation pipeline (or cache load) failed
+      // to record the mapping. Returning success with an empty string makes
+      // the caller pass "" to hipModuleGetFunction, which fails downstream
+      // with the misleading error "Failed to find kernel via kernel name: ".
+      logError("hiprtc: lowered name for '{}' is empty; refusing to return "
+               "empty string as success",
+               NameExpression);
+      return HIPRTC_ERROR_INTERNAL_ERROR;
+    }
     *LoweredName = It->second.data();
     return HIPRTC_SUCCESS;
   }

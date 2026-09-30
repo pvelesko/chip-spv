@@ -21,9 +21,12 @@
  */
 
 #include "CHIPBackendLevel0.hh"
+#include "ModuleCache.hh"
 #include "Utils.hh"
 
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <fstream>
 
@@ -32,6 +35,48 @@
 
 // Auto-generated header that lives in <build-dir>/bitcode.
 #include "rtdevlib-modules.h"
+
+using zexDriverImportExternalPointer_t =
+    ze_result_t (*)(ze_driver_handle_t, void *, size_t);
+using zexDriverReleaseImportedPointer_t =
+    ze_result_t (*)(ze_driver_handle_t, void *);
+
+void CHIPContextLevel0::importHostMemory(void *HostPtr, size_t SizeBytes) {
+  // --- resolve import/release ---
+  void *fnPtr = nullptr;
+  zeDriverGetExtensionFunctionAddress(ZeDriver, "zexDriverImportExternalPointer", &fnPtr);
+  auto importFn = reinterpret_cast<zexDriverImportExternalPointer_t>(fnPtr);
+
+  // if importFn is null, this is not available. we warn and continue
+  if (importFn) {
+    // if this fails, it means the extension was available but it is not working. so we fail.
+    if (importFn(ZeDriver, HostPtr, SizeBytes) != ZE_RESULT_SUCCESS) {
+      CHIPERR_LOG_AND_THROW("zexDriverImportExternalPointer failed", hipErrorUnknown); 
+    }
+  }
+  else {
+    logWarn("zexDriverImportExternalPointer not available in this driver — skipping host memory import");
+  }
+}
+
+void CHIPContextLevel0::releaseHostMemory(void *HostPtr) {
+   // --- resolve import/release ---
+  void *fnPtr = nullptr;
+  zeDriverGetExtensionFunctionAddress(ZeDriver, "zexDriverReleaseImportedPointer", &fnPtr);
+  auto releaseFn = reinterpret_cast<zexDriverReleaseImportedPointer_t>(fnPtr);
+
+  // if releaseFn is null, this is not available. we warn and continue       
+  if (releaseFn) {
+    // if this fails, it means the extension was available but it is not working. so we fail.
+    if (releaseFn(ZeDriver, HostPtr) != ZE_RESULT_SUCCESS) {
+      CHIPERR_LOG_AND_THROW("zexDriverReleaseExternalPointer failed", hipErrorUnknown); 
+    }
+  }
+  else {
+    logWarn("zexDriverReleaseExternalPointer not available in this driver — skipping host memory release");
+  }
+  
+}
 
 /// Converts driver version queried from zeDriverGetProperties to string.
 static std::string driverVersionToString(uint32_t DriverVersion) noexcept {
@@ -226,17 +271,110 @@ createSampler(CHIPDeviceLevel0 *ChipDev, const hipResourceDesc *PResDesc,
 void CHIPEventLevel0::reset() {
   logTrace("CHIPEventLevel0::reset() {} msg: {} handle: {}", (void *)this, Msg,
            (void *)Event_);
+
+  // If the event is still in flight (RECORDING), block until it completes
+  // before resetting the underlying L0 event. Otherwise zeEventHostReset
+  // races with the kernel/copy that's still signalling this event, the
+  // event's dependents see "ready" before the dependency actually
+  // completes, and downstream kernels read stale memory — surfaced by
+  // LAMMPS unit tests as NaN forces/stresses on every PairStyle.gpu case.
+  // (~CHIPEventLevel0 already does the same for destruction; mirror that
+  // for reuse.)
+  if (EventStatus_ == EVENT_STATUS_RECORDING) {
+    logTrace("CHIPEventLevel0::reset(): waiting for in-flight recording");
+    wait();
+  }
+
   {
     LOCK(DependsOnListMtx);
     DependsOnList.clear();
   }
+
   zeStatus = zeEventHostReset(Event_);
   CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeEventHostReset);
   TrackCalled_ = false;
   UserEvent_ = false;
-  if (EventStatus_ == EVENT_STATUS_RECORDING)
-    logWarn("CHIPEventLevel0::reset() called while event is recording");
 
+  EventStatus_ = EVENT_STATUS_INIT;
+  Timestamp_ = 0;
+  HostTimestamp_ = 0;
+  DeviceTimestamp_ = 0;
+  SignalEnqueued_ = false;
+  markDeleted(false);
+}
+
+void CHIPEventLevel0::reRecordReset() {
+  logTrace("CHIPEventLevel0::reRecordReset() {} msg: {} handle: {}",
+           (void *)this, Msg, (void *)Event_);
+  {
+    LOCK(DependsOnListMtx);
+    DependsOnList.clear();
+  }
+
+  // Reap retired slots whose signal has already completed: once signaled, the
+  // barrier that referenced the handle is done and nothing else refers to it
+  // (nobody waits on this event's handle directly), so it is safe to destroy.
+  // This bounds RetiredSlots_ to the in-flight window across many re-records.
+  for (auto It = RetiredSlots_.begin(); It != RetiredSlots_.end();) {
+    if (zeEventQueryStatus(It->second) == ZE_RESULT_SUCCESS) {
+      zeEventDestroy(It->second);
+      if (It->first)
+        zeEventPoolDestroy(It->first);
+      It = RetiredSlots_.erase(It);
+    } else {
+      ++It;
+    }
+  }
+
+  // On a re-record, do NOT zeEventHostReset the shared handle: it may still be
+  // referenced by an in-flight barrier from a circular stream-wait dependency,
+  // and host-resetting an in-use L0 event is UB (SEGVs in libze_intel_gpu).
+  // Instead retire the current handle (kept alive above until its signal fires)
+  // and allocate a fresh handle for the new recording. A never-recorded handle
+  // (fresh from the constructor) is reused as-is.
+  //
+  // Only fresh-slot for user events, which own a dedicated single-slot pool
+  // (retiring/destroying that pool is safe). Pooled events share a pool owned by
+  // LZEventPool, so fall back to the in-place reset there (safe: pooled events
+  // are only recycled once RECORDED with no remaining dependents).
+  if (EventStatus_ != EVENT_STATUS_INIT) {
+    if (isUserEvent() && Event_) {
+      // Build the fresh pool+event into locals FIRST; only commit the swap
+      // (retire the old pair + adopt the new) once both allocations succeed.
+      // Otherwise a throw from zeEventPoolCreate/zeEventCreate would leave
+      // Event_/EventPoolHandle_ still aliasing a handle already pushed into
+      // RetiredSlots_, double-freeing it at destruction.
+      CHIPContextLevel0 *ZeCtx = (CHIPContextLevel0 *)ChipContext_;
+      ze_event_pool_desc_t EventPoolDesc = {ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+                                            nullptr,
+                                            ZE_EVENT_POOL_FLAG_HOST_VISIBLE, 1};
+      ze_event_pool_handle_t FreshPool = nullptr;
+      zeStatus =
+          zeEventPoolCreate(ZeCtx->get(), &EventPoolDesc, 0, nullptr, &FreshPool);
+      CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeEventPoolCreate);
+      ze_event_desc_t EventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC, nullptr, 0,
+                                   ZE_EVENT_SCOPE_FLAG_HOST,
+                                   ZE_EVENT_SCOPE_FLAG_HOST};
+      ze_event_handle_t FreshEvent = nullptr;
+      zeStatus = zeEventCreate(FreshPool, &EventDesc, &FreshEvent);
+      if (zeStatus != ZE_RESULT_SUCCESS)
+        zeEventPoolDestroy(FreshPool); // don't leak the pool if event fails
+      CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeEventCreate);
+
+      // Both allocations succeeded: retire the old handle and adopt the new.
+      RetiredSlots_.emplace_back(EventPoolHandle_, Event_);
+      EventPoolHandle_ = FreshPool;
+      Event_ = FreshEvent;
+      EventPoolIndex = 0;
+    } else {
+      if (EventStatus_ == EVENT_STATUS_RECORDING)
+        wait();
+      zeStatus = zeEventHostReset(Event_);
+      CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeEventHostReset);
+    }
+  }
+
+  TrackCalled_ = false;
   EventStatus_ = EVENT_STATUS_INIT;
   Timestamp_ = 0;
   HostTimestamp_ = 0;
@@ -258,6 +396,19 @@ CHIPEventLevel0::~CHIPEventLevel0() {
     logTrace("~CHIPEventLevel0({}) waiting for event to finish", (void *)this);
     wait();
   }
+
+  // Free handles retired by reRecordReset() that never got reaped (their
+  // signal may not have fired). Synchronize first so we don't destroy a handle
+  // still referenced by an in-flight barrier. Use the same bounded timeout as
+  // wait() rather than an infinite wait so a stuck queue can't hang teardown.
+  uint64_t RetireTimeout = ChipEnvVars.getL0EventTimeout() * 1e9;
+  for (auto &Slot : RetiredSlots_) {
+    zeEventHostSynchronize(Slot.second, RetireTimeout);
+    zeEventDestroy(Slot.second);
+    if (Slot.first)
+      zeEventPoolDestroy(Slot.first);
+  }
+  RetiredSlots_.clear();
 
   zeStatus = zeEventDestroy(Event_);
   assert(zeStatus == ZE_RESULT_SUCCESS);
@@ -305,11 +456,13 @@ CHIPEventLevel0::CHIPEventLevel0(CHIPContextLevel0 *ChipCtx,
       EventPoolHandle_(nullptr), EventPoolIndex(0) {
   CHIPContextLevel0 *ZeCtx = (CHIPContextLevel0 *)ChipContext_;
 
+  // Do not set ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP: chipStar computes
+  // hipEventElapsedTime from an explicit global-timestamp write (see
+  // recordEvent()), never calls zeEventQueryKernelTimestamp, so the kernel
+  // timestamps this flag produces were never read. The flag only made
+  // zeEventQueryStatus expensive (~0.4ms/call), inflating checkEvents(). Precise
+  // per-kernel device timing remains available out-of-band via iprof/unitrace.
   unsigned int PoolFlags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
-#ifdef CHIP_L0_KERNEL_TIMESTAMPS
-  if (!Flags.isDisableTiming())
-    PoolFlags = PoolFlags | ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
-#endif
 
   ze_event_pool_desc_t EventPoolDesc = {
       ZE_STRUCTURE_TYPE_EVENT_POOL_DESC, // stype
@@ -345,12 +498,16 @@ CHIPEventLevel0::CHIPEventLevel0(CHIPContextLevel0 *ChipCtx,
       EventPoolHandle_(nullptr), EventPoolIndex(0) {}
 
 void CHIPQueueLevel0::recordEvent(chipstar::Event *ChipEvent) {
-  IsEmptyQueue_.store(false);
   auto ChipEventLz = static_cast<CHIPEventLevel0 *>(ChipEvent);
 
   {
     LOCK(::Backend->EventsMtx);
-    ChipEventLz->reset();
+    // Re-record with a fresh event slot (issue #1258): re-recording an event
+    // that is still referenced by an in-flight barrier (e.g. a circular
+    // stream-wait dependency) must NOT host-reset the shared handle in place —
+    // that SEGVs the L0 driver. reRecordReset retires the old handle and
+    // allocates a fresh one instead.
+    ChipEventLz->reRecordReset();
   }
 
   auto TimestampWriteCompleteLz = std::static_pointer_cast<CHIPEventLevel0>(
@@ -373,7 +530,8 @@ void CHIPQueueLevel0::recordEvent(chipstar::Event *ChipEvent) {
                                          &ChipEventLz->getDeviceTimestamp());
   CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeDeviceGetGlobalTimestamps);
 
-  LOCK(CommandListMtx);
+  LOCK(*CmdListMtx_);
+  markBusy();
   auto CommandList = this->getCmdListImm();
   auto CommandListCopy = this->getCmdListImmCopy();
 
@@ -640,9 +798,9 @@ CHIPCallbackDataLevel0::CHIPCallbackDataLevel0(hipStreamCallback_t CallbackF,
   }
 
   // Lock before using immediate command list
-  LOCK(ChipQueueLz->CommandListMtx);
+  LOCK(*ChipQueueLz->CmdListMtx_);
+  ChipQueueLz->markBusy();
   ze_command_list_handle_t CommandList = ChipQueueLz->getCmdListImm();
-  ChipQueueLz->IsEmptyQueue_.store(false);
 
   // Add a barrier so that it signals
   zeStatus = zeCommandListAppendBarrier(
@@ -748,7 +906,10 @@ void CHIPEventMonitorLevel0::monitor() {
   while (true) {
     usleep(200);
     checkCallbacks();
-    // checkEvents();
+    // checkEvents() is handled in getEventFromPool() to avoid L0 driver
+    // lock contention: zeEventQueryStatus can hold an L0-internal lock for
+    // hundreds of milliseconds, which blocks zeCommandQueueSynchronize on
+    // the main thread when called from this 200µs hot-loop.
     checkCmdLists();
     checkExit();
   } // endless loop
@@ -781,6 +942,33 @@ CHIPKernelLevel0::CHIPKernelLevel0(ze_kernel_handle_t ZeKernel,
       Device->getAttr(hipDeviceAttributeMaxSharedMemoryPerBlock) -
       StaticLocalSize_;
   MaxWorkGroupSize_ = Device->getAttr(hipDeviceAttributeMaxThreadsPerBlock);
+}
+
+CHIPKernelLevel0 *CHIPKernelLevel0::clone() {
+  // Create an independent ze_kernel_handle_t for the same function so the
+  // copy has its own argument bindings (issue #782). Level Zero has no
+  // zeKernelClone, so we create a fresh handle from the parent module using
+  // the same kernel name and residency flag as the original creation path.
+  // The original handle is left untouched.
+  ze_kernel_handle_t ClonedHandle = nullptr;
+  // Keep the name in a local so pKernelName does not dangle: getName() returns
+  // a temporary std::string whose buffer would be freed before zeKernelCreate.
+  std::string KernelName = getName();
+  ze_kernel_desc_t KernelDesc = {ZE_STRUCTURE_TYPE_KERNEL_DESC, nullptr,
+                                 0, // flags
+                                 KernelName.c_str()};
+  if (!Device->hasOnDemandPaging())
+    KernelDesc.flags |= ZE_KERNEL_FLAG_FORCE_RESIDENCY;
+  zeStatus = zeKernelCreate(Module->get(), &KernelDesc, &ClonedHandle);
+  CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeKernelCreate);
+  auto *Cloned = new CHIPKernelLevel0(ClonedHandle, Device, getName(),
+                                      getFuncInfo(), Module);
+  // Preserve the host/device function pointer associations so that the clone
+  // still resolves to the same HIP kernel (needed by graph-node execution,
+  // e.g. prepareDeviceVariables()).
+  Cloned->setHostPtr(getHostPtr());
+  Cloned->setDevPtr(getDevPtr());
+  return Cloned;
 }
 // End CHIPKernelLevelZero
 
@@ -831,17 +1019,18 @@ CHIPQueueLevel0::~CHIPQueueLevel0() {
     PatternBuffer3D_ = nullptr;
   }
 
-  bool isSameCmdList = ZeCmdListImm_ == ZeCmdListImmCopy_;
-
-  zeStatus = zeCommandListDestroy(ZeCmdListImm_);
-  CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeCommandListDestroy);
-  ZeCmdListImm_ = nullptr;
-
-  if (!isSameCmdList) {
-    zeStatus = zeCommandListDestroy(ZeCmdListImmCopy_);
-    CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeCommandListDestroy);
-    ZeCmdListImmCopy_ = nullptr;
+  // A marker still pending on the shared command list must outlive the queue.
+  if (QueryEvent_ &&
+      (!QueryArmed_ || zeEventQueryStatus(QueryEvent_) == ZE_RESULT_SUCCESS)) {
+    zeEventDestroy(QueryEvent_);
+    zeEventPoolDestroy(QueryEventPool_);
   }
+
+  // The immediate CL is shared across all streams that map to the same hardware
+  // queue. It is owned by CHIPDeviceLevel0::SharedImmCLs_ and must not be
+  // destroyed per-stream.
+  ZeCmdListImm_ = nullptr;
+  ZeCmdListImmCopy_ = nullptr;
 
   // From destructor post query only when queue is owned by CHIP
   // Non-owned command queues can be destroyed independently by the owner
@@ -894,7 +1083,6 @@ CHIPQueueLevel0::createMarkerEventWithLock(CHIPContextLevel0* Ctx, const std::st
 std::pair<std::vector<ze_event_handle_t>, chipstar::LockGuardVector>
 CHIPQueueLevel0::addDependenciesQueueSync(
     std::shared_ptr<chipstar::Event> TargetEvent) {
-  IsEmptyQueue_.store(false);
   auto Ctx = static_cast<CHIPContextLevel0 *>(ChipCtxLz_);
   auto BackendLz = static_cast<CHIPBackendLevel0 *>(Backend);
 
@@ -906,9 +1094,9 @@ CHIPQueueLevel0::addDependenciesQueueSync(
     
     // Signal this marker in the other queue's command list
     auto OtherQueue = static_cast<CHIPQueueLevel0 *>(q);
-    LOCK(OtherQueue->CommandListMtx);
-    auto OtherCommandList = OtherQueue->getCmdListImm();
+    LOCK(*OtherQueue->CmdListMtx_);
     OtherQueue->IsEmptyQueue_.store(false);
+    auto OtherCommandList = OtherQueue->getCmdListImm();
 
     zeStatus = zeCommandListAppendSignalEvent(OtherCommandList, MarkerEventLz->peek());
     CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeCommandListAppendSignalEvent);
@@ -1004,23 +1192,37 @@ void CHIPContextLevel0::checkEvents() {
 }
 
 std::shared_ptr<CHIPEventLevel0> CHIPContextLevel0::getEventFromPool() {
-  // Perform maintenance tasks that were previously done by EventMonitor thread
-  checkEvents();
-  
-  // go through all pools and try to get an allocated event
-  LOCK(ContextMtx); // Context::EventPool
-  EventsRequested_++;
-  std::shared_ptr<CHIPEventLevel0> Event;
+  // Fast path: try to get an event without calling checkEvents().
+  // checkEvents() calls zeEventQueryStatus on every tracked event -- an O(N)
+  // scan. Calling it on every getEventFromPool() invocation would add O(N)
+  // overhead per event acquisition, even when the pool has free events.
+  {
+    LOCK(ContextMtx); // Context::EventPool
+    EventsRequested_++;
+    for (auto EventPool : EventPools_) {
+      auto Event = EventPool->getEvent();
+      if (Event) {
+        EventsReused_++;
+        return Event;
+      }
+    }
+  }
 
+  // Pool is exhausted. Recycle completed events (may call zeEventQueryStatus)
+  // before allocating a new pool slot.
+  checkEvents();
+
+  LOCK(ContextMtx); // Context::EventPool (re-acquire after checkEvents)
+  std::shared_ptr<CHIPEventLevel0> Event;
   for (auto EventPool : EventPools_) {
-    auto Event = EventPool->getEvent();
+    Event = EventPool->getEvent();
     if (Event) {
       EventsReused_++;
       return Event;
     }
   }
 
-  // no events available, create new pool, get event from there and return
+  // No events after recycling: create new pool
   logTrace("No available events found in {} event pools. Creating a new "
            "event pool",
            EventPools_.size());
@@ -1103,7 +1305,7 @@ CHIPQueueLevel0::CHIPQueueLevel0(CHIPDeviceLevel0 *ChipDev,
   CommandListDescCopy_ = ChipDev->getCommandListCopyDesc();
 
   SharedBuf_ =
-      ChipCtxLz_->allocateImpl(32, 8, hipMemoryType::hipMemoryTypeUnified);
+      ChipCtxLz_->allocateImpl(32, 8, hipMemoryType::hipMemoryTypeHost);
 
   // Initialize the uint64_t part as 0
   *(uint64_t *)this->SharedBuf_ = 0;
@@ -1133,7 +1335,7 @@ CHIPQueueLevel0::CHIPQueueLevel0(CHIPDeviceLevel0 *ChipDev,
   CommandListDesc_ = ChipDev->getCommandListComputeDesc();
 
   SharedBuf_ =
-      ChipCtxLz_->allocateImpl(32, 8, hipMemoryType::hipMemoryTypeUnified);
+      ChipCtxLz_->allocateImpl(32, 8, hipMemoryType::hipMemoryTypeHost);
 
   // Initialize the uint64_t part as 0
   *(uint64_t *)this->SharedBuf_ = 0;
@@ -1162,9 +1364,15 @@ void CHIPQueueLevel0::ensurePatternBufferAllocated() {
 }
 
 void CHIPQueueLevel0::initializeCmdListImm() {
-  zeStatus = zeCommandListCreateImmediate(ZeCtx_, ZeDev_, &QueueDescriptor_,
-                                          &ZeCmdListImm_);
-  CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeCommandListCreateImmediate);
+  // Reuse a shared immediate CL for this hardware queue (ordinal, index).
+  // On devices with numQueues==1 (e.g. Intel Arc B570), all HIP streams map to
+  // the same hardware queue and share one CL handle. This avoids the ~0.45ms
+  // per-call overhead of zeCommandListAppendLaunchKernel when switching between
+  // different immediate CL handles on Intel Arc (driver dispatches each CL to
+  // the hardware command processor independently, whereas consecutive appends
+  // to the same CL handle are batched and take ~0.013ms each).
+  ZeCmdListImm_ = ChipDevLz_->getOrCreateSharedImmCL(ZeCtx_, QueueDescriptor_,
+                                                      CmdListMtx_);
 
   // TODO: Using separate copy command lists requires fixing inter-queue
   // synchronization. For now, always reuse the compute command list.
@@ -1294,9 +1502,25 @@ ze_command_queue_desc_t CHIPDeviceLevel0::getNextCopyQueueDesc(int Priority) {
   return CommandQueueCopyDesc;
 }
 
+ze_command_list_handle_t CHIPDeviceLevel0::getOrCreateSharedImmCL(
+    ze_context_handle_t ZeCtx, const ze_command_queue_desc_t &QDesc,
+    std::shared_ptr<std::mutex> &OutMtx) {
+  // Key encodes both ordinal and index so streams on different hardware queues
+  // (multi-queue devices) each get their own shared CL.
+  uint64_t Key = ((uint64_t)QDesc.ordinal << 32) | (uint64_t)QDesc.index;
+  LOCK(SharedImmCLsMapMtx_);
+  auto &Entry = SharedImmCLs_[Key];
+  if (!Entry.Handle) {
+    Entry.Mutex = std::make_shared<std::mutex>();
+    zeStatus = zeCommandListCreateImmediate(ZeCtx, ZeDev_, &QDesc, &Entry.Handle);
+    CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeCommandListCreateImmediate);
+  }
+  OutMtx = Entry.Mutex;
+  return Entry.Handle;
+}
+
 std::shared_ptr<chipstar::Event>
 CHIPQueueLevel0::launchImpl(chipstar::ExecItem *ExecItem) {
-  IsEmptyQueue_.store(false);
   CHIPContextLevel0 *ChipCtxZe = (CHIPContextLevel0 *)ChipContext_;
   CHIPKernelLevel0 *ChipKernel = (CHIPKernelLevel0 *)ExecItem->getKernel();
   ze_kernel_handle_t KernelZe = ChipKernel->get();
@@ -1324,7 +1548,8 @@ CHIPQueueLevel0::launchImpl(chipstar::ExecItem *ExecItem) {
   auto [EventHandles, EventLocks] = addDependenciesQueueSync({});
 
   // if using immediate command lists, lock the mutex
-  LOCK(CommandListMtx); // TODO this is probably not needed when using RCL
+  LOCK(*CmdListMtx_); // TODO this is probably not needed when using RCL
+  markBusy();
   auto CommandList = this->getCmdListImm();
 
   // Do we need to annotate indirect buffer accesses?
@@ -1337,10 +1562,35 @@ CHIPQueueLevel0::launchImpl(chipstar::ExecItem *ExecItem) {
   if (!ModInfo.HasNoIGBAs) {
     // skpiing this check because PVC has a hardcoded value for this flag even though it's not supported:
     // if (!LzDev->hasOnDemandPaging())
-    zeStatus = zeKernelSetIndirectAccess(
-        KernelZe, ZE_KERNEL_INDIRECT_ACCESS_FLAG_DEVICE |
-                      ZE_KERNEL_INDIRECT_ACCESS_FLAG_HOST);
-    CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeKernelSetIndirectAccess);
+    // The L0 driver appears to serialize zeKernelSetIndirectAccess across
+    // threads (it can deadlock or extreme-slow under back-to-back launches).
+    // The flag is a property of the kernel handle and only needs to be set
+    // once per kernel, not per launch. Cache the result and skip the call
+    // if it has already been performed for this kernel.
+    bool Expected = false;
+    if (ChipKernel->IndirectAccessSet_.compare_exchange_strong(
+            Expected, true, std::memory_order_acq_rel)) {
+      // Declare indirect access to all three USM kinds, mirroring the
+      // OpenCL backend's CL_KERNEL_EXEC_INFO_INDIRECT_{HOST,DEVICE,SHARED}
+      // _ACCESS_INTEL. SHARED covers hipMallocManaged memory backed by
+      // zeMemAllocShared (see allocateImpl()): the driver only migrates a
+      // shared allocation for a launch when the kernel declares indirect
+      // shared access, and a pointer reached through a by-value struct or
+      // another buffer is not visible to it as a kernel argument. A no-op
+      // where no shared allocations exist.
+      logInfo("Kernel {}: zeKernelSetIndirectAccess(DEVICE|HOST|SHARED), "
+              "module has indirect global buffer accesses",
+              ChipKernel->getName());
+      zeStatus = zeKernelSetIndirectAccess(
+          KernelZe, ZE_KERNEL_INDIRECT_ACCESS_FLAG_DEVICE |
+                        ZE_KERNEL_INDIRECT_ACCESS_FLAG_HOST |
+                        ZE_KERNEL_INDIRECT_ACCESS_FLAG_SHARED);
+      if (zeStatus != ZE_RESULT_SUCCESS) {
+        // Reset the flag so a future launch can retry.
+        ChipKernel->IndirectAccessSet_.store(false, std::memory_order_release);
+      }
+      CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeKernelSetIndirectAccess);
+    }
   }
 
   // if there's a spill buffer, we must use an event so we can track when
@@ -1366,7 +1616,7 @@ CHIPQueueLevel0::launchImpl(chipstar::ExecItem *ExecItem) {
 
   // This function may not be called from simultaneous threads with the same
   // command list handle.
-  // Done via LOCK(CommandListMtx)
+  // Done via LOCK(*CmdListMtx_)
   zeStatus = zeCommandListAppendLaunchKernel(
       CommandList, KernelZe, &LaunchArgs, nullptr,
       EventHandles.size(), EventHandles.data());
@@ -1377,7 +1627,6 @@ CHIPQueueLevel0::launchImpl(chipstar::ExecItem *ExecItem) {
 std::shared_ptr<chipstar::Event>
 CHIPQueueLevel0::memFillAsyncImpl(void *Dst, size_t Size, const void *Pattern,
                                   size_t PatternSize) {
-  IsEmptyQueue_.store(false);
   CHIPContextLevel0 *ChipCtxZe = (CHIPContextLevel0 *)ChipContext_;
   std::shared_ptr<chipstar::Event> MemFillEvent =
       static_cast<CHIPBackendLevel0 *>(Backend)->createEventShared(
@@ -1400,11 +1649,12 @@ CHIPQueueLevel0::memFillAsyncImpl(void *Dst, size_t Size, const void *Pattern,
   // Get dependencies BEFORE locking CommandListMtx to avoid deadlock
   auto [EventHandles, EventLocks] = addDependenciesQueueSync(MemFillEvent);
   
-  LOCK(CommandListMtx);
+  LOCK(*CmdListMtx_);
+  markBusy();
   auto CommandList = this->getCmdListImmCopy();
   // The application must not call this function from
   // simultaneous threads with the same command list handle.
-  // Done via LOCK(CommandListMtx)
+  // Done via LOCK(*CmdListMtx_)
   zeStatus = zeCommandListAppendMemoryFill(
       CommandList, Dst, Pattern, PatternSize, Size,
       std::static_pointer_cast<CHIPEventLevel0>(MemFillEvent)->peek(),
@@ -1428,7 +1678,6 @@ CHIPQueueLevel0::memCopy3DAsyncImpl(void *Dst, size_t Dpitch, size_t Dspitch,
                                     const void *Src, size_t Spitch,
                                     size_t Sspitch, size_t Width, size_t Height,
                                     size_t Depth, hipMemcpyKind Kind) {
-  IsEmptyQueue_.store(false);
   CHIPContextLevel0 *ChipCtxZe = (CHIPContextLevel0 *)ChipContext_;
   std::shared_ptr<chipstar::Event> MemCopyRegionEvent =
       static_cast<CHIPBackendLevel0 *>(Backend)->createEventShared(
@@ -1453,11 +1702,12 @@ CHIPQueueLevel0::memCopy3DAsyncImpl(void *Dst, size_t Dpitch, size_t Dspitch,
   auto [EventHandles, EventLocks] =
       addDependenciesQueueSync(MemCopyRegionEvent);
   
-  LOCK(CommandListMtx);
+  LOCK(*CmdListMtx_);
+  markBusy();
   auto CommandList = this->getCmdListImmCopy();
   // The application must not call this function from
   // simultaneous threads with the same command list handle.
-  // Done via LOCK(CommandListMtx)
+  // Done via LOCK(*CmdListMtx_)
 
   zeStatus = zeCommandListAppendMemoryCopyRegion(
       CommandList, Dst, &DstRegion, Dpitch, Dspitch, Src, &SrcRegion, Spitch,
@@ -1474,7 +1724,6 @@ void CHIPQueueLevel0::memFillAsync3D(hipPitchedPtr PitchedDevPtr, int Value,
                                      hipExtent Extent) {
   logTrace("CHIPQueueLevel0::memFillAsync3D - using "
            "zeCommandListAppendMemoryCopyRegion implementation");
-  IsEmptyQueue_.store(false);
   CHIPContextLevel0 *ChipCtxZe = (CHIPContextLevel0 *)ChipContext_;
 
   size_t Width = Extent.width;
@@ -1540,10 +1789,12 @@ void CHIPQueueLevel0::memFillAsync3D(hipPitchedPtr PitchedDevPtr, int Value,
       static_cast<CHIPBackendLevel0 *>(Backend)->createEventShared(
           ChipCtxZe, chipstar::EventFlags(), "memFillAsync3D_region");
 
+
   // Get dependencies before acquiring command list lock to avoid deadlock
   auto [EventHandles, EventLocks] = addDependenciesQueueSync(CopyEvent);
 
-  LOCK(CommandListMtx);
+  LOCK(*CmdListMtx_);
+  markBusy();
   auto CommandList = this->getCmdListImmCopy();
 
   // Wait for pattern buffer to be filled
@@ -1621,18 +1872,18 @@ std::shared_ptr<chipstar::Event>
 CHIPQueueLevel0::memCopyToImage(ze_image_handle_t Image, const void *Src,
                                 const chipstar::RegionDesc &SrcRegion) {
   logTrace("CHIPQueueLevel0::memCopyToImage");
-  IsEmptyQueue_.store(false);
   CHIPContextLevel0 *ChipCtxZe = (CHIPContextLevel0 *)ChipContext_;
   std::shared_ptr<chipstar::Event> ImageCopyEvent =
       static_cast<CHIPBackendLevel0 *>(Backend)->createEventShared(
           ChipCtxZe, chipstar::EventFlags(), "memCopyToImage");
   auto [EventHandles, EventLocks] = addDependenciesQueueSync(ImageCopyEvent);
   if (!SrcRegion.isPitched()) {
-    LOCK(CommandListMtx);
+    LOCK(*CmdListMtx_);
+    markBusy();
     auto CommandList = this->getCmdListImm();
     // The application must not call this function from
     // simultaneous threads with the same command list handle.
-    // Done via LOCK(CommandListMtx)
+    // Done via LOCK(*CmdListMtx_)
     zeStatus = zeCommandListAppendImageCopyFromMemory(
         CommandList, Image, Src, 0,
         std::static_pointer_cast<CHIPEventLevel0>(ImageCopyEvent)->peek(),
@@ -1647,7 +1898,8 @@ CHIPQueueLevel0::memCopyToImage(ze_image_handle_t Image, const void *Src,
   CHIPASSERT(SrcRegion.getNumDims() == 2 &&
              "UNIMPLEMENTED: 3D pitched image copy.");
   const char *SrcRow = (const char *)Src;
-  LOCK(CommandListMtx);
+  LOCK(*CmdListMtx_);
+  markBusy();
   auto CommandList = this->getCmdListImm();
   for (size_t Row = 0; Row < SrcRegion.Size[1]; Row++) {
     bool LastRow = Row == SrcRegion.Size[1] - 1;
@@ -1661,7 +1913,7 @@ CHIPQueueLevel0::memCopyToImage(ze_image_handle_t Image, const void *Src,
 
     // The application must not call this function from
     // simultaneous threads with the same command list handle.
-    // Done via LOCK(CommandListMtx)
+    // Done via LOCK(*CmdListMtx_)
     zeStatus = zeCommandListAppendImageCopyFromMemory(
         CommandList, Image, SrcRow, &DstZeRegion,
         LastRow
@@ -1682,6 +1934,7 @@ hipError_t CHIPQueueLevel0::getBackendHandles(uintptr_t *NativeInfo,
     *NumHandles = 6;
     return hipSuccess;
   }
+  NativeHandlesEscaped_ = true;
 
   // get the immediate command list handle
   NativeInfo[5] = (uintptr_t)ZeCmdListImm_;
@@ -1717,11 +1970,12 @@ std::shared_ptr<chipstar::Event> CHIPQueueLevel0::enqueueMarkerImpl() {
   // Get dependencies BEFORE locking CommandListMtx to avoid deadlock
   addDependenciesQueueSync(MarkerEvent);
   
-  LOCK(CommandListMtx);
+  LOCK(*CmdListMtx_);
+  IsEmptyQueue_.store(false);
   auto CommandList = this->getCmdListImm();
   // The application must not call this function from
   // simultaneous threads with the same command list handle.
-  // Done via LOCK(CommandListMtx)
+  // Done via LOCK(*CmdListMtx_)
   zeStatus = zeCommandListAppendSignalEvent(
       CommandList,
       std::static_pointer_cast<CHIPEventLevel0>(MarkerEvent)->peek());
@@ -1763,11 +2017,12 @@ std::shared_ptr<chipstar::Event> CHIPQueueLevel0::enqueueBarrierImpl(
   } // done gather Event_ handles to wait on
 
   // TODO Should this be memory or compute?
-  LOCK(CommandListMtx);
+  LOCK(*CmdListMtx_);
+  markBusy();
   auto CommandList = this->getCmdListImm();
   // The application must not call this function from
   // simultaneous threads with the same command list handle.
-  // Done via LOCK(CommandListMtx)
+  // Done via LOCK(*CmdListMtx_)
   zeStatus = zeCommandListAppendBarrier(CommandList, SignalEventHandle,
                                         NumEventsToWaitFor, EventHandles);
   CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeCommandListAppendBarrier);
@@ -1792,11 +2047,12 @@ CHIPQueueLevel0::memCopyAsyncImpl(void *Dst, const void *Src, size_t Size,
   // (addDependenciesQueueSync may lock other queue's CommandListMtx)
   auto [EventHandles, EventLocks] = addDependenciesQueueSync(MemCopyEvent);
   
-  LOCK(CommandListMtx);
+  LOCK(*CmdListMtx_);
+  markBusy();
   auto CommandList = this->getCmdListImmCopy();
   // The application must not call this function from simultaneous threads with
   // the same command list handle
-  // Done via LOCK(CommandListMtx)
+  // Done via LOCK(*CmdListMtx_)
   zeStatus = zeCommandListAppendMemoryCopy(
       CommandList, Dst, Src, Size,
       std::static_pointer_cast<CHIPEventLevel0>(MemCopyEvent)->peek(),
@@ -1819,11 +2075,13 @@ CHIPQueueLevel0::memPrefetchImpl(const void *Ptr, size_t Count, int DstDevId) {
         static_cast<CHIPBackendLevel0 *>(Backend)->createEventShared(
             ChipCtxZe, chipstar::EventFlags(), "memPrefetch");
     
+    auto [EventHandles, EventLocks] = addDependenciesQueueSync(PrefetchEvent);
+
     // For CPU prefetch, just create an event that's already complete
     // The memory will be accessible on CPU by default for managed memory
-    LOCK(CommandListMtx);
+    LOCK(*CmdListMtx_);
+    markBusy();
     auto CommandList = this->getCmdListImmCopy();
-    auto [EventHandles, EventLocks] = addDependenciesQueueSync(PrefetchEvent);
     
     // Append a barrier to signal completion (no actual prefetch command)
     zeStatus = zeCommandListAppendBarrier(
@@ -1842,9 +2100,11 @@ CHIPQueueLevel0::memPrefetchImpl(const void *Ptr, size_t Count, int DstDevId) {
       static_cast<CHIPBackendLevel0 *>(Backend)->createEventShared(
           ChipCtxZe, chipstar::EventFlags(), "memPrefetch");
   
-  LOCK(CommandListMtx);
-  auto CommandList = this->getCmdListImmCopy();
   auto [EventHandles, EventLocks] = addDependenciesQueueSync(PrefetchEvent);
+
+  LOCK(*CmdListMtx_);
+  markBusy();
+  auto CommandList = this->getCmdListImmCopy();
   
   // Append memory prefetch command to the command list
   zeStatus = zeCommandListAppendMemoryPrefetch(
@@ -1864,28 +2124,49 @@ CHIPQueueLevel0::memPrefetchImpl(const void *Ptr, size_t Count, int DstDevId) {
 }
 
 void CHIPQueueLevel0::finish() {
+  // zeCommandListHostSynchronize on an empty immediate command list has a
+  // fixed ~0.4ms overhead on Intel Arc B570. When N streams are created,
+  // hipDeviceSynchronize() calls finish() on all N+default queues, making
+  // the cost O(N×0.4ms).
+  //
+  // However, the Intel Arc L0 driver requires at least one full blocking sync
+  // on each command list to transition it to "idle" state — a prerequisite for
+  // parallel kernel execution across multiple command lists. Skip the blocking
+  // wait only after the first sync has already been performed.
+  if (IsEmptyQueue_.load() && CmdListInitialized_.load()) return;
 
   if (zeCmdQOwnership_) {
     zeStatus = zeCommandQueueSynchronize(ZeCmdQ_, ChipEnvVars.getL0EventTimeout() * 1e9);
     CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeCommandQueueSynchronize,
                                       "zeCommandQueueSynchronize timeout out");
   }
-  LOCK(CommandListMtx);
+  LOCK(*CmdListMtx_);
 
   // host wait for command list to complete
   if( ZeCmdListImmCopy_ != ZeCmdListImm_) {
     zeStatus = zeCommandListHostSynchronize(ZeCmdListImmCopy_, UINT64_MAX);
     CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeCommandListHostSynchronize);
   }
-  
+
   // host wait for command list to complete
   zeStatus = zeCommandListHostSynchronize(ZeCmdListImm_, UINT64_MAX);
   CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeCommandListHostSynchronize);
 
   // All GPU work on this queue has completed. Release cross-queue dependency
   // marker events so their ze_events can be recycled by the event pool.
-  PendingCrossQueueDeps_.clear();
+  //
+  // Test-only fault injection for issue #1311: when the environment variable
+  // CHIP_L0_TEST_RETAIN_CROSSQUEUE_DEPS is set, skip clearing the markers. This
+  // deterministically reproduces the production condition (seen with Zero-RK on
+  // Aurora) where finish() does not reach this point at shutdown -- e.g. one of
+  // the Level Zero synchronize calls above throws -- leaving the marker events
+  // alive until the queue is destroyed during context teardown.
+  static const bool RetainCrossQueueDepsForTest =
+      std::getenv("CHIP_L0_TEST_RETAIN_CROSSQUEUE_DEPS") != nullptr;
+  if (!RetainCrossQueueDepsForTest)
+    PendingCrossQueueDeps_.clear();
   IsEmptyQueue_.store(true);
+  CmdListInitialized_.store(true);
   return;
 }
 
@@ -1927,28 +2208,54 @@ void CHIPQueueLevel0::finishWithoutEventsMtx() {
 }
 
 bool CHIPQueueLevel0::query() {
-  // use a zero timeout zeCommandListHostSynchronize
-  bool executeReady = true;
-  bool copyReady = true;
-  zeStatus = zeCommandListHostSynchronize(ZeCmdListImm_, 0);
-  if (zeStatus == ZE_RESULT_SUCCESS) {
-    executeReady = true;
-  } else if (zeStatus == ZE_RESULT_NOT_READY) {
-    executeReady = false;
-  } else {
+  if (NativeHandlesEscaped_) {
+    zeStatus = zeCommandListHostSynchronize(ZeCmdListImm_, 0);
+    if (zeStatus == ZE_RESULT_NOT_READY)
+      return false;
     CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeCommandListHostSynchronize);
+    return true;
   }
 
-  zeStatus = zeCommandListHostSynchronize(ZeCmdListImmCopy_, 0);
-  if (zeStatus == ZE_RESULT_SUCCESS) {
-    copyReady = true;
-  } else if (zeStatus == ZE_RESULT_NOT_READY) {
-    copyReady = false;
-  } else {
-    CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeCommandListHostSynchronize);
+  // Poll a marker behind this queue's work: zeCommandListHostSynchronize also
+  // waits for other streams sharing the command list.
+  LOCK(*CmdListMtx_);
+  uint64_t Submits = SubmitCount_.load();
+  if (IsEmptyQueue_.load())
+    return true;
+
+  if (QueryArmed_) {
+    zeStatus = zeEventQueryStatus(QueryEvent_);
+    // Work submitted after a pending marker cannot have completed either.
+    if (zeStatus == ZE_RESULT_NOT_READY)
+      return false;
+    CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeEventQueryStatus);
+    if (Submits == QuerySubmitCount_)
+      return true;
+    zeStatus = zeEventHostReset(QueryEvent_);
+    CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeEventHostReset);
+    QueryArmed_ = false;
+  } else if (!QueryEvent_) {
+    ze_event_pool_desc_t PoolDesc = {ZE_STRUCTURE_TYPE_EVENT_POOL_DESC, nullptr,
+                                     ZE_EVENT_POOL_FLAG_HOST_VISIBLE, 1};
+    zeStatus =
+        zeEventPoolCreate(ChipCtxLz_->get(), &PoolDesc, 0, nullptr, &QueryEventPool_);
+    CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeEventPoolCreate);
+    ze_event_desc_t EventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC, nullptr, 0,
+                                 ZE_EVENT_SCOPE_FLAG_HOST};
+    zeStatus = zeEventCreate(QueryEventPool_, &EventDesc, &QueryEvent_);
+    CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeEventCreate);
   }
 
-  return executeReady && copyReady;
+  zeStatus = zeCommandListAppendSignalEvent(ZeCmdListImm_, QueryEvent_);
+  CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeCommandListAppendSignalEvent);
+  QueryArmed_ = true;
+  QuerySubmitCount_ = Submits;
+
+  zeStatus = zeEventQueryStatus(QueryEvent_);
+  if (zeStatus == ZE_RESULT_NOT_READY)
+    return false;
+  CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeEventQueryStatus);
+  return true;
 }
 
 void CHIPQueueLevel0::executeCommandList(
@@ -1976,12 +2283,10 @@ void CHIPQueueLevel0::executeCommandList(
 LZEventPool::LZEventPool(CHIPContextLevel0 *Ctx, unsigned int Size)
     : Ctx_(Ctx), Size_(Size), AllocatedCount_(0) {
 
+  // No ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP (see CHIPEventLevel0 ctor): chipStar
+  // times events via an explicit global-timestamp write, never reads kernel
+  // timestamps, and the flag only made zeEventQueryStatus expensive.
   unsigned int PoolFlags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
-#ifdef CHIP_L0_KERNEL_TIMESTAMPS
-  // Enable kernel timestamps by default since most events need timing.
-  // Events with timing disabled will still work but won't use timestamps.
-  PoolFlags = PoolFlags | ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
-#endif
 
   ze_event_pool_desc_t EventPoolDesc = {
       ZE_STRUCTURE_TYPE_EVENT_POOL_DESC, // stype
@@ -2352,14 +2657,21 @@ CHIPContextLevel0::~CHIPContextLevel0() {
     Backend->Events.clear();  // This releases all shared_ptr, triggering returnEvent()
   }
 
-  // delete all event pools
+  // Delete the device (and thus its queues) BEFORE deleting the event pools.
+  // Queues hold shared_ptr<Event> in PendingCrossQueueDeps_ whose custom
+  // deleter (LZEventPool::returnEvent) pushes the raw event back onto the
+  // owning pool. At shutdown finish() may be skipped or throw before clearing
+  // those refs, so they are released only when ~CHIPQueueLevel0 destroys its
+  // event vector. If the pools were freed first, returnEvent would push onto
+  // freed memory, corrupting the heap (issue #1311).
+  delete static_cast<CHIPDeviceLevel0 *>(ChipDevice_);
+
+  // Now that all queues are gone and have returned their events, the pools
+  // can be safely deleted.
   for (LZEventPool *Pool : EventPools_)
     delete Pool;
 
   EventPools_.clear();
-
-  // delete all devicesA
-  delete static_cast<CHIPDeviceLevel0 *>(ChipDevice_);
 
   while (!this->FencedCmdListsPool_.empty())
     this->FencedCmdListsPool_.pop();
@@ -2386,6 +2698,18 @@ void *CHIPContextLevel0::allocateImpl(size_t Size, size_t Alignment,
       /* DmaDesc.flags   = */ DeviceFlags,
       /* DmaDesc.ordinal = */ 0,
   };
+
+  // Opt-in: permit a single allocation larger than the device's reported
+  // maxMemAllocSize via the ze_relaxed_allocation_limits extension. This is
+  // the Level Zero equivalent of NEO's AllowUnrestrictedSize for OpenCL.
+  ze_relaxed_allocation_limits_exp_desc_t RelaxedDesc{
+      /* RelaxedDesc.stype = */
+      ZE_STRUCTURE_TYPE_RELAXED_ALLOCATION_LIMITS_EXP_DESC,
+      /* RelaxedDesc.pNext = */ nullptr,
+      /* RelaxedDesc.flags = */ ZE_RELAXED_ALLOCATION_LIMITS_EXP_FLAG_MAX_SIZE,
+  };
+  if (chipUnrestrictedAllocSize())
+    DmaDesc.pNext = &RelaxedDesc;
   ze_host_mem_alloc_flags_t HostFlags = ZE_DEVICE_MEM_ALLOC_FLAG_BIAS_CACHED;
   if (Flags.isWriteCombined())
     HostFlags += ZE_HOST_MEM_ALLOC_FLAG_BIAS_WRITE_COMBINED;
@@ -2395,14 +2719,19 @@ void *CHIPContextLevel0::allocateImpl(size_t Size, size_t Alignment,
       /* HmaDesc.flags = */ HostFlags,
   };
   if (MemTy == hipMemoryType::hipMemoryTypeUnified) {
-    // Use zeMemAllocHost for managed memory to ensure host accessibility
-    // is maintained even when the GPU accesses the memory. Intel's Level Zero
-    // driver on discrete GPUs uses page migration with zeMemAllocShared that
-    // removes host mappings when pages are accessed by the device, causing
-    // segfaults on subsequent host access. Host memory remains accessible
-    // from both host and device, providing correct HIP/CUDA semantics.
-    zeStatus = zeMemAllocHost(ZeCtx, &HmaDesc, Size, Alignment, &Ptr);
-    CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeMemAllocHost);
+    // Single-device shared USM, associated with this device so that the
+    // sharedSingleDeviceAllocCapabilities apply. Shared USM is what
+    // hipMallocManaged means: one pointer valid on host and device, with the
+    // driver migrating pages. Host USM (zeMemAllocHost) is the backing for
+    // hipHostMalloc, where the pages stay pinned in host memory and the
+    // device reaches them over the link; using it for managed memory left
+    // device atomics unsupported wherever host USM reports no ATOMIC access
+    // capability (Intel Data Center GPU Max), and made hipMemPrefetchAsync
+    // meaningless.
+    auto ChipDev = (CHIPDeviceLevel0 *)Backend->getActiveDevice();
+    zeStatus = zeMemAllocShared(ZeCtx, &DmaDesc, &HmaDesc, Size, Alignment,
+                                ChipDev->get(), &Ptr);
+    CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeMemAllocShared);
   } else if (MemTy == hipMemoryType::hipMemoryTypeDevice) {
     auto ChipDev = (CHIPDeviceLevel0 *)Backend->getActiveDevice();
     ze_device_handle_t ZeDev = ChipDev->get();
@@ -2474,6 +2803,9 @@ void CHIPDeviceLevel0::populateDevicePropertiesImpl() {
   std::memset(&FpAtomicProps_, 0, sizeof(FpAtomicProps_));
   FpAtomicProps_.stype = ZE_STRUCTURE_TYPE_FLOAT_ATOMIC_EXT_PROPERTIES;
 
+  std::memset(&MemAccessProps_, 0, sizeof(MemAccessProps_));
+  MemAccessProps_.stype = ZE_STRUCTURE_TYPE_DEVICE_MEMORY_ACCESS_PROPERTIES;
+
   ze_device_module_properties_t DeviceModuleProps;
   bool HasFPAtomicsExt =
       static_cast<CHIPBackendLevel0 *>(Backend)->hasFloatAtomicsExt();
@@ -2510,6 +2842,17 @@ void CHIPDeviceLevel0::populateDevicePropertiesImpl() {
   // Query device image properties
   zeStatus = zeDeviceGetImageProperties(ZeDev_, &DeviceImageProps);
   CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeDeviceGetImageProperties);
+
+  // Query which USM kinds support atomic and concurrent access
+  zeStatus = zeDeviceGetMemoryAccessProperties(ZeDev_, &MemAccessProps_);
+  CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeDeviceGetMemoryAccessProperties);
+
+  logInfo("Managed memory (hipMallocManaged) uses shared USM on {} "
+          "(hostAllocCapabilities=0x{:x}, "
+          "sharedSingleDeviceAllocCapabilities=0x{:x})",
+          ZeDeviceProps_.name,
+          (unsigned)MemAccessProps_.hostAllocCapabilities,
+          (unsigned)MemAccessProps_.sharedSingleDeviceAllocCapabilities);
 
   // Copy device name
   strncpy(HipDeviceProps_.name, ZeDeviceProps_.name,
@@ -2578,8 +2921,10 @@ void CHIPDeviceLevel0::populateDevicePropertiesImpl() {
   HipDeviceProps_.major = 2;
   HipDeviceProps_.minor = 0;
 
-  HipDeviceProps_.maxThreadsPerMultiProcessor =
-      ZeDeviceProps_.numEUsPerSubslice * ZeDeviceProps_.numThreadsPerEU; //  10;
+  // Never below maxThreadsPerBlock: an accepted block must fit on one unit.
+  HipDeviceProps_.maxThreadsPerMultiProcessor = std::max(
+      ZeDeviceProps_.numEUsPerSubslice * ZeDeviceProps_.numThreadsPerEU,
+      static_cast<uint32_t>(HipDeviceProps_.maxThreadsPerBlock));
 
   HipDeviceProps_.computeMode = hipComputeModeDefault;
   HipDeviceProps_.arch = {};
@@ -2630,16 +2975,20 @@ void CHIPDeviceLevel0::populateDevicePropertiesImpl() {
   HipDeviceProps_.textureAlignment = 1;
   HipDeviceProps_.texturePitchAlignment = 1;
 
-  // Level0 devices support basic CUDA managed memory via USM,
-  // but some of the functions such as prefetch and advice are unimplemented
-  // in chipStar.
-  // Level0 supports unified shared memory via zeMemAllocShared, which is used
-  // in allocateImpl() for hipMemoryTypeUnified allocations.
+  // hipMallocManaged is backed by single-device shared USM (allocateImpl()).
+  // concurrentManagedAccess describes that kind; hostNativeAtomicSupported is
+  // about host memory, which backs hipHostMalloc.
   HipDeviceProps_.managedMemory = 1;
-  // TODO: Populate these from SVM/USM properties. Advertise the safe
-  // defaults for now. Uninitialized properties cause undeterminism.
+  HipDeviceProps_.hostNativeAtomicSupported =
+      (MemAccessProps_.hostAllocCapabilities & ZE_MEMORY_ACCESS_CAP_FLAG_ATOMIC)
+          ? 1
+          : 0;
+  const ze_memory_access_cap_flags_t ManagedCaps =
+      MemAccessProps_.sharedSingleDeviceAllocCapabilities;
+  HipDeviceProps_.concurrentManagedAccess =
+      (ManagedCaps & ZE_MEMORY_ACCESS_CAP_FLAG_CONCURRENT) ? 1 : 0;
+  // Conservative defaults for the remaining USM related properties.
   HipDeviceProps_.directManagedMemAccessFromHost = 0;
-  HipDeviceProps_.concurrentManagedAccess = 0;
   HipDeviceProps_.pageableMemoryAccess = 0;
   HipDeviceProps_.pageableMemoryAccessUsesHostPageTables = 0;
 
@@ -2876,218 +3225,183 @@ std::string resultToString(ze_result_t zeStatus) {
 // CHIPModuleLevel0
 // ***********************************************************************
 
-/// Dumps build/link log into the error log stream. The 'Log' value must be
-/// valid handle. This function will destroy the log handle.
-static void dumpBuildLog(ze_module_build_log_handle_t &&Log) {
+/// Dumps a non-empty build/link log into the info log stream and returns its
+/// contents. The 'Log' value must be a valid handle. This function will
+/// destroy the log handle.
+///
+/// The size zeModuleBuildLogGetString reports counts the terminating NUL
+/// (the spec calls pBuildLog a null-terminated string; the Compute Runtime
+/// returns buildLog.size() + 1), so the string is cut at the first NUL: a NUL
+/// on stderr truncates it for any parent that reads the stream back as a C
+/// string, which is how gtest death tests match the child's abort message.
+static std::string dumpBuildLog(ze_module_build_log_handle_t &&Log) {
+  std::string LogStr;
   size_t LogSize;
   zeStatus = zeModuleBuildLogGetString(Log, &LogSize, nullptr);
   if (zeStatus == ZE_RESULT_SUCCESS) {
     std::vector<char> LogVec(LogSize);
     zeStatus = zeModuleBuildLogGetString(Log, &LogSize, LogVec.data());
-    if (zeStatus == ZE_RESULT_SUCCESS)
-      logInfo("ZE Build Log:\n{}", std::string_view(LogVec.data(), LogSize));
+    if (zeStatus == ZE_RESULT_SUCCESS) {
+      LogStr.assign(LogVec.data(), strnlen(LogVec.data(), LogSize));
+      if (!LogStr.empty())
+        logInfo("ZE Build Log:\n{}", LogStr);
+    }
   }
 
   CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeModuleBuildLogDestroy);
+  return LogStr;
 }
 
-void save(const ze_module_desc_t &desc, const ze_module_handle_t &module,
-          CHIPDeviceLevel0 *device) {
-  const void *pNextConst = desc.pNext;
-  // If pNext is null, we can't use the experimental multi-input path for caching
-  if (!pNextConst) {
+/// Compute the Level Zero module cache key.
+///
+/// Unlike the OpenCL path this hashes every input module handed to
+/// zeModuleCreate, so the runtime device library modules are already covered:
+/// they are passed in as additional ILs rather than linked in afterwards.
+///
+/// The driver version is only the floor: it identifies the Compute Runtime
+/// build but provably not the device compiler (an IGC-only upgrade leaves it
+/// bit-identical). The loader-delta digest is what covers the compiler.
+static std::string
+computeLevel0CacheKey(const ze_module_program_exp_desc_t *ProgramDesc,
+                      CHIPDeviceLevel0 *Device) {
+  namespace cache = chipstar::cache;
+  cache::KeyBuilder KB;
+  KB.add(cache::KeyField::BackendTag, "level0");
+  for (uint32_t I = 0; I < ProgramDesc->count; ++I) {
+    KB.add(cache::KeyField::Il, ProgramDesc->pInputModules[I],
+           ProgramDesc->inputSizes[I]);
+    KB.add(cache::KeyField::BuildOptions,
+           ProgramDesc->pBuildFlags && ProgramDesc->pBuildFlags[I]
+               ? std::string_view(ProgramDesc->pBuildFlags[I])
+               : std::string_view(""));
+  }
+  KB.add(cache::KeyField::DeviceName, Device->getName());
+
+  ze_device_properties_t DeviceProperties{};
+  DeviceProperties.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+  DeviceProperties.pNext = nullptr;
+  if (zeDeviceGetProperties(Device->get(), &DeviceProperties) ==
+      ZE_RESULT_SUCCESS) {
+    KB.add(cache::KeyField::DeviceId,
+           static_cast<uint64_t>(DeviceProperties.deviceId));
+    KB.add(cache::KeyField::VendorId,
+           static_cast<uint64_t>(DeviceProperties.vendorId));
+  }
+
+  if (auto *CtxLz = static_cast<CHIPContextLevel0 *>(Device->getContext())) {
+    ze_driver_properties_t DriverProperties{};
+    DriverProperties.stype = ZE_STRUCTURE_TYPE_DRIVER_PROPERTIES;
+    DriverProperties.pNext = nullptr;
+    if (zeDriverGetProperties(CtxLz->ZeDriver, &DriverProperties) ==
+        ZE_RESULT_SUCCESS)
+      KB.add(cache::KeyField::DriverVersion,
+             static_cast<uint64_t>(DriverProperties.driverVersion));
+  }
+
+  KB.add(cache::KeyField::LoaderDelta, cache::loaderDeltaDigest());
+  KB.add(cache::KeyField::Environment, collectCompilerEnvironmentVariables());
+  std::string Key = KB.finish();
+  logDebug("Level0: generated cache key: '{}'", Key);
+  return Key;
+}
+
+/// Persist a compiled module's native binary under CacheKey. Never throws:
+/// any failure only costs a later process a recompile.
+static void storeModule(ze_module_handle_t Module,
+                        const std::string &CacheKey) {
+  namespace cache = chipstar::cache;
+  if (CacheKey.empty() || !ChipEnvVars.getModuleCacheDir().has_value())
     return;
-  }
-  ze_module_program_exp_desc_t *ProgramDesc =
-      const_cast<ze_module_program_exp_desc_t *>(
-          reinterpret_cast<const ze_module_program_exp_desc_t *>(pNextConst));
-  int numILs = ProgramDesc->count;
-
-  std::hash<std::string> hasher;
-  std::string combinedInput;
-  for (int i = 0; i < numILs; i++) {
-    combinedInput.append(
-        reinterpret_cast<const char *>(ProgramDesc->pInputModules[i]),
-        ProgramDesc->inputSizes[i]);
-    combinedInput.append(ProgramDesc->pBuildFlags[i]);
-    combinedInput.append(std::to_string(ProgramDesc->inputSizes[i]));
-  }
-
-  // Add device name to the hash input
-  combinedInput.append(device->getName());
-
-  // Include IGC_ environment variables in cache key
-  std::string igcVars = collectIGCEnvironmentVariables();
-  logDebug("Level0: IGC variables for cache key: '{}'", igcVars);
-  if (!igcVars.empty()) {
-    combinedInput.append(";");
-    combinedInput.append(igcVars);
-  }
-
-  size_t hash = hasher(combinedInput);
-  logDebug("Level0: Generated cache hash: '{}'", std::to_string(hash));
-
-  if (!ChipEnvVars.getModuleCacheDir().has_value()) {
-    logTrace("Module caching is disabled");
+  size_t BinarySize = 0;
+  if (zeModuleGetNativeBinary(Module, &BinarySize, nullptr) !=
+          ZE_RESULT_SUCCESS ||
+      BinarySize == 0)
     return;
-  }
-
-  std::string cacheDir = ChipEnvVars.getModuleCacheDir().value();
-  // Create the cache directory if it doesn't exist
-  std::filesystem::create_directories(cacheDir);
-  std::string fullPath = cacheDir + "/" + std::to_string(hash);
-  std::string fullPath_tmp = cacheDir + "/" + std::to_string(hash) +"_tmp";
-
-  size_t binarySize;
-  zeStatus = zeModuleGetNativeBinary(module, &binarySize, nullptr);
-  CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeModuleGetNativeBinary);
-
-  std::vector<uint8_t> binary(binarySize);
-  zeStatus = zeModuleGetNativeBinary(module, &binarySize, binary.data());
-  CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeModuleGetNativeBinary);
-  
-  // for c++23 we could use std::ios::noreplace in the future
-  // try to create a file. This is atomic, so one process will succeed and the
-  int fd = open(fullPath_tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
-
-  if( fd == -1 ) {
-    // file already exists or another error occurred
-    if( errno == EEXIST ) {
-
-      // file already exists. wait until the final file appears
-      double duration = 0; //
-      double duration_limit = 3600; // waits 60 min roughly and then will stop
-      while (!std::filesystem::exists(fullPath) and duration < duration_limit ) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-	duration+=0.5;
-      }
-    } else {
-      logError("Failed to open file for writing module binary");
-      std::abort();
-    }
-  } else {
-    // this process opened the file
-    ssize_t bytes = write(fd,reinterpret_cast<const char *>(binary.data()), binary.size() );
-    if( bytes == -1 ) {
-      logError("Failed to write file for module binary");
-      close(fd);
-      std::abort();
-    }
-    if( fsync(fd) == -1 ) {
-      logError("Failed to write file for module binary");
-      close(fd);
-      std::abort();
-    }
-    close(fd);
-    // rename, also atomic
-    if( rename(fullPath_tmp.c_str(), fullPath.c_str() ) == -1) {
-      logError("Failed to write file for module binary");
-    }
-    
-    logTrace("Module binary cached as {}", fullPath);
-  }
+  std::vector<uint8_t> Binary(BinarySize);
+  if (zeModuleGetNativeBinary(Module, &BinarySize, Binary.data()) !=
+      ZE_RESULT_SUCCESS)
+    return;
+  cache::store(ChipEnvVars.getModuleCacheDir().value(), "level0", CacheKey,
+               Binary.data(), Binary.size());
 }
 
-bool load(ze_module_desc_t &desc, CHIPDeviceLevel0 *device) {
-  const void *pNextConst = desc.pNext;
-  // If pNext is null, we can't use the experimental multi-input path for caching
-  if (!pNextConst) {
-    return false;
-  }
-  ze_module_program_exp_desc_t *ProgramDesc =
-      const_cast<ze_module_program_exp_desc_t *>(
-          reinterpret_cast<const ze_module_program_exp_desc_t *>(pNextConst));
-  int numILs = ProgramDesc->count;
-
-  std::hash<std::string> hasher;
-  std::string combinedInput;
-  for (int i = 0; i < numILs; i++) {
-    combinedInput.append(
-        reinterpret_cast<const char *>(ProgramDesc->pInputModules[i]),
-        ProgramDesc->inputSizes[i]);
-    combinedInput.append(ProgramDesc->pBuildFlags[i]);
-    combinedInput.append(std::to_string(ProgramDesc->inputSizes[i]));
-  }
-
-  // Add device name to the hash input
-  combinedInput.append(device->getName());
-
-  // Include IGC_ environment variables in cache key
-  std::string igcVars = collectIGCEnvironmentVariables();
-  logDebug("Level0 load: IGC variables for cache key: '{}'", igcVars);
-  if (!igcVars.empty()) {
-    combinedInput.append(";");
-    combinedInput.append(igcVars);
-  }
-
-  size_t hash = hasher(combinedInput);
-  logDebug("Level0 load: Generated cache hash: '{}'", std::to_string(hash));
-
-  if (!ChipEnvVars.getModuleCacheDir().has_value()) {
-    return false;
-  }
-
-  std::string cacheDir = ChipEnvVars.getModuleCacheDir().value();
-  std::string fullPath = cacheDir + "/" + std::to_string(hash);
-
-  logTrace("Loading kernel binary from cache at {}", fullPath);
-  std::ifstream inFile(fullPath, std::ios::in | std::ios::binary);
-  if (!inFile) {
-    return false;
-  }
-
-  // Get file size
-  inFile.seekg(0, std::ios::end);
-  size_t fileSize = inFile.tellg();
-  inFile.seekg(0, std::ios::beg);
-
-  assert(fileSize > 0 && "Cache file is empty");
-
-  // Read the binary data
-  auto binary = std::make_unique<std::vector<uint8_t>>(fileSize);
-  inFile.read(reinterpret_cast<char *>(binary->data()), fileSize);
-  inFile.close();
-
-  desc.format = ZE_MODULE_FORMAT_NATIVE;
-  desc.pNext = nullptr;
-  desc.inputSize = binary->size();
-  desc.pInputModule = binary->data();
-  desc.pBuildFlags = nullptr;
-  desc.pConstants = nullptr;
-
-  // Store the unique_ptr in a static variable to keep it alive
-  static std::vector<std::unique_ptr<std::vector<uint8_t>>> binaryStorage;
-  binaryStorage.push_back(std::move(binary));
-
-  logTrace("Module binary loaded from cache, size: {} bytes", fileSize);
-  return true;
-}
-
+/// Create a module, consulting the cache when CacheKey is non-empty. An
+/// empty key bypasses the cache entirely (the relink fallback builds
+/// intermediate objects that must be neither loaded nor stored).
 static ze_module_handle_t compileIL(ze_context_handle_t ZeCtx,
                                     ze_device_handle_t ZeDev,
-                                    ze_module_desc_t &ModuleDesc,
-                                    CHIPDeviceLevel0 *device) {
+                                    const ze_module_desc_t &BuildDesc,
+                                    CHIPDeviceLevel0 *Device,
+                                    const std::string &CacheKey = "",
+                                    bool *WasCachedOut = nullptr) {
+  namespace cache = chipstar::cache;
+
+  // The Entry owns the cached bytes and zeModuleCreate reads them through a
+  // raw pointer, so it is declared before the descriptor that points into
+  // it and stays alive across the call.
+  cache::Entry Cached;
+  if (!CacheKey.empty() && ChipEnvVars.getModuleCacheDir().has_value())
+    Cached = cache::load(ChipEnvVars.getModuleCacheDir().value(), "level0",
+                         CacheKey); // emits the MISS marker itself
+
+  // A local copy: a cache hit retargets it at the native binary without
+  // mutating the caller's descriptor.
+  ze_module_desc_t Desc = BuildDesc;
+  if (Cached) {
+    Desc.pNext = nullptr;
+    Desc.format = ZE_MODULE_FORMAT_NATIVE;
+    Desc.inputSize = Cached.data().size();
+    Desc.pInputModule = Cached.data().data();
+    Desc.pBuildFlags = nullptr;
+    Desc.pConstants = nullptr;
+  }
 
   ze_module_build_log_handle_t Log;
   ze_module_handle_t Object;
-  bool cached = load(ModuleDesc, device);
   auto start = std::chrono::high_resolution_clock::now();
-  zeStatus = zeModuleCreate(ZeCtx, ZeDev, &ModuleDesc, &Object, &Log);
+  zeStatus = zeModuleCreate(ZeCtx, ZeDev, &Desc, &Object, &Log);
   auto end = std::chrono::high_resolution_clock::now();
   std::chrono::duration<double> elapsed = end - start;
-  if (cached)
+
+  if (Cached && zeStatus != ZE_RESULT_SUCCESS) {
+    // The driver refused the cached native binary. Reject it and recompile
+    // from IL instead of failing the application.
+    cache::logOutcome("level0", CacheKey, cache::Outcome::Rejected,
+                      "zeModuleCreate");
+    dumpBuildLog(std::move(Log));
+    Cached = cache::Entry();
+    Desc = BuildDesc;
+    zeStatus = zeModuleCreate(ZeCtx, ZeDev, &Desc, &Object, &Log);
+  }
+
+  if (Cached)
     logTrace("Loaded from cache, zeModuleCreate took {} seconds",
              elapsed.count());
   else
-    logTrace("zeModulerCeate took {} seconds", elapsed.count());
-  dumpBuildLog(std::move(Log));
+    logTrace("zeModuleCreate took {} seconds", elapsed.count());
+  std::string BuildLog = dumpBuildLog(std::move(Log));
 
   CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeModuleCreate);
+
+  // Some Level Zero drivers compile lazily: zeModuleCreate returns SUCCESS but
+  // the build log reports a fatal error (e.g. "backend compiler failed build"
+  // for a kernel using double on a GPU without native FP64 when DP emulation is
+  // off). A subsequent zeModuleGetKernelNames on such a half-built module
+  // segfaults inside the driver, so surface the failure as a clean error here
+  // instead of proceeding.
+  if (BuildLog.find("backend compiler failed build") != std::string::npos)
+    CHIPERR_LOG_AND_THROW("Level Zero module build failed:\n" + BuildLog,
+                          hipErrorInvalidImage);
+
   logTrace("LZ CREATE MODULE via calling zeModuleCreate {} ",
            resultToString(zeStatus));
 
-  if (!cached)
-    save(ModuleDesc, Object, device);
+  if (Cached)
+    cache::logOutcome("level0", CacheKey, cache::Outcome::Hit, "");
+  // The store happens in compile(), not here: the module has not yet passed
+  // the unlinked-module probe, and only a module known to link may be cached.
+  if (WasCachedOut)
+    *WasCachedOut = static_cast<bool>(Cached);
 
   return Object;
 }
@@ -3171,9 +3485,16 @@ void CHIPModuleLevel0::compile(chipstar::Device *ChipDev) {
                                  // description is provided.
                                  0, nullptr, nullptr, nullptr};
 
+  // Key the compile request once, up front. The relink fallback below
+  // passes no key to its inner compileIL calls: those build intermediate
+  // objects, not the artifact this key names.
+  std::string CacheKey = computeLevel0CacheKey(&ProgramDesc, LzDev);
+
   auto *ChipCtxLz = static_cast<CHIPContextLevel0 *>(ChipDev->getContext());
   auto start = std::chrono::high_resolution_clock::now();
-  ZeModule_ = compileIL(ChipCtxLz->get(), LzDev->get(), ModuleDesc, LzDev);
+  bool WasCached = false;
+  ZeModule_ = compileIL(ChipCtxLz->get(), LzDev->get(), ModuleDesc, LzDev,
+                        CacheKey, &WasCached);
   auto end = std::chrono::high_resolution_clock::now();
   std::chrono::duration<double, std::milli> duration = end - start;
 
@@ -3222,7 +3543,7 @@ void CHIPModuleLevel0::compile(chipstar::Device *ChipDev) {
         compileIL(ChipCtxLz->get(), LzDev->get(), MainModuleDesc, LzDev);
     if (!MainModule) {
       CHIPERR_LOG_AND_THROW("Failed to create main module in fallback",
-                            hipErrorTbd);
+                            hipErrorSharedObjectInitFailed);
     }
 
     // Create device library modules (remaining inputs)
@@ -3239,8 +3560,9 @@ void CHIPModuleLevel0::compile(chipstar::Device *ChipDev) {
         for (auto LibMod : DeviceLibModules) {
           zeModuleDestroy(LibMod);
         }
-        CHIPERR_LOG_AND_THROW("Failed to create device library module in fallback",
-                              hipErrorTbd);
+        CHIPERR_LOG_AND_THROW(
+            "Failed to create device library module in fallback",
+            hipErrorSharedObjectInitFailed);
       }
       DeviceLibModules.push_back(LibModule);
     }
@@ -3262,21 +3584,33 @@ void CHIPModuleLevel0::compile(chipstar::Device *ChipDev) {
       LinkedDeviceLibModules_ = std::move(DeviceLibModules);
     } else {
       logWarn("Fallback module linking failed: {}", resultToString(zeStatus));
+      std::string LinkLogText;
       if (LinkLog) {
-        dumpBuildLog(std::move(LinkLog));
+        LinkLogText = dumpBuildLog(std::move(LinkLog));
       }
       // Clean up
       zeModuleDestroy(MainModule);
       for (auto LibModule : DeviceLibModules) {
         zeModuleDestroy(LibModule);
       }
-      CHIPERR_CHECK_LOG_AND_THROW_TABLE(zeModuleDynamicLink);
+      CHIPERR_LOG_AND_THROW("Fallback module linking failed: " +
+                                resultToString(zeStatus) + "\n" + LinkLogText,
+                            hipErrorSharedObjectInitFailed);
     }
   }
 
   if (!ZeModule_) {
-    CHIPERR_LOG_AND_THROW("Module is null after compilation", hipErrorTbd);
+    CHIPERR_LOG_AND_THROW("Module is null after compilation",
+                          hipErrorSharedObjectInitFailed);
   }
+
+  // Persist only a module that is known good: the unlinked-module probe has
+  // run, and on the multi-input path a module that failed it has been
+  // replaced by the fallback. The fallback result itself is deliberately
+  // not cached: whether a dynamically linked module's native binary is
+  // independently reloadable is unverified.
+  if (!WasCached && !ModuleNeedsRelink)
+    storeModule(ZeModule_, CacheKey);
 
   uint32_t KernelCount = 0;
   zeStatus = zeModuleGetKernelNames(ZeModule_, &KernelCount, nullptr);
@@ -3411,6 +3745,17 @@ void CHIPExecItemLevel0::setupAllArgs() {
                                           sizeof(void *), &SpillSlot);
       break;
     }
+    case SPVTypeKind::DeviceGlobal: {
+      // Implicit arg carrying the device address of a __device__/__constant__
+      // global (globals-as-kernel-args lowering). Bind it to the global's
+      // allocated storage.
+      void *DevPtr = chipstar::getDeviceGlobalArgAddr(Kernel, Arg);
+      logTrace("setArg {} for device global '{}' -> {}", Arg.Index,
+               Arg.DevGlobalName, DevPtr);
+      zeStatus = zeKernelSetArgumentValue(Kernel->get(), Arg.Index,
+                                          sizeof(void *), &DevPtr);
+      break;
+    }
     default:
       CHIPERR_LOG_AND_ABORT(
           "Internal chipStar error: CHIPExecItemLevel0::setupAllArgs Unknown "
@@ -3433,3 +3778,23 @@ void CHIPExecItemLevel0::setKernel(chipstar::Kernel *Kernel) {
 }
 
 chipstar::Kernel *CHIPExecItemLevel0::getKernel() { return ChipKernel_; }
+
+void CHIPExecItemLevel0::takeOwnedKernelClone() {
+  // Replace the (shared) kernel with an independent clone that this exec item
+  // owns and destroys, so argument bindings are private to this exec item
+  // (issue #782). The original shared kernel is left untouched.
+  ChipKernel_ = ChipKernel_->clone();
+  OwnsKernel_ = true;
+}
+
+chipstar::ExecItem *CHIPExecItemLevel0::clone() const {
+  auto *NewExecItem = new CHIPExecItemLevel0(*this);
+  // Give the clone its own ze_kernel_handle_t so that a duplicated graph (e.g.
+  // hipGraphClone) does not share argument state with the original (#782).
+  NewExecItem->takeOwnedKernelClone();
+  // Force argument (re)binding onto the freshly cloned handle at launch time;
+  // the copy constructor inherited ArgsSetup from the source which may have
+  // already bound arguments to the original handle.
+  NewExecItem->ArgsSetup = false;
+  return NewExecItem;
+}

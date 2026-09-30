@@ -28,6 +28,7 @@
 #include <memory>
 #include <vector>
 #include <functional>
+#include <string>
 #include <string_view>
 
 enum class SPVTypeKind : unsigned {
@@ -47,6 +48,10 @@ enum class SPVTypeKind : unsigned {
   DeviceGlobalHidden, // Phase H4: hidden pointer arg synthesised by
                       // HIPSPVLowerToHLSLShape to bind a `__device__`
                       // global as a per-kernel kernel-arg buffer.
+  DeviceGlobal, // An implicit trailing pointer argument carrying the device
+                // address of a __device__/__constant__ global variable (used on
+                // drivers that can't consume program-scope globals, e.g.
+                // rusticl). DevGlobalName names the global; no client arg.
 
   // Should not appear in kernel parameter lists.
   Opaque, // The type is an unresolved, special SPIR-V type.
@@ -65,6 +70,9 @@ struct SPVArgTypeInfo {
   SPVTypeKind Kind;
   SPVStorageClass StorageClass;
   size_t Size;
+  /// For Kind==DeviceGlobal: the name of the device global whose address this
+  /// implicit argument carries. Empty otherwise.
+  std::string DevGlobalName;
   /// Optional override for the OpenCL kernel argument index passed to
   /// clSetKernelArg. When negative, the visitor uses the linear ordinal
   /// position in ArgTypeInfo_ (matching the OpenCL kernel signature).

@@ -21,6 +21,7 @@
  */
 
 #include "CHIPBackend.hh"
+#include "ModuleCache.hh"
 #include <atomic>
 
 // Definition of thread_local static member (required when not using 'inline')
@@ -54,6 +55,23 @@ static void queueKernel(chipstar::Queue *Q, chipstar::Kernel *K,
   delete EI;
 }
 
+/// Launch geometry for a grid-stride init kernel writing up to Bytes bytes.
+static void getVarInitLaunchGeometry(chipstar::Device *Dev,
+                                     chipstar::Kernel *Kern, size_t Bytes,
+                                     dim3 &GridDim, dim3 &BlockDim) {
+  size_t BlockSize = 256;
+  hipFuncAttributes Attrs{};
+  if (Kern->getAttributes(&Attrs) == hipSuccess && Attrs.maxThreadsPerBlock > 0)
+    BlockSize = std::min<size_t>(BlockSize, Attrs.maxThreadsPerBlock);
+  size_t NumBlocks = std::min<size_t>(Bytes / 8 / BlockSize + 1, 1024);
+  NumBlocks =
+      std::min<size_t>(NumBlocks, Dev->getAttr(hipDeviceAttributeMaxGridDimX));
+  GridDim = dim3(NumBlocks, 1, 1);
+  BlockDim = dim3(BlockSize, 1, 1);
+  logTrace("Device variable init geometry: {} bytes -> grid={} block={}", Bytes,
+           GridDim.x, BlockDim.x);
+}
+
 /// Queue a shadow kernel for binding a device variable (a pointer) to
 /// the given allocation.
 static void queueVariableInfoShadowKernel(chipstar::Queue *Q,
@@ -78,9 +96,14 @@ static void queueVariableBindShadowKernel(chipstar::Queue *Q,
   assert(M && Var);
   auto *DevPtr = Var->getDevAddr();
   assert(DevPtr && "Space has not be allocated for a variable.");
-  auto *K = M->getKernelByName(std::string(ChipVarBindPrefix) +
-                               std::string(Var->getName()));
-  assert(K && "chipstar::Module is missing a shadow kernel?");
+  // Use the non-throwing findKernel(): when device globals are lowered to
+  // kernel arguments (rusticl path), the bind shadow kernels are removed
+  // because there is no program-scope global to bind — the address travels as
+  // an implicit kernel argument instead.
+  auto *K = M->findKernel(std::string(ChipVarBindPrefix) +
+                          std::string(Var->getName()));
+  if (!K)
+    return;
   void *Args[] = {&DevPtr};
   queueKernel(Q, K, Args);
 }
@@ -92,7 +115,29 @@ static void queueVariableInitShadowKernel(chipstar::Queue *Q,
   auto *K = M->getKernelByName(std::string(ChipVarInitPrefix) +
                                std::string(Var->getName()));
   assert(K && "chipstar::Module is missing a shadow kernel?");
-  queueKernel(Q, K);
+  dim3 GridDim, BlockDim;
+  if (Var->hasGridStrideInit())
+    getVarInitLaunchGeometry(Q->getDevice(), K, Var->getSize(), GridDim,
+                             BlockDim);
+  if (K->getFuncInfo()->getNumKernelArgs() == 1) {
+    // Globals-as-kernel-args lowering: the init kernel takes the storage
+    // address as its argument instead of reading a program-scope global.
+    auto *DevPtr = Var->getDevAddr();
+    void *Args[] = {&DevPtr};
+    queueKernel(Q, K, Args, GridDim, BlockDim);
+  } else
+    queueKernel(Q, K, nullptr, GridDim, BlockDim);
+}
+
+void *chipstar::getDeviceGlobalArgAddr(chipstar::Kernel *Kernel,
+                                       const SPVFuncInfo::KernelArg &Arg) {
+  auto *Var = Kernel->getModule()->getGlobalVar(Arg.DevGlobalName.c_str());
+  if (!Var || !Var->getDevAddr())
+    CHIPERR_LOG_AND_THROW(
+        "DeviceGlobal kernel arg references an unallocated global: " +
+            Arg.DevGlobalName,
+        hipErrorLaunchFailure);
+  return Var->getDevAddr();
 }
 
 static void initDeviceHeap(chipstar::Queue *Q, chipstar::Module *M) {
@@ -208,11 +253,7 @@ void chipstar::AllocationTracker::recordAllocation(
     void *DevPtr, void *HostPtr, hipDevice_t Device, size_t Size,
     chipstar::HostAllocFlags Flags, hipMemoryType MemoryType) {
   chipstar::AllocationInfo *AllocInfo = new chipstar::AllocationInfo{
-      DevPtr, HostPtr, Size, Flags, Flags, Device, false, MemoryType};
-  // Assign a process-unique buffer id used by
-  // hipPointerGetAttribute(HIP_POINTER_ATTRIBUTE_BUFFER_ID).
-  static std::atomic<uint64_t> NextBufferId{1};
-  AllocInfo->BufferId = NextBufferId.fetch_add(1, std::memory_order_relaxed);
+      DevPtr, HostPtr, Size, Flags, Device, false, MemoryType};
   LOCK(AllocationTrackerMtx); // writing chipstar::AllocTracker::PtrToAllocInfo_
                               // chipstar::AllocTracker::AllocInfos_
   // TODO AllocInfo turned into class and constructor take care of this
@@ -257,22 +298,20 @@ chipstar::AllocationTracker::getAllocInfoCheckPtrRanges(void *DevPtr) {
   // Note: This function is called from within a locked context
 
   // upper_bound gives the first entry with key > DevPtr; step back one to get
-  // the candidate whose start address is <= DevPtr, then range-check it.
-  // PtrToAllocInfo_ may contain both DevPtr- and HostPtr-keyed entries for
-  // the same allocation; the key we stepped back to is the actual base
-  // address of the range we have to check against (not blindly
-  // AllocInfo->DevPtr, which may belong to an unrelated mapping).
+  // the candidate whose start address is <= DevPtr, then range-check it. The
+  // key is the start of either the host or the device range of the record, so
+  // the range is measured from the key: a hipHostRegister'ed record has a host
+  // range at a different address than its device range, and no device range
+  // at all until hipHostGetDevicePointer creates the backing.
   const auto It = PtrToAllocInfo_.upper_bound(DevPtr);
   if (It == PtrToAllocInfo_.cbegin())
     return nullptr;
 
-  auto PrevIt = std::prev(It);
-  void *Base = PrevIt->first;
-  chipstar::AllocationInfo *AllocInfo = PrevIt->second;
-  void *End = static_cast<char *>(Base) + AllocInfo->Size;
+  const auto &Candidate = *std::prev(It);
+  void *End = static_cast<char *>(Candidate.first) + Candidate.second->Size;
 
-  if (DevPtr >= Base && DevPtr < End)
-    return AllocInfo;
+  if (DevPtr < End)
+    return Candidate.second;
 
   return nullptr;
 }
@@ -381,6 +420,38 @@ chipstar::DeviceVar *chipstar::Module::getGlobalVar(const char *VarName) {
   }
 
   return *VarFound;
+}
+
+void chipstar::Module::addUnregisteredDeviceVariables() {
+  // A __chip_var_info_<X> shadow kernel means HipGlobalVariables.cpp lowered X
+  // into a __chip_var_addr_<X> address slot: the module's code reads X via the
+  // slot and __chip_var_init_all writes X's initializer through it, so the
+  // slot must be bound to storage before the module's first launch whether or
+  // not the host registered X. clang emits no __hipRegisterVar for a
+  // function-local static __device__ variable, for an inline __device__
+  // variable or a template static data member that host code does not ODR-use
+  // (clang/lib/CodeGen/CGCUDANV.cpp, handleVarRegistration), or for any
+  // variable of a code object loaded through hipModuleLoadData. Such
+  // variables have no host pointer; they are looked up by name only.
+  static int NoHostPtr = 0;
+  for (auto *Kernel : ChipKernels_) {
+    const std::string &KernelName = Kernel->getName();
+    if (KernelName.rfind(ChipVarInfoPrefix, 0) != 0)
+      continue;
+    std::string VarName = KernelName.substr(strlen(ChipVarInfoPrefix));
+    bool HasVar = std::any_of(ChipVars_.begin(), ChipVars_.end(),
+                              [&VarName](chipstar::DeviceVar *Var) {
+                                return Var->getName() == VarName;
+                              });
+    if (HasVar)
+      continue;
+    logTrace("Device variable {} has no host registration in module {}, "
+             "binding it from its shadow kernels",
+             VarName, (void *)this);
+    UnregisteredVars_.push_back(std::make_unique<SPVVariable>(SPVVariable{
+        {const_cast<SPVModule *>(Src_), HostPtr(&NoHostPtr), VarName}, 0}));
+    addDeviceVariable(new chipstar::DeviceVar(UnregisteredVars_.back().get()));
+  }
 }
 
 hipError_t
@@ -506,6 +577,7 @@ chipstar::Module::allocateDeviceVariablesNoLock(chipstar::Device *Device,
     Var->setDevAddr(
         Ctx->allocate(Size, Alignment, hipMemoryType::hipMemoryTypeDevice));
     Var->markHasInitializer(HasInitializer);
+    Var->setInitKind((*VarInfo.second)[2]);
     // Sanity check for object sizes reported by the shadow kernels vs
     // __hipRegisterVar. For device-only variables, we don't have __hipRegisterVar
     // so the size is 0 - update it from the shadow kernel.
@@ -565,31 +637,61 @@ void chipstar::Module::prepareDeviceVariablesNoLock(chipstar::Device *Device,
   logTrace("Initialize device variables in module: {}", (void *)this);
 
   bool QueuedKernels = false;
-  for (auto *Var : ChipVars_) {
-    logTrace("Checking variable '{}' for initialization: hasInitializer={}",
-             Var->getName(), Var->hasInitializer());
-    if (!Var->hasInitializer())
-      continue;
-    // Phase I3 (Vulkan path): if we recovered the initializer bytes from
-    // the SPV OpName encoding, re-seed the device buffer via memCopyAsync
-    // rather than launching the shadow init kernel (which doesn't exist
-    // in the bridging-pass-rewritten module). This is the hipDeviceReset
-    // re-init path: allocate left the buffer alone (no free/realloc) but
-    // cleared `DeviceVariablesInitialized_`, so we must restore the
-    // declaration-time initializer here.
-    const auto &Init = Var->getInitData();
-    if (!Init.empty() && Var->getDevAddr()) {
-      size_t CopyN = std::min(Init.size(), Var->getSize());
-      logTrace("Re-seeding variable '{}' from cached InitData ({} bytes)",
-               Var->getName(), CopyN);
-      Queue->memCopyAsync(Var->getDevAddr(), Init.data(), CopyN,
-                          hipMemcpyHostToDevice);
+  const char Zero = 0;
+  for (auto *Var : ChipVars_)
+    if (Var->isHostFilled()) {
+      Queue->memFillAsync(Var->getDevAddr(), Var->getSize(), &Zero, 1);
       QueuedKernels = true;
-      continue;
     }
-    logTrace("Initializing variable '{}'", Var->getName());
-    queueVariableInitShadowKernel(Queue, this, Var);
+  // Fast path (#582): the program-scope-globals lowering emits a single
+  // combined init kernel that initializes ALL variables in one launch, instead
+  // of one single-work-item init kernel per variable. Launch it once when
+  // present; otherwise fall back to the per-variable init kernels (used by the
+  // globals-as-kernel-args/rusticl lowering).
+  auto *CombinedInitKernel = findKernel(ChipVarInitAllName);
+  // Reject the per-variable init kernel of a variable named `all`.
+  if (CombinedInitKernel &&
+      (CombinedInitKernel->getFuncInfo()->getNumKernelArgs() != 0 ||
+       std::count_if(ChipKernels_.begin(), ChipKernels_.end(),
+                     [](chipstar::Kernel *K) {
+                       return K->getName().rfind(ChipVarInitPrefix, 0) == 0;
+                     }) > 1))
+    CombinedInitKernel = nullptr;
+  if (CombinedInitKernel) {
+    logTrace("Initializing all device variables via combined init kernel");
+    // Only grid-stride init kernels may run on more than one work item.
+    bool GridStride = true;
+    size_t MaxBytes = 0;
+    for (auto *Var : ChipVars_)
+      if (Var->hasInitializer() && !Var->isHostFilled()) {
+        GridStride &= Var->hasGridStrideInit();
+        MaxBytes = std::max(MaxBytes, Var->getSize());
+      }
+    dim3 GridDim, BlockDim;
+    if (GridStride)
+      getVarInitLaunchGeometry(Queue->getDevice(), CombinedInitKernel, MaxBytes,
+                               GridDim, BlockDim);
+    queueKernel(Queue, CombinedInitKernel, nullptr, GridDim, BlockDim);
     QueuedKernels = true;
+  } else {
+    for (auto *Var : ChipVars_) {
+      logTrace("Checking variable '{}' for initialization: hasInitializer={}",
+               Var->getName(), Var->hasInitializer());
+      if (!Var->hasInitializer() || Var->isHostFilled())
+        continue;
+      // Vulkan path: no shadow init kernel; copy the reflected initializer.
+      const auto &Init = Var->getInitData();
+      if (!Init.empty() && Var->getDevAddr()) {
+        Queue->memCopyAsync(Var->getDevAddr(), Init.data(),
+                            std::min(Init.size(), Var->getSize()),
+                            hipMemcpyHostToDevice);
+        QueuedKernels = true;
+        continue;
+      }
+      logTrace("Initializing variable '{}'", Var->getName());
+      queueVariableInitShadowKernel(Queue, this, Var);
+      QueuedKernels = true;
+    }
   }
 
   // Launch kernel for resetting host-inaccessible global device variables.
@@ -733,6 +835,7 @@ chipstar::Device::~Device() {
     for (auto &Kv : SrcModToCompiledMod_)
       delete Kv.second;
     SrcModToCompiledMod_.clear();
+    FailedSrcMods_.clear();
   }
 }
 
@@ -1001,12 +1104,7 @@ int chipstar::Device::getAttr(hipDeviceAttribute_t Attr) const {
     return Prop.pageableMemoryAccessUsesHostPageTables;
     break;
   case hipDeviceAttributeCanUseStreamWaitValue:
-    // hipStreamWaitValue64() and hipStreamWaitValue32() support
-    // return g_devices[device]->devices()[0]->info().aqlBarrierValue_;
-    CHIPERR_LOG_AND_THROW(
-        "Device::getAttr(hipDeviceAttributeCanUseStreamWaitValue path "
-        "unimplemented",
-        hipErrorTbd);
+    return 0; // Not supported
     break;
   case hipDeviceAttributeUnifiedAddressing:
     return Prop.unifiedAddressing;
@@ -1014,9 +1112,152 @@ int chipstar::Device::getAttr(hipDeviceAttribute_t Attr) const {
   case hipDeviceAttributeMemoryPoolsSupported:
     return Prop.memoryPoolsSupported;
     break;
+  case hipDeviceAttributeAccessPolicyMaxWindowSize:
+    return Prop.accessPolicyMaxWindowSize;
+    break;
+  case hipDeviceAttributeAsyncEngineCount:
+    return Prop.asyncEngineCount;
+    break;
+  case hipDeviceAttributeCanUseHostPointerForRegisteredMem:
+    return Prop.canUseHostPointerForRegisteredMem;
+    break;
+  case hipDeviceAttributeComputePreemptionSupported:
+    return Prop.computePreemptionSupported;
+    break;
+  case hipDeviceAttributeDeviceOverlap:
+    return Prop.deviceOverlap;
+    break;
+  case hipDeviceAttributeGlobalL1CacheSupported:
+    return Prop.globalL1CacheSupported;
+    break;
+  case hipDeviceAttributeHostNativeAtomicSupported:
+    return Prop.hostNativeAtomicSupported;
+    break;
+  case hipDeviceAttributeLocalL1CacheSupported:
+    return Prop.localL1CacheSupported;
+    break;
+  case hipDeviceAttributeMaxBlocksPerMultiProcessor:
+    return Prop.maxBlocksPerMultiProcessor;
+    break;
+  case hipDeviceAttributeMaxRegistersPerMultiprocessor:
+    return Prop.regsPerMultiprocessor;
+    break;
+  case hipDeviceAttributeMaxTexture1DLayered:
+    return Prop.maxTexture1DLayered[0];
+    break;
+  case hipDeviceAttributeMaxTexture1DMipmap:
+    return Prop.maxTexture1DMipmap;
+    break;
+  case hipDeviceAttributeMaxTexture2DGather:
+    return Prop.maxTexture2DGather[0];
+    break;
+  case hipDeviceAttributeMaxTexture2DLayered:
+    return Prop.maxTexture2DLayered[0];
+    break;
+  case hipDeviceAttributeMaxTexture2DMipmap:
+    return Prop.maxTexture2DMipmap[0];
+    break;
+  case hipDeviceAttributeMaxTexture3DAlt:
+    return Prop.maxTexture3DAlt[0];
+    break;
+  case hipDeviceAttributeMaxTextureCubemap:
+    return Prop.maxTextureCubemap;
+    break;
+  case hipDeviceAttributeMaxTextureCubemapLayered:
+    return Prop.maxTextureCubemapLayered[0];
+    break;
+  case hipDeviceAttributeMaxSurface1D:
+    return Prop.maxSurface1D;
+    break;
+  case hipDeviceAttributeMaxSurface1DLayered:
+    return Prop.maxSurface1DLayered[0];
+    break;
+  case hipDeviceAttributeMaxSurface2D:
+    return Prop.maxSurface2D[0];
+    break;
+  case hipDeviceAttributeMaxSurface2DLayered:
+    return Prop.maxSurface2DLayered[0];
+    break;
+  case hipDeviceAttributeMaxSurface3D:
+    return Prop.maxSurface3D[0];
+    break;
+  case hipDeviceAttributeMaxSurfaceCubemap:
+    return Prop.maxSurfaceCubemap;
+    break;
+  case hipDeviceAttributeMaxSurfaceCubemapLayered:
+    return Prop.maxSurfaceCubemapLayered[0];
+    break;
+  case hipDeviceAttributeMultiGpuBoardGroupID:
+    return Prop.multiGpuBoardGroupID;
+    break;
+  case hipDeviceAttributePciDomainId:
+    return Prop.pciDomainID;
+    break;
+  case hipDeviceAttributePersistingL2CacheMaxSize:
+    return Prop.persistingL2CacheMaxSize;
+    break;
+  case hipDeviceAttributeReservedSharedMemPerBlock:
+    return static_cast<int>(Prop.reservedSharedMemPerBlock);
+    break;
+  case hipDeviceAttributeSharedMemPerBlockOptin:
+    return static_cast<int>(Prop.sharedMemPerBlockOptin);
+    break;
+  case hipDeviceAttributeSharedMemPerMultiprocessor:
+    return static_cast<int>(Prop.sharedMemPerMultiprocessor);
+    break;
+  case hipDeviceAttributeSingleToDoublePrecisionPerfRatio:
+    return Prop.singleToDoublePrecisionPerfRatio;
+    break;
+  case hipDeviceAttributeStreamPrioritiesSupported:
+    return Prop.streamPrioritiesSupported;
+    break;
+  case hipDeviceAttributeSurfaceAlignment:
+    return static_cast<int>(Prop.surfaceAlignment);
+    break;
+  case hipDeviceAttributeTccDriver:
+    return Prop.tccDriver;
+    break;
+  case hipDeviceAttributeTotalGlobalMem:
+    return static_cast<int>(Prop.totalGlobalMem / (1024 * 1024)); // MB
+    break;
+  case hipDeviceAttributeVirtualMemoryManagementSupported:
+    return 0; // Not supported
+    break;
+  case hipDeviceAttributeHostRegisterSupported:
+    return Prop.hostRegisterSupported;
+    break;
+  case hipDeviceAttributeMemoryPoolSupportedHandleTypes:
+    return static_cast<int>(Prop.memoryPoolSupportedHandleTypes);
+    break;
+  case hipDeviceAttributePhysicalMultiProcessorCount:
+    return Prop.multiProcessorCount;
+    break;
+  case hipDeviceAttributeClockInstructionRate:
+    return Prop.clockRate; // Approximate with clock rate
+    break;
+  case hipDeviceAttributeImageSupport:
+    return 0; // Not supported in chipStar
+    break;
+  case hipDeviceAttributeMaxThreadsDim:
+    return Prop.maxThreadsDim[0];
+    break;
+  case hipDeviceAttributeHostNumaId:
+    return -1; // NUMA not supported
+    break;
+  case hipDeviceAttributeIsLargeBar:
+    return 0;
+    break;
+  case hipDeviceAttributeFineGrainSupport:
+    return 0;
+    break;
+  case hipDeviceAttributeWallClockRate:
+    return Prop.clockRate;
+    break;
   default:
-    CHIPERR_LOG_AND_THROW("Device::getAttr asked for an unkown attribute",
-                          hipErrorInvalidValue);
+    CHIPERR_LOG_AND_THROW(
+        "Device::getAttr asked for an unknown attribute: " +
+            std::to_string(static_cast<int>(Attr)),
+        hipErrorInvalidValue);
   }
   return -1;
 }
@@ -1091,28 +1332,25 @@ int chipstar::Device::getPeerAccess(chipstar::Device *PeerDevice) {
 }
 
 void chipstar::Device::setCacheConfig(hipFuncCache_t Cfg) {
-  // chipStar doesn't actually steer the L1/shared split per-device — the
-  // backend has no equivalent control — but CUDA/HIP semantics permit
-  // accepting and remembering the hint so the matching get* call returns
-  // what the user set. Real cache behavior is unchanged.
+  // No reconfigurable cache on chipStar targets; store the hint so
+  // hipDeviceGetCacheConfig can round-trip it, and report success.
   CacheConfig_ = Cfg;
 }
 
 void chipstar::Device::setFuncCacheConfig(const void *Func,
                                           hipFuncCache_t Cfg) {
-  // No-op: CUDA/HIP define this as a hint and AMD docs explicitly state
-  // it has no effect. Returning success lets apps that always set a hint
-  // proceed normally.
+  UNIMPLEMENTED();
 }
 
-hipFuncCache_t chipstar::Device::getCacheConfig() { return CacheConfig_; }
+hipFuncCache_t chipstar::Device::getCacheConfig() {
+  // HIP contract: hipDeviceGetCacheConfig returns hipSuccess and the cache
+  // hint is simply ignored on architectures without a reconfigurable cache.
+  // Echo back the last hint set via setCacheConfig (default PreferNone).
+  return CacheConfig_;
+}
 
 hipSharedMemConfig chipstar::Device::getSharedMemConfig() {
-  // HIP/CUDA semantics on non-Kepler GPUs: the bank-size selector is
-  // ignored and the device reports the natural FourByte mode. Returning
-  // BankSizeDefault made several catch tests fail (they explicitly
-  // require FourByte on non-Kepler). Match the documented behaviour.
-  return hipSharedMemBankSizeFourByte;
+  return hipSharedMemBankSizeDefault;
 }
 
 void chipstar::Device::removeContext(chipstar::Context *Context) {}
@@ -1196,36 +1434,9 @@ void chipstar::Device::registerModuleVariables(chipstar::Module *ChipModule,
     DeviceVarLookup_.insert(std::make_pair(Info.Ptr, Var));
   }
 
-  // For hipRTC modules, discover variables from shadow kernels
-  // (SrcMod->Variables is empty for hipRTC)
-  if (SrcMod->Variables.empty()) {
-    auto &Kernels = ChipModule->getKernels();
-
-    // Create fake SPVVariables for hipRTC - these will be owned by SrcMod
-    auto *MutableSrcMod = const_cast<SPVModule *>(SrcMod);
-
-    for (auto *Kernel : Kernels) {
-      std::string KernelName = Kernel->getName();
-
-      // Look for variable info shadow kernels
-      if (KernelName.find(ChipVarInfoPrefix) == 0) {
-        // Extract variable name from __chip_var_info_<varname>
-        std::string VarName = KernelName.substr(strlen(ChipVarInfoPrefix));
-
-        // Create fake SPVVariable for hipRTC - add to SrcMod's Variables list
-        // Use a dummy host pointer since hipRTC variables don't have real host
-        // pointers
-        void *DummyPtr = reinterpret_cast<void *>(
-            static_cast<uintptr_t>(0x1000 + MutableSrcMod->Variables.size()));
-        MutableSrcMod->Variables.emplace_back(
-            SPVVariable{{MutableSrcMod, HostPtr(DummyPtr), VarName}, 0});
-
-        // Now register this variable with the module
-        auto *Var = new chipstar::DeviceVar(&MutableSrcMod->Variables.back());
-        ChipModule->addDeviceVariable(Var);
-      }
-    }
-  }
+  // hipRTC and hipModuleLoadData code objects have no host registration at
+  // all; a HIP fat binary may still carry variables the host did not register.
+  ChipModule->addUnregisteredDeviceVariables();
 }
 
 void chipstar::Device::invalidateDeviceVariables() {
@@ -1334,69 +1545,14 @@ chipstar::Module *chipstar::Device::getOrCreateModule(HostPtr Ptr) {
     HostPtrToCompiledMod_[Info.Ptr] = Mod;
   }
 
-  // Discover device-only variables (e.g., template instantiations) that weren't
-  // registered via __hipRegisterVar. These have shadow kernels but no host symbol.
-  // Static variables protected by DeviceVarMtx to ensure thread safety.
-  static int DummyHostPtr = 0;
-  // Use unique_ptr for automatic cleanup when the program exits
-  static std::vector<std::unique_ptr<SPVVariable>> SyntheticVars;
-
   {
-    LOCK(DeviceVarMtx); // Protect static SyntheticVars from concurrent access
-    for (auto *Kernel : Mod->getKernels()) {
-      const std::string &KernelName = Kernel->getName();
-      size_t PrefixLen = strlen(ChipVarInfoPrefix);
+    LOCK(DeviceVarMtx); // chipstar::Module::ChipVars_
+    Mod->addUnregisteredDeviceVariables();
 
-      // Check if this is a variable info shadow kernel
-      if (KernelName.length() <= PrefixLen ||
-          KernelName.substr(0, PrefixLen) != ChipVarInfoPrefix)
-        continue;
-
-      // Extract variable name
-      std::string VarName = KernelName.substr(PrefixLen);
-
-      // Check if we already processed this variable
-      bool AlreadyRegistered = false;
-      for (const auto &Info : SrcMod->Variables) {
-        std::string NameTmp(Info.Name.begin(), Info.Name.end());
-        if (NameTmp == VarName) {
-          AlreadyRegistered = true;
-          break;
-        }
-      }
-
-      if (AlreadyRegistered)
-        continue;
-
-      // Check if already in SyntheticVars (another thread may have added it)
-      bool AlreadySynthesized = false;
-      for (const auto &SV : SyntheticVars) {
-        if (SV->Name == VarName) {
-          AlreadySynthesized = true;
-          break;
-        }
-      }
-      if (AlreadySynthesized)
-        continue;
-
-      // This is a device-only variable - create a DeviceVar for it
-      logTrace("Found device-only variable: {} (no host symbol)", VarName);
-
-      // Create a synthetic SPVVariable for this device-only variable
-      // Use aggregate initialization since SPVVariable has no default constructor
-      auto *RawVar = new SPVVariable{
-          {const_cast<SPVModule *>(SrcMod), HostPtr(&DummyHostPtr), VarName}, 0};
-      std::unique_ptr<SPVVariable> SyntheticVar(RawVar);
-
-      auto *Var = new chipstar::DeviceVar(SyntheticVar.get());
-      Mod->addDeviceVariable(Var);
-
-      // Store the synthetic variable so it persists (unique_ptr handles cleanup)
-      SyntheticVars.push_back(std::move(SyntheticVar));
-
-      // Note: We don't add to DeviceVarLookup_ since there's no host pointer
-    }
-
+    // Device globals recovered from Vulkan SPIR-V reflection that nothing
+    // above registered (template/function-static __device__ vars).
+    static int DummyHostPtr = 0;
+    static std::vector<std::unique_ptr<SPVVariable>> SyntheticVars;
     // Phase I3 (Vulkan path): synthesise DeviceVars for any
     // SPVModuleInfo::DeviceGlobal not yet registered via either the host
     // __hipRegisterVar entry above or the shadow-kernel synthesis just
@@ -1478,20 +1634,42 @@ chipstar::Module *chipstar::Device::getOrCreateModule(HostPtr Ptr) {
   return Mod;
 }
 
-/// Get compiled module for the source module 'SrcMod'.
+/// Get compiled module for the source module 'SrcMod'. A source whose
+/// compilation failed is not compiled again: the error of the first attempt
+/// is thrown on every later request.
 chipstar::Module *chipstar::Device::getOrCreateModule(const SPVModule &SrcMod) {
-  LOCK(DeviceVarMtx); // chipstar::Device::SrcModToCompiledMod_
-                      // chipstar::Device::HostPtrToCompiledMod_
-                      // chipstar::Device::DeviceVarLookup_
+  { // Check if we have already created, or already failed to create, the
+    // module for the source.
+    LOCK(DeviceVarMtx); // chipstar::Device::SrcModToCompiledMod_
+                        // chipstar::Device::FailedSrcMods_
+    if (SrcModToCompiledMod_.count(&SrcMod))
+      return SrcModToCompiledMod_[&SrcMod];
 
-  // Check if we have already created the module for the source.
-  if (SrcModToCompiledMod_.count(&SrcMod))
-    return SrcModToCompiledMod_[&SrcMod];
+    auto Failed = FailedSrcMods_.find(&SrcMod);
+    if (Failed != FailedSrcMods_.end()) {
+      CHIPError Err = Failed->second;
+      CHIPERR_LOG_AND_THROW("Module failed to compile earlier: " +
+                                Err.getMsgStr(),
+                            Err.toHIPError());
+    }
+  }
 
   logDebug("Compile module {}", static_cast<const void *>(&SrcMod));
 
+  // compile() runs with DeviceVarMtx released. It enters the backend compiler,
+  // which is free to block, throw, or terminate the process:
+  // SPIRV-LLVM-Translator calls exit() from inside clBuildProgram on a module
+  // it rejects, and the atexit path that runs then takes DeviceVarMtx again in
+  // deallocateDeviceVariables() on this same thread.
   auto start = std::chrono::high_resolution_clock::now();
-  auto *Module = compile(SrcMod);
+  chipstar::Module *Module = nullptr;
+  try {
+    Module = compile(SrcMod);
+  } catch (const CHIPError &Err) {
+    LOCK(DeviceVarMtx); // chipstar::Device::FailedSrcMods_
+    FailedSrcMods_.emplace(&SrcMod, Err);
+    throw;
+  }
   auto end = std::chrono::high_resolution_clock::now();
   auto duration =
       std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -1501,7 +1679,13 @@ chipstar::Module *chipstar::Device::getOrCreateModule(const SPVModule &SrcMod) {
     return nullptr;
   }
 
-  SrcModToCompiledMod_.insert(std::make_pair(&SrcMod, Module));
+  LOCK(DeviceVarMtx); // chipstar::Device::SrcModToCompiledMod_
+  // Every HIP entry point holds ApiMtx for the whole call, so compilation is
+  // single-entry per device and nothing can have inserted this source while
+  // DeviceVarMtx was released above.
+  auto Insertion = SrcModToCompiledMod_.insert(std::make_pair(&SrcMod, Module));
+  assert(Insertion.second && "ApiMtx should keep module compilation single-entry");
+  (void)Insertion; // Only read by the assert, which NDEBUG compiles away.
   return Module;
 }
 
@@ -1553,9 +1737,10 @@ void *chipstar::Context::allocate(size_t Size, size_t Alignment,
     return HostPtr;
   }
 
-  if (Size > ChipDev->getMaxMallocSize()) {
+  if (Size > ChipDev->getMaxMallocSize() && !chipUnrestrictedAllocSize()) {
     logCritical("Requested allocation of {} exceeds the maximum size of a "
-                "single allocation of {}",
+                "single allocation of {} (set CHIP_UNRESTRICTED_ALLOC_SIZE=1 "
+                "to allow larger allocations)",
                 Size, ChipDev->getMaxMallocSize());
     CHIPERR_LOG_AND_THROW(
         "Allocation size exceeds limits for a single allocation",
@@ -1586,50 +1771,25 @@ void chipstar::Context::reset() {
 
   auto Dev = getDevice();
 
-  // Wait for any in-flight commands to drain before freeing the underlying
-  // backend storage. Other threads may still hold references to the pointers
-  // we are about to release (Catch test
-  // Unit_hipStreamPerThread_DeviceReset_1 launches detached worker threads
-  // doing async copies while the main thread calls reset).
-  for (auto *Q : Dev->getQueuesNoLock()) {
-    if (Q)
-      Q->finish();
-  }
-  if (auto *DefaultQ = Dev->getDefaultQueue())
-    DefaultQ->finish();
+  // Properly free all allocations and clean up AllocationTracker
+  for (auto &Ptr : AllocatedPtrs_) {
+    // Get allocation info before freeing
+    chipstar::AllocationInfo *AllocInfo = Dev->AllocTracker->getAllocInfo(Ptr);
 
-  // Tear down device-side __device__/__constant__ variable allocations and
-  // null their device addresses so a subsequent prepareDeviceVariables call
-  // re-allocates them. Without this the AllocTracker drain below would free
-  // the backing memory while DeviceVar nodes still hold dangling pointers,
-  // and post-reset hipMemcpy{To,From}Symbol crashes (sample
-  // hipTestSymbolReset).
-  Dev->deallocateDeviceVariables();
+    // Free the memory
+    freeImpl(Ptr);
 
-  // Drain every recorded allocation belonging to this device. AllocatedPtrs_
-  // was never populated, so snapshot the AllocationTracker via the public
-  // visitor and ensure all device pointers handed to the user become
-  // invalid for the post-reset hipFree contract.
-  if (Dev->AllocTracker) {
-    std::vector<chipstar::AllocationInfo *> ToFree;
-    Dev->AllocTracker->visitAllocations(
-        [&](const chipstar::AllocationInfo &Info) {
-          ToFree.push_back(const_cast<chipstar::AllocationInfo *>(&Info));
-        });
-    for (auto *Info : ToFree) {
-      if (Info->MemoryType == hipMemoryTypeHost && Info->HostPtr &&
-          !Info->Flags.isMapped()) {
-        std::free(Info->HostPtr);
-      } else if (Info->DevPtr) {
-        freeImpl(Info->DevPtr);
-      }
-      Dev->AllocTracker->eraseRecord(Info);
+    // Remove from AllocationTracker to prevent double-allocation errors
+    if (AllocInfo) {
+      Dev->AllocTracker->eraseRecord(AllocInfo);
     }
-    Dev->AllocTracker->releaseMemReservation(Dev->AllocTracker->TotalMemSize);
   }
+
+  // Free all the memory reservations on each device
+  Dev->AllocTracker->releaseMemReservation(Dev->AllocTracker->TotalMemSize);
   AllocatedPtrs_.clear();
 
-  Dev->reset();
+  getDevice()->reset();
 }
 
 hipError_t chipstar::Context::free(void *Ptr) {
@@ -1763,7 +1923,14 @@ void chipstar::Backend::waitForThreadExit() {
   }
 }
 void chipstar::Backend::initialize() {
+  // Bracket backend init with loaded-library snapshots: this is the window
+  // in which the runtime driver loads its device compiler (NEO dlopens
+  // libigc during device enumeration), and the delta between the snapshots
+  // identifies runtime + compiler for the module cache key. See
+  // ModuleCache.hh.
+  auto MappedBefore = cache::snapshotMappedObjects();
   initializeImpl();
+  cache::recordLoaderDelta(MappedBefore);
   if (ChipContexts.size() == 0) {
     std::string Msg = "No CHIPContexts were initialized";
     CHIPERR_LOG_AND_THROW(Msg, hipErrorInitializationError);
@@ -1776,7 +1943,11 @@ void chipstar::Backend::initialize() {
 
 void chipstar::Backend::setActiveContext(chipstar::Context *ChipContext) {
   LOCK(::Backend->ActiveCtxMtx); // writing Backend::ChipCtxStack
-  ChipCtxStack.push(ChipContext);
+  // Replaces the top of the stack, as cuCtxSetCurrent does; null just pops.
+  if (!ChipCtxStack.empty())
+    ChipCtxStack.pop();
+  if (ChipContext)
+    ChipCtxStack.push(ChipContext);
 }
 
 void chipstar::Backend::setActiveDevice(chipstar::Device *ChipDevice) {
@@ -2208,29 +2379,80 @@ void chipstar::Queue::memCopy3DAsync(void *Dst, size_t DPitch, size_t DSPitch,
   ChipEvent->Msg = "memCopy3DAsync";
 }
 
-void chipstar::Queue::updateLastNode(CHIPGraphNode *NewNode) {
-  if (LastNode_ != nullptr) {
-    NewNode->addDependency(LastNode_);
-  }
-  // Consume any fork-in dependencies recorded by hipStreamWaitEvent during
-  // capture so the next node on this stream depends on the join points.
-  for (CHIPGraphNode *Dep : PendingCaptureDeps_) {
-    if (Dep && Dep != LastNode_)
-      NewNode->addDependency(Dep);
-  }
-  PendingCaptureDeps_.clear();
-  LastNode_ = NewNode;
+void chipstar::Queue::chainCaptureNode(CHIPGraphNode *NewNode) {
+  NewNode->addDependencies(CaptureDeps_);
+  CaptureDeps_ = {NewNode};
 }
 
-void chipstar::Queue::initCaptureGraph() { CaptureGraph_ = new CHIPGraph(); }
+void chipstar::Queue::addCaptureDependencies(
+    const std::vector<CHIPGraphNode *> &Nodes) {
+  for (auto *Node : Nodes)
+    if (std::find(CaptureDeps_.begin(), CaptureDeps_.end(), Node) ==
+        CaptureDeps_.end())
+      CaptureDeps_.push_back(Node);
+}
+
+void chipstar::Queue::beginCapture(hipStreamCaptureMode Mode) {
+  CaptureGraph_ = new CHIPGraph();
+  CaptureMode_ = Mode;
+  CaptureStatus_ = hipStreamCaptureStatusActive;
+  CaptureOrigin_ = true;
+  CaptureParent_ = nullptr;
+  // The first node recorded into the new graph is a root; a node left over
+  // from an earlier capture on this stream belongs to another graph.
+  CaptureDeps_.clear();
+  CaptureForks_.clear();
+  CaptureEvents_.clear();
+}
+
+void chipstar::Queue::joinCapture(Queue *Parent) {
+  CaptureGraph_ = Parent->CaptureGraph_;
+  CaptureMode_ = Parent->CaptureMode_;
+  CaptureStatus_ = hipStreamCaptureStatusActive;
+  CaptureOrigin_ = false;
+  CaptureParent_ = Parent;
+  CaptureDeps_.clear();
+  CaptureForks_.clear();
+  CaptureEvents_.clear();
+  Parent->CaptureForks_.insert(this);
+}
+
+void chipstar::Queue::captureEvent(chipstar::Event *Event) {
+  if (auto *Previous = Event->getCaptureQueue())
+    Previous->releaseCaptureEvent(Event);
+  Event->setCapture(this, CaptureDeps_);
+  CaptureEvents_.insert(Event);
+}
+
+void chipstar::Queue::releaseCaptureEvent(chipstar::Event *Event) {
+  CaptureEvents_.erase(Event);
+  Event->clearCapture();
+}
+
+void chipstar::Queue::endCapture() {
+  for (auto *Event : CaptureEvents_)
+    Event->clearCapture();
+  CaptureEvents_.clear();
+  // Detach from the parent first so that a fork ending its capture does not
+  // erase itself from the set being iterated here.
+  if (CaptureParent_)
+    CaptureParent_->CaptureForks_.erase(this);
+  CaptureParent_ = nullptr;
+  auto Forks = std::move(CaptureForks_);
+  CaptureForks_.clear();
+  for (auto *Fork : Forks) {
+    Fork->CaptureParent_ = nullptr;
+    Fork->endCapture();
+  }
+  CaptureOrigin_ = false;
+  CaptureDeps_.clear();
+  CaptureGraph_ = nullptr;
+  CaptureStatus_ = hipStreamCaptureStatusNone;
+}
 
 std::shared_ptr<chipstar::Event>
 chipstar::Queue::RegisteredVarCopy(chipstar::ExecItem *ExecItem,
                                    MANAGED_MEM_STATE ExecState) {
-
-  // TODO: Inspect kernel code for indirect allocation accesses. If
-  //       the kernel does not have any, we only need inspect kernels
-  //       pointer arguments for allocations to be synchronized.
 
   auto *AllocTracker = ::Backend->getActiveDevice()->AllocTracker;
   if (!AllocTracker->getNumHostAllocations() &&
@@ -2247,8 +2469,38 @@ chipstar::Queue::RegisteredVarCopy(chipstar::ExecItem *ExecItem,
         MemUnmap(&AllocInfo);
       else
         MemMap(&AllocInfo, chipstar::Queue::MEM_MAP_TYPE::HOST_READ_WRITE);
-    } else if (AllocInfo.HostPtr &&
+    } else if (AllocInfo.HostPtr && AllocInfo.DevPtr &&
+               // DevPtr will be null if hipHostRegister was called but
+               // hipHostGetDevicePointer was never called, meaning no device
+               // backing exists yet and there is nothing to sync.
                AllocInfo.MemoryType == hipMemoryTypeManaged) {
+      // If the module has no indirect global buffer accesses, only sync
+      // allocations whose DevPtr is explicitly passed as a kernel argument.
+      const SPVModuleInfo &ModInfo = ExecItem->getKernel()->getModule()->getInfo();
+      if (ModInfo.HasNoIGBAs) {
+        bool IsKernelArg = false;
+        const auto &FuncInfo = *ExecItem->getKernel()->getFuncInfo();
+        void *DevBegin = AllocInfo.DevPtr;
+        void *DevEnd = static_cast<char *>(AllocInfo.DevPtr) + AllocInfo.Size;
+        FuncInfo.visitKernelArgs(ExecItem->getArgs(),
+                                 [&](const SPVFuncInfo::KernelArg &Arg) {
+                                   if (Arg.Kind == SPVTypeKind::Pointer &&
+                                       !Arg.isWorkgroupPtr()) {
+                                     void *PtrVal = *static_cast<void **>(
+                                         const_cast<void *>(Arg.Data));
+                                     // The argument may point anywhere inside
+                                     // the allocation, e.g. the device pointer
+                                     // of an interior host pointer.
+                                     if (PtrVal >= DevBegin && PtrVal < DevEnd)
+                                       IsKernelArg = true;
+                                   }
+                                 });
+        if (!IsKernelArg) {
+          logDebug("Skipping sync of managed memory {} - not a kernel arg",
+                   AllocInfo.DevPtr);
+          return;
+        }
+      }
       void *Src = PreKernel ? AllocInfo.HostPtr : AllocInfo.DevPtr;
       void *Dst = PreKernel ? AllocInfo.DevPtr : AllocInfo.HostPtr;
       logDebug("Sync managed memory {} -> {} ({})", Src, Dst,
@@ -2293,16 +2545,31 @@ void chipstar::Queue::launch(chipstar::ExecItem *ExItem) {
     logDebug("{}", InfoStr.str());
   }
 
-  auto TotalThreadsPerBlock =
-      ExItem->getBlock().x * ExItem->getBlock().y * ExItem->getBlock().z;
   auto DeviceProps = getDevice()->getDeviceProps();
   auto MaxTotalThreadsPerBlock = DeviceProps.maxThreadsPerBlock;
+
+  // Detect negative block dimensions passed as large unsigned values (sign wrap).
+  // Use INT32_MAX as threshold since no legitimate block dimension approaches it.
+  const auto kMaxReasonableBlockDim =
+      static_cast<uint32_t>(std::numeric_limits<int32_t>::max());
+  if (ExItem->getBlock().x > kMaxReasonableBlockDim ||
+      ExItem->getBlock().y > kMaxReasonableBlockDim ||
+      ExItem->getBlock().z > kMaxReasonableBlockDim) {
+    logCritical("Negative block dimension ({}, {}, {})",
+                ExItem->getBlock().x, ExItem->getBlock().y,
+                ExItem->getBlock().z);
+    CHIPERR_LOG_AND_THROW("Negative block dimension",
+                          hipErrorInvalidConfiguration);
+  }
+
+  auto TotalThreadsPerBlock =
+      ExItem->getBlock().x * ExItem->getBlock().y * ExItem->getBlock().z;
 
   if (TotalThreadsPerBlock > MaxTotalThreadsPerBlock) {
     logCritical("Requested total local size {} exceeds HW limit {}",
                 TotalThreadsPerBlock, MaxTotalThreadsPerBlock);
     CHIPERR_LOG_AND_THROW("Requested local size exceeds HW max",
-                          hipErrorLaunchFailure);
+                          hipErrorInvalidValue);
   }
 
   if (ExItem->getBlock().x > DeviceProps.maxThreadsDim[0] ||
@@ -2314,7 +2581,7 @@ void chipstar::Queue::launch(chipstar::ExecItem *ExItem) {
         DeviceProps.maxThreadsDim[0], DeviceProps.maxThreadsDim[1],
         DeviceProps.maxThreadsDim[2]);
     CHIPERR_LOG_AND_THROW("Requested local size exceeds HW max",
-                          hipErrorLaunchFailure);
+                          hipErrorInvalidValue);
   }
 
   std::shared_ptr<chipstar::Event> RegisteredVarInEvent =

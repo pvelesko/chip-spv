@@ -1,16 +1,25 @@
 name: Libraries Presubmit
 
+# Manual dispatch only for now. These lanes build chipStar on pastrami and
+# salami against llvm/22.0-native and llvm/21.0 respectively, while the unit
+# gates on those same machines have moved to llvm/23.0, so on every PR each
+# host built chipStar twice against different toolchains. Run it by hand when
+# touching the libraries until the toolchains are unified.
 on:
-  pull_request:
-    paths-ignore: "docs/**"
+  workflow_dispatch:
 
 concurrency:
-  group: libraries-${{ github.event.pull_request.number }}
+  group: libraries-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-and-test-libraries:
-    runs-on: [self-hosted, Linux, X64]
+  # chipFFT + chipBLAS positive verification on macOS ARM64 (pastrami, PoCL).
+  # No Level Zero on this host, so the OpenCL/CLBlast + OpenCL/VkFFT path
+  # is the right hipFFT/hipBLAS implementation here. Mirrors the meatloaf
+  # job's "install via install_chipstar.py, then ctest each staged build"
+  # shape so library results stay consistent across hosts.
+  build-and-test-libraries-pastrami:
+    runs-on: [self-hosted, ARM64, MacOS]
     env:
       CHIP_MODULE_CACHE_DIR: ""
     steps:
@@ -20,58 +29,66 @@ jobs:
           fetch-depth: 0
           submodules: 'recursive'
 
-      - name: Build chipStar + all libraries
-        shell: bash
+      - name: Build chipFFT and chipBLAS (PoCL)
+        shell: /bin/bash {0}
         run: |
           set -e
-          if [ -f "$HOME/.local/init/bash" ]; then
-            export MODULESHOME=$HOME/.local
-            source "$MODULESHOME/init/bash"
-          elif [ -f /etc/profile.d/lmod.sh ]; then
-            source /etc/profile.d/lmod.sh
-          else
-            source /etc/profile.d/modules.sh
-          fi
-          module use /space/pvelesko/modulefiles
-          module load oneapi/2025.0.4 llvm/22.0-native level-zero/dgpu
-          module list
+          export PATH="/Users/paulius/.pyenv/shims:/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
+          source /opt/homebrew/Cellar/modules/5.6.0/init/bash
+          export MODULEPATH="/Users/paulius/modulefiles:$MODULEPATH"
+          module load ocl-icd-loader
+          module load pocl
 
-          STAGING=/tmp/chipstar-ci-staging/${{ github.event.pull_request.number }}
+          export LLVM_DIR=$HOME/install/llvm/22.0-native
+          export PATH="${LLVM_DIR}/bin:$PATH"
+          export SPIRV_TOOLS_PREFIX=$(brew --prefix spirv-tools)
+          export CMAKE_PREFIX_PATH="${SPIRV_TOOLS_PREFIX}:${CMAKE_PREFIX_PATH:-}"
+
+          # chipFFT and chipBLAS both set CMAKE_FIND_FRAMEWORK=NEVER on
+          # Apple to dodge OpenCL.framework, so find_package(OpenCL) needs
+          # an explicit pointer at the ocl-icd-loader prefix.
+          export OpenCL_ROOT=/Users/paulius/install/ocl-icd-loader
+          export CMAKE_LIBRARY_PATH=${OpenCL_ROOT}/lib:${CMAKE_LIBRARY_PATH:-}
+          export CMAKE_INCLUDE_PATH=${OpenCL_ROOT}/include:${CMAKE_INCLUDE_PATH:-}
+          export SDKROOT=$(xcrun --show-sdk-path)
+
+          STAGING=${{ runner.temp }}/chipstar-ci-staging/${{ github.event.pull_request.number || 'dispatch' }}
           rm -rf $STAGING
 
-          ./install_chipstar.py --all \
+          ./install_chipstar.py -c chipfft,chipblas \
             --with-tests \
             --install-dir $STAGING \
             --staging-dir $STAGING/staging \
-            -j 8
+            -j 4
 
           echo "STAGING=$STAGING" >> $GITHUB_ENV
 
       - name: Run library tests
-        shell: bash
+        shell: /bin/bash {0}
         run: |
           set -e
-          if [ -f "$HOME/.local/init/bash" ]; then
-            export MODULESHOME=$HOME/.local
-            source "$MODULESHOME/init/bash"
-          elif [ -f /etc/profile.d/lmod.sh ]; then
-            source /etc/profile.d/lmod.sh
-          else
-            source /etc/profile.d/modules.sh
-          fi
-          module use /space/pvelesko/modulefiles
-          module load oneapi/2025.0.4 llvm/22.0-native level-zero/dgpu
+          export PATH="/Users/paulius/.pyenv/shims:/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
+          source /opt/homebrew/Cellar/modules/5.6.0/init/bash
+          export MODULEPATH="/Users/paulius/modulefiles:$MODULEPATH"
+          module load ocl-icd-loader
+          module load pocl
 
-          # Find the chipStar install (date-stamped subdir)
+          # PoCL JIT-compiles every OpenCL kernel with its bundled clang, and
+          # upstream clang has no built-in macOS sysroot, so without this the
+          # kernel .so cannot link against libSystem and kernels silently
+          # produce garbage ("ld: library 'System' not found").
+          export SDKROOT=$(xcrun --show-sdk-path)
+
           CHIP_INSTALL=$(ls -d $STAGING/chipStar/*/ | head -1)
           export PATH=$CHIP_INSTALL/bin:$PATH
-          export LD_LIBRARY_PATH=$CHIP_INSTALL/lib:${LD_LIBRARY_PATH:-}
+          export DYLD_LIBRARY_PATH=$CHIP_INSTALL/lib:${DYLD_LIBRARY_PATH:-}
           export HIP_PATH=$CHIP_INSTALL
           export HIP_PLATFORM=spirv
           export CHIP_LOGLEVEL=err
-          # Enable IGC software fp64 emulation on Intel Arc (Alchemist lacks native fp64)
-          export IGC_EnableDPEmulation=1
-          export OverrideDefaultFP64Settings=1
+          # PoCL on Apple Silicon (CPU device) has no fp16 OpenCL kernels, so
+          # CLBlast errors out on hipblasH* calls. The chipBLAS api_surface
+          # test honors this env var to skip the half-precision section.
+          export CHIPBLAS_SKIP_HALF_API_SURFACE=1
 
           failed=0
           for lib_staging in $STAGING/staging/*/; do
@@ -105,11 +122,126 @@ jobs:
             echo "::error::$failed libraries had test failures"
             exit 1
           fi
+        timeout-minutes: 90
 
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
-          name: library-test-logs
+          name: library-test-logs-pastrami
           path: |
-            /tmp/chipstar-ci-staging/${{ github.event.pull_request.number }}/staging/*/build/Testing/**/LastTest*.log
+            ${{ runner.temp }}/chipstar-ci-staging/${{ github.event.pull_request.number || 'dispatch' }}/staging/*/build/Testing/**/LastTest*.log
+          if-no-files-found: ignore
+
+  # chipFFT + chipBLAS positive verification on Linux ARM64 (salami, Mali-G52
+  # via OpenCL). No Level Zero on this host. Same install-and-ctest shape
+  # as the meatloaf and pastrami jobs.
+  build-and-test-libraries-salami:
+    runs-on: [self-hosted, Linux, ARM64]
+    env:
+      CHIP_MODULE_CACHE_DIR: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - name: Build chipFFT and chipBLAS (OpenCL)
+        shell: bash
+        run: |
+          set -e
+          export MODULESHOME=$HOME/.local
+          source $MODULESHOME/init/bash 2>/dev/null || source /etc/profile.d/modules.sh
+          module use ~/modulefiles
+          module load llvm/21.0
+          module list
+
+          export LLVM_DIR=$(module show llvm/21.0 2>&1 | grep -E 'prepend-path\s+PATH' | awk '{print $NF}' | head -1 | xargs dirname)
+          echo "LLVM_DIR=$LLVM_DIR"
+
+          STAGING=/tmp/chipstar-ci-staging-salami/${{ github.event.pull_request.number || 'dispatch' }}
+          rm -rf $STAGING
+
+          ./install_chipstar.py -c chipfft,chipblas \
+            --with-tests \
+            --install-dir $STAGING \
+            --staging-dir $STAGING/staging \
+            -j $(nproc)
+
+          echo "STAGING=$STAGING" >> $GITHUB_ENV
+
+      - name: Run library tests
+        shell: bash
+        run: |
+          set -e
+          export MODULESHOME=$HOME/.local
+          source $MODULESHOME/init/bash 2>/dev/null || source /etc/profile.d/modules.sh
+          module use ~/modulefiles
+          module load llvm/21.0
+
+          CHIP_INSTALL=$(ls -d $STAGING/chipStar/*/ | head -1)
+          export PATH=$CHIP_INSTALL/bin:$PATH
+          export LD_LIBRARY_PATH=$CHIP_INSTALL/lib:${LD_LIBRARY_PATH:-}
+          export HIP_PATH=$CHIP_INSTALL
+          export HIP_PLATFORM=spirv
+          export CHIP_LOGLEVEL=err
+          # Mali-G52 lacks native fp64. CLBlast returns kNoDoublePrecision
+          # (-2044) for every d*/z* test and chipFFT's z2z/d2z plans abort
+          # at first kernel build. Skip those via the existing per-library
+          # exclude.txt convention; single-precision + complex-single cover
+          # the API surface this lane is meant to gate.
+          mkdir -p $STAGING/staging/chipBLAS/.ci
+          {
+            echo "^l[123]:d"
+            echo "^l3:z"
+            echo "^conformance:d"
+            echo "^conformance:zgemm"
+            echo "^api_surface$"
+          } > $STAGING/staging/chipBLAS/.ci/exclude.txt
+          mkdir -p $STAGING/staging/chipFFT/.ci
+          {
+            echo "z2z"
+            echo "d2z"
+          } > $STAGING/staging/chipFFT/.ci/exclude.txt
+
+          failed=0
+          for lib_staging in $STAGING/staging/*/; do
+            lib=$(basename $lib_staging)
+            lib_build="$lib_staging/build"
+            if [ ! -d "$lib_build" ]; then
+              continue
+            fi
+            if [ -f "$lib_build/CTestTestfile.cmake" ]; then
+              echo "=== Testing $lib ==="
+              exclude=""
+              exclude_file="$lib_staging/.ci/exclude.txt"
+              if [ -f "$exclude_file" ]; then
+                exclude=$(grep -Ev '^\s*(#|$)' "$exclude_file" | paste -sd '|' - || true)
+              fi
+              labels=""
+              labels_file="$lib_staging/.ci/ctest-labels.txt"
+              if [ -f "$labels_file" ]; then
+                labels=$(grep -Ev '^\s*(#|$)' "$labels_file" | paste -sd '|' - || true)
+              fi
+              cd "$lib_build"
+              if ! ctest --output-on-failure --timeout 1800 ${labels:+-L "$labels"} ${exclude:+-E "$exclude"}; then
+                echo "::warning::$lib tests had failures"
+                failed=$((failed + 1))
+              fi
+            else
+              echo "=== $lib: no CTest tests ==="
+            fi
+          done
+          if [ $failed -gt 0 ]; then
+            echo "::error::$failed libraries had test failures"
+            exit 1
+          fi
+        timeout-minutes: 90
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: library-test-logs-salami
+          path: |
+            /tmp/chipstar-ci-staging-salami/${{ github.event.pull_request.number || 'dispatch' }}/staging/*/build/Testing/**/LastTest*.log
           if-no-files-found: ignore

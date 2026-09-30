@@ -20,11 +20,13 @@ Usage:
 
 import argparse
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import tty
 import termios
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
@@ -46,8 +48,16 @@ class Component:
       compiler: "llvm" (chipStar), "hipcc", or "icpx".
       cmake_flags: extra -D flags appended to the cmake command.
       test_cmake_flags: -D flags appended only when --with-tests is passed.
+      test_build_targets: extra make targets built only when --with-tests is
+                       passed. chipStar's unit tests are a separate target
+                       rather than a cmake option, so they need this.
       with_clang_compiler_path: append -DCLANG_COMPILER_PATH=<llvm_clang>.
       with_hip_include_flag: append -DCMAKE_CXX_FLAGS=-I<HIP_PATH>/include.
+      with_plain_clang_compiler: append -DCMAKE_CXX_COMPILER=<llvm_clang>,
+                       overriding the default hipcc. Needed for components
+                       that bundle a non-HIP C++ subdirectory (e.g. chipBLAS
+                       + CLBlast); hipcc auto-injects -include spirv_fixups.h
+                       which collides with std::complex<float> typedefs.
       use_cwd_if_chipstar_repo / git_submodule_update: chipStar-only source
                        handling (reuse in-tree checkout, init submodules).
     """
@@ -56,8 +66,10 @@ class Component:
                  compiler="hipcc",
                  cmake_flags=None,
                  test_cmake_flags=None,
+                 test_build_targets=None,
                  with_clang_compiler_path=False,
                  with_hip_include_flag=False,
+                 with_plain_clang_compiler=False,
                  use_cwd_if_chipstar_repo=False,
                  git_submodule_update=False):
         self.name = name
@@ -70,8 +82,10 @@ class Component:
         self.compiler = compiler
         self.cmake_flags = list(cmake_flags) if cmake_flags else []
         self.test_cmake_flags = list(test_cmake_flags) if test_cmake_flags else []
+        self.test_build_targets = list(test_build_targets) if test_build_targets else []
         self.with_clang_compiler_path = with_clang_compiler_path
         self.with_hip_include_flag = with_hip_include_flag
+        self.with_plain_clang_compiler = with_plain_clang_compiler
         self.use_cwd_if_chipstar_repo = use_cwd_if_chipstar_repo
         self.git_submodule_update = git_submodule_update
     
@@ -87,6 +101,9 @@ COMPONENTS = [
         repo="git@github.com:CHIP-SPV/chipStar.git",
         description="Core HIP runtime for SPIR-V (required)",
         compiler="llvm",
+        # chipStar's unit tests are built by a dedicated target, not enabled by
+        # a cmake option, so `make` alone leaves them unbuilt.
+        test_build_targets=["build_tests"],
         use_cwd_if_chipstar_repo=True,
         git_submodule_update=True,
     ),
@@ -193,6 +210,48 @@ COMPONENTS = [
         description="HIP FFT via MKL",
     ),
     Component(
+        name="chipfft",
+        display_name="chipFFT",
+        # SSH to match the rest of the suite; the CI runner has SSH access
+        # to all CHIP-SPV mirrors. (Initial attempt with HTTPS hit
+        # 'could not read Username' because the runner's git config
+        # requires a credential helper for github.com.)
+        repo="git@github.com:CHIP-SPV/chipFFT.git",
+        depends_on=["chipstar"],
+        description=("Portable hipFFT API on chipStar + VkFFT (OpenCL). "
+                     "Mutually exclusive with H4I-HipFFT — both install "
+                     "lib/libhipfft.so. Refuses to configure on Level Zero "
+                     "systems (use H4I-HipFFT there). Disabled by default; "
+                     "opt in via -c chipfft."),
+        enabled=False,  # opt-in; conflicts with H4I-HipFFT
+        cmake_flags=["-DCHIPFFT_BUILD_TESTS=OFF"],
+        test_cmake_flags=["-DCHIPFFT_BUILD_TESTS=ON"],
+        git_submodule_update=True,  # third_party/VkFFT is a submodule
+    ),
+    Component(
+        name="chipblas",
+        display_name="chipBLAS",
+        repo="git@github.com:CHIP-SPV/chipBLAS.git",
+        depends_on=["chipstar"],
+        description=("Portable hipBLAS API on chipStar + CLBlast (OpenCL). "
+                     "Mutually exclusive with H4I-HipBLAS — both install "
+                     "lib/libhipblas.so. Refuses to configure on Level Zero "
+                     "systems (use H4I-HipBLAS there). Disabled by default; "
+                     "opt in via -c chipblas."),
+        enabled=False,  # opt-in; conflicts with H4I-HipBLAS
+        cmake_flags=["-DCHIPBLAS_BUILD_TESTS=OFF"],
+        test_cmake_flags=["-DCHIPBLAS_BUILD_TESTS=ON"],
+        # chipBLAS bundles CLBlast via add_subdirectory; CLBlast is pure
+        # OpenCL C++ and must not be built with hipcc — hipcc auto-includes
+        # spirv_fixups.h which redefines float2/double2 as HIP vector types
+        # and collides with CLBlast's std::complex<float> aliases. Use plain
+        # clang++ + HIP_PATH/include so chipBLAS itself still sees the HIP
+        # headers via __HIP_PLATFORM_SPIRV__ without dragging the fixups in.
+        with_plain_clang_compiler=True,
+        with_hip_include_flag=True,
+        git_submodule_update=True,  # third_party/CLBlast is a submodule
+    ),
+    Component(
         name="hipmm",
         display_name="hipMM",
         repo="git@github.com:CHIP-SPV/hipMM.git",
@@ -202,7 +261,58 @@ COMPONENTS = [
         test_cmake_flags=["-DBUILD_TESTS=ON"],
         with_hip_include_flag=True,
     ),
+    Component(
+        name="chiprccl",
+        display_name="chipRCCL",
+        repo="git@github.com:CHIP-SPV/chipRCCL.git",
+        depends_on=["chipstar"],
+        description=("Minimal single-process RCCL (NCCL API): nranks==1 "
+                     "collectives as local device operations"),
+    ),
+    Component(
+        name="chipstdpar",
+        display_name="chipStdPar",
+        repo="git@github.com:CHIP-SPV/chipStdPar.git",
+        depends_on=["chipstar", "rocprim", "rocthrust"],
+        description=("Header-only C++17 parallel-STL forwarding to rocThrust "
+                     "(no clang --hipstdpar needed)"),
+    ),
 ]
+
+
+# ============================================================================
+# System Capability Detection
+# ============================================================================
+
+# Components that require an OpenCL-only / Level-Zero-free environment.
+# Their upstream CMake (chipFFT, chipBLAS) hard-errors when Level Zero is
+# present, directing users to the H4I-* MKL-backed alternatives. We mirror
+# that policy here so the installer never even tries — it shows them as
+# unavailable in --list / the interactive menu and refuses --components
+# requests with a clear message.
+LZ_INCOMPATIBLE_COMPONENTS = {"chipfft", "chipblas"}
+
+
+def detect_level_zero() -> Optional[str]:
+    """Return a short reason string if Level Zero is detected, else None.
+
+    Matches the find_path/find_library probes used by chipFFT and chipBLAS:
+    presence of <level_zero/ze_api.h> or libze_loader on standard paths.
+    """
+    header_hints = ["/usr/local/include", "/usr/include"]
+    lib_hints = [
+        "/usr/local/lib", "/usr/lib",
+        "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu",
+        "/usr/lib64",
+    ]
+    for d in header_hints:
+        if (Path(d) / "level_zero" / "ze_api.h").exists():
+            return f"found {d}/level_zero/ze_api.h"
+    for d in lib_hints:
+        for soname in ("libze_loader.so", "libze_loader.so.1"):
+            if (Path(d) / soname).exists():
+                return f"found {d}/{soname}"
+    return None
 
 
 # ============================================================================
@@ -268,7 +378,8 @@ class InstallConfig:
     """Installation configuration."""
     def __init__(self, install_base=None, module_base=None, staging_dir=None, jobs=None,
                  date_stamp=None, llvm_dir=None, dry_run=False, verbose=True, module_format="tcl",
-                 no_install=False, install_only=False, build_tests=False):
+                 no_install=False, install_only=False, build_tests=False,
+                 cmake_flags=None):
         self.install_base = install_base if install_base else Path.home() / "install" / "HIP"
         self.module_base = module_base if module_base else Path.home() / "modulefiles" / "HIP"
         self.staging_dir = staging_dir if staging_dir else Path("/tmp")
@@ -281,6 +392,7 @@ class InstallConfig:
         self.no_install = no_install
         self.install_only = install_only
         self.build_tests = build_tests
+        self.cmake_flags = list(cmake_flags) if cmake_flags else []
 
 
 # ============================================================================
@@ -786,6 +898,8 @@ class Builder:
             ("H4I-HipBLAS",   "lib/libhipblas.so"),
             ("H4I-HipSOLVER", "lib/libhipsolver.so"),
             ("H4I-HipFFT",    "lib/libhipfft.so"),
+            ("chipFFT",       "include/chipfft/chipfft_ext.h"),
+            ("chipBLAS",      "include/chipblas/chipblas_ext.h"),
             ("hipMM",         "include/rmm/rmm.hpp"),
         ]
 
@@ -885,12 +999,15 @@ class Builder:
             shutil.rmtree(build_dir)
         build_dir.mkdir(parents=True)
 
-    def _cmake_configure_and_build(self, build_dir: Path, cmake_args: List[str]) -> None:
+    def _cmake_configure_and_build(self, build_dir: Path, cmake_args: List[str],
+                                   extra_targets: Optional[List[str]] = None) -> None:
         """Run cmake + make unless --install-only."""
         if self.config.install_only:
             return
         self.run_cmd(cmake_args, cwd=build_dir)
         self.run_cmd(["make", f"-j{self.config.jobs}"], cwd=build_dir)
+        for target in extra_targets or []:
+            self.run_cmd(["make", f"-j{self.config.jobs}", target], cwd=build_dir)
 
     def _make_install_if_needed(self, build_dir: Path) -> None:
         """Run make install unless --no-install."""
@@ -948,6 +1065,41 @@ class Builder:
             return False
         return "project(chipStar" in content or "project(chipstar" in content
 
+    def prefetch_sources(self, components: List[Component]) -> None:
+        """Clone every component's source up front, in parallel.
+
+        Builds run one component at a time, and each one used to clone its own
+        source just before configuring it, so every clone sat on the critical
+        path with the CPU idle. Cloning is pure network/IO into per-component
+        directories, so it parallelises safely even though the builds cannot:
+        they share one install prefix and one CMAKE_PREFIX_PATH.
+
+        Failures are ignored here on purpose -- the component's own build still
+        calls clone_or_update_if_needed and will report the error in context.
+        """
+        if self.config.install_only or self.config.dry_run:
+            return
+
+        pending = [c for c in components
+                   if not (c.use_cwd_if_chipstar_repo
+                           and self._is_chipstar_source_tree(Path.cwd()))]
+        if len(pending) < 2:
+            return
+
+        print(f"{Colors.YELLOW}[INFO]{Colors.NC} Prefetching {len(pending)} sources...")
+
+        def fetch(component: Component) -> None:
+            try:
+                self.clone_or_update(component.repo, component.display_name,
+                                     component.branch, self.config.staging_dir)
+            except Exception as e:  # noqa: BLE001 - retried serially in the build
+                print(f"{Colors.YELLOW}[WARN]{Colors.NC} "
+                      f"Prefetch of {component.display_name} failed ({e}); "
+                      f"will retry during its build")
+
+        with ThreadPoolExecutor(max_workers=min(4, len(pending))) as pool:
+            list(pool.map(fetch, pending))
+
     def _resolve_src_dir(self, component: Component) -> Path:
         """Pick the source directory for a component (cwd for in-tree chipStar, else staging)."""
         if component.use_cwd_if_chipstar_repo:
@@ -963,7 +1115,7 @@ class Builder:
     def _compiler_cmake_flags(self, component: Component) -> List[str]:
         """Return compiler-specific -D flags for the given component."""
         if component.compiler == "llvm":
-            return [f"-DLLVM_CONFIG={self.llvm_dir}/bin/llvm-config"]
+            return [f"-DLLVM_CONFIG_BIN={self.llvm_dir}/bin/llvm-config"]
         if component.compiler == "icpx":
             icpx_path = subprocess.run(
                 ["which", "icpx"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -999,6 +1151,10 @@ class Builder:
             f"-DCMAKE_INSTALL_PREFIX={install_dir}",
             *self._compiler_cmake_flags(component),
         ]
+        if component.with_plain_clang_compiler:
+            # Later -D wins in the CMake cache, so this overrides the default
+            # -DCMAKE_CXX_COMPILER=<hipcc> from _compiler_cmake_flags.
+            cmake_args.append(f"-DCMAKE_CXX_COMPILER={self.llvm_clang}")
         if component.with_clang_compiler_path:
             cmake_args.append(f"-DCLANG_COMPILER_PATH={self.llvm_clang}")
         cmake_args.extend(component.cmake_flags)
@@ -1009,7 +1165,11 @@ class Builder:
             if hip_path:
                 cmake_args.append(f"-DCMAKE_CXX_FLAGS=-I{hip_path}/include")
 
-        self._cmake_configure_and_build(build_dir, cmake_args)
+        # Appended last so a caller-supplied -D overrides anything above it.
+        cmake_args.extend(self.config.cmake_flags)
+
+        extra_targets = component.test_build_targets if self.config.build_tests else []
+        self._cmake_configure_and_build(build_dir, cmake_args, extra_targets)
         self._make_install_if_needed(build_dir)
     
     def _generate_module(self, name: str, install_dir: Path, version: Optional[str] = None):
@@ -1173,6 +1333,14 @@ Examples:
         "--with-tests", action="store_true",
         help="Build each library's test suite (off by default; CI test stages should set this)"
     )
+    parser.add_argument(
+        "--cmake-flags", default="",
+        help='Extra -D flags appended to every component\'s cmake configure. '
+             'Pass with an equals sign, --cmake-flags="-DFOO=ON", because '
+             'argparse rejects a space-separated value that starts with a '
+             'dash unless it happens to contain a space. Appended last, so '
+             'they override the built-in flags.'
+    )
 
     return parser.parse_args()
 
@@ -1180,11 +1348,20 @@ Examples:
 def list_components():
     """Print list of available components."""
     print(f"\n{Colors.BOLD}Available Components:{Colors.NC}\n")
-    
+
+    lz_reason = detect_level_zero()
+    if lz_reason:
+        print(f"  {Colors.YELLOW}Note:{Colors.NC} Level Zero detected ({lz_reason}). "
+              f"Components {sorted(LZ_INCOMPATIBLE_COMPONENTS)} are disabled on this "
+              f"system — use the H4I-* equivalents instead.\n")
+
     for comp in COMPONENTS:
         deps = f" (requires: {', '.join(comp.depends_on)})" if comp.depends_on else ""
-        print(f"  {Colors.CYAN}{comp.name:12}{Colors.NC} {comp.display_name:16} {comp.description}{deps}")
-    
+        disabled_tag = ""
+        if lz_reason and comp.name in LZ_INCOMPATIBLE_COMPONENTS:
+            disabled_tag = f" {Colors.RED}[disabled: Level Zero present]{Colors.NC}"
+        print(f"  {Colors.CYAN}{comp.name:12}{Colors.NC} {comp.display_name:16} {comp.description}{deps}{disabled_tag}")
+
     print()
 
 
@@ -1209,6 +1386,7 @@ def main():
         no_install=args.no_install,
         install_only=args.install_only,
         build_tests=args.with_tests,
+        cmake_flags=shlex.split(args.cmake_flags) if args.cmake_flags else [],
     )
     
     if args.install_dir:
@@ -1225,20 +1403,39 @@ def main():
         print(f"{Colors.YELLOW}[WARNING]{Colors.NC} Both --all and -c specified. Using -c (ignoring --all).")
         args.all = False
     
+    # Refuse to build components that need an OpenCL-only environment if
+    # Level Zero is detected on this host. Their upstream CMake errors out
+    # with the same policy; we surface it earlier here so users (and CI)
+    # get a single, actionable error instead of a half-built dependency tree.
+    lz_reason = detect_level_zero()
+
     if args.all:
-        # Enable all components
-        for comp in COMPONENTS:
-            comp.enabled = True
-        components_to_install = COMPONENTS[:]
+        # Enable all components that are on by default. Components with
+        # enabled=False (e.g. mutually-exclusive alternatives like chipfft
+        # vs H4I-HipFFT — both install lib/libhipfft.so) stay opt-in and
+        # require an explicit --components selection.
+        components_to_install = [c for c in COMPONENTS if c.enabled]
     elif args.components:
         # Parse component list
         component_names = [c.strip() for c in args.components.split(",")]
         component_map = {c.name: c for c in COMPONENTS}
-        
+
+        if lz_reason:
+            blocked = [n for n in component_names if n in LZ_INCOMPATIBLE_COMPONENTS]
+            if blocked:
+                print(f"{Colors.RED}[ERROR]{Colors.NC} Level Zero was detected on this "
+                      f"system ({lz_reason}).")
+                print(f"  Refusing to install: {', '.join(blocked)}")
+                print(f"  These components target the OpenCL stack only. On Level Zero "
+                      f"hosts use the H4I-* equivalents:")
+                print(f"    chipfft  -> H4I-HipFFT  (component: hipfft)")
+                print(f"    chipblas -> H4I-HipBLAS (component: hipblas)")
+                return 1
+
         # First disable all components, then enable only requested ones + deps
         for comp in COMPONENTS:
             comp.enabled = False
-        
+
         # Enable requested components and their dependencies
         installer = InteractiveInstaller(COMPONENTS, config)
         for name in component_names:
@@ -1248,7 +1445,7 @@ def main():
                 print(f"{Colors.RED}[ERROR]{Colors.NC} Unknown component: {name}")
                 print(f"Use --list to see available components.")
                 return 1
-        
+
         components_to_install = installer.get_enabled_components()
     else:
         # Interactive mode
@@ -1291,6 +1488,8 @@ def main():
     
     print(f"\n{Colors.BOLD}Starting installation of {len(components_to_install)} components...{Colors.NC}\n")
     
+    builder.prefetch_sources(components_to_install)
+
     failed = []
     succeeded = []
     

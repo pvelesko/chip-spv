@@ -1,5 +1,4 @@
-#=============================================================================
-#  CMake build system files
+#======================================================================#  CMake build system files
 #
 #  Copyright (c) 2023 chipStar developers
 #
@@ -21,11 +20,16 @@
 #  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 #  THE SOFTWARE.
 #
-#=============================================================================
-
+#======================================================================
 set(CHIP_SKIP_TEST 77)
 
+# add_hip_runtime_test(<source> [MODES <mode>...])
+#
+# With MODES, one ctest is registered per mode and the mode is passed as the
+# executable's only argument. Each mode is then its own process with its own
+# result, so a mode that skips or dies cannot take the others down with it.
 function(add_hip_runtime_test MAIN_SOURCE)
+  cmake_parse_arguments(ARG "" "" "MODES" ${ARGN})
   get_filename_component(EXEC_NAME ${MAIN_SOURCE} NAME_WLE)
   set_source_files_properties(${MAIN_SOURCE} PROPERTIES LANGUAGE CXX)
   add_executable("${EXEC_NAME}" ${MAIN_SOURCE})
@@ -40,83 +44,109 @@ function(add_hip_runtime_test MAIN_SOURCE)
   target_compile_definitions("${EXEC_NAME}"
     PRIVATE CHIP_SKIP_TEST=${CHIP_SKIP_TEST})
 
-  add_test(NAME ${EXEC_NAME} COMMAND ${HIP_PROFILE_TESTS_COMMAND} ${SKIP_DOUBLE_TESTS} ${CMAKE_CURRENT_BINARY_DIR}/${EXEC_NAME})
+  if(ARG_MODES)
+    set(TEST_NAMES)
+    foreach(MODE IN LISTS ARG_MODES)
+      add_test(NAME ${EXEC_NAME}_${MODE} COMMAND ${HIP_PROFILE_TESTS_COMMAND} ${SKIP_DOUBLE_TESTS} ${CMAKE_CURRENT_BINARY_DIR}/${EXEC_NAME} ${MODE})
+      list(APPEND TEST_NAMES ${EXEC_NAME}_${MODE})
+    endforeach()
+  else()
+    add_test(NAME ${EXEC_NAME} COMMAND ${HIP_PROFILE_TESTS_COMMAND} ${SKIP_DOUBLE_TESTS} ${CMAKE_CURRENT_BINARY_DIR}/${EXEC_NAME})
+    set(TEST_NAMES ${EXEC_NAME})
+  endif()
 
-  set_tests_properties("${EXEC_NAME}" PROPERTIES
+  set_tests_properties(${TEST_NAMES} PROPERTIES
     SKIP_RETURN_CODE ${CHIP_SKIP_TEST})
-  set_tests_properties("${EXEC_NAME}" PROPERTIES
+  set_tests_properties(${TEST_NAMES} PROPERTIES
     PASS_REGULAR_EXPRESSION "PASS")
-  set_tests_properties("${EXEC_NAME}" PROPERTIES
+  set_tests_properties(${TEST_NAMES} PROPERTIES
     FAIL_REGULAR_EXPRESSION "FAIL")
-  set_tests_properties("${EXEC_NAME}" PROPERTIES
+  set_tests_properties(${TEST_NAMES} PROPERTIES
     SKIP_REGULAR_EXPRESSION "HIP_SKIP_THIS_TEST")
 
 endfunction()
 
 # add_shell_test(<script-file>)
+# The pass emits one of two shapes and the build picks it, so the shell gates
+# have to assert the one this build produces.
+if(CHIP_VOLATILE_LOWERING_ATOMIC)
+  set(VOLATILE_LOWERING "atomic")
+else()
+  set(VOLATILE_LOWERING "cachectl")
+endif()
+
 function(add_shell_test SCRIPT)
   get_filename_component(TEST_NAME ${SCRIPT} NAME_WLE)
   configure_file(${SCRIPT} ${SCRIPT} @ONLY)
   add_test(NAME ${TEST_NAME}
     COMMAND /bin/bash ${CMAKE_CURRENT_BINARY_DIR}/${SCRIPT})
+  # Without this a script that prints the skip marker is reported as a pass,
+  # so an unsupported configuration is indistinguishable from a tested one.
+  set_tests_properties(${TEST_NAME} PROPERTIES
+    SKIP_REGULAR_EXPRESSION "HIP_SKIP_THIS_TEST")
 endfunction()
 
-# TODO - this should check if immediate cmd lists are being used
-add_hip_runtime_test(TestRecordEventBlocking.cpp)
-# This test checks if zeEventQuery is a blocking operation
-set_tests_properties(TestRecordEventBlocking PROPERTIES
-  TIMEOUT 60)
+# Tests are registered by globbing Test*.hip and Test*.cpp, so adding one is a
+# matter of dropping the file into this directory. CONFIGURE_DEPENDS re-runs the
+# glob during the build when the set of matching files changes.
+#
+# Anything that needs more than a plain add_hip_runtime_test() call is listed
+# here and registered by hand below instead.
+set(RUNTIME_TESTS_MANUAL
+  TestBufferDevAddr.hip           # guarded on OpenCL_LIBRARY
+  TestDeviceAbortStderr.hip       # SIGABRT death + stderr checked by a driver script
+  TestEnvVars.hip                 # driven by ../run_testenvvars.sh, not by ctest
+  TestFix1393ExitDuringModuleBuild.hip # run under an interposer by a driver script
+  TestFix1604ClFlushErrorMap.hip  # run under an interposer by a driver script
+  TestFix1543SwitchModeEventLeak.hip # run under an interposer by a driver script
+  TestFixFunctionLocalStaticDeviceVar.hip # multi-TU, second TU under inputs/
+  TestFix1601ExtractorMultiTUDoubles.hip # multi-TU, compiled by its .bash, not a test
+  TestFixLlvmUsedAddrspace.hip    # not registered as a test
+  TestFix1592ExtractorExitStatus.hip # compiled by TestFix1592ExtractorExitStatus.bash, not a test
+  TestFix1600ExtractorArgvBoundaries.hip # compiled by TestFix1600ExtractorArgvBoundaries.bash, not a test
+  TestFix1693StringTableOffset.hip # needs program-scope globals, registered below
+  TestFix1703ByteOffsetTable.hip # needs program-scope globals, registered below
 
-add_hip_runtime_test(TestLazyModuleInit.cpp)
-add_hip_runtime_test(TestKernelArgs.hip)
-add_hip_runtime_test(TestUndefKernelArg.hip)
+  TestFixVolatileLoadLowering.hip # compiled by TestFixVolatileLoadLoweringSPIRV.bash, not a test
+  TestFixKokkosUnorderedMapInsert.hip # reference idiom only, see the comment below
+  TestModuleCacheInvalidation.hip # run several times through a driver script
+  TestStreamWaitEventOrdering.cpp # not registered as a test
+  TestTemplateKernelModules.hip   # multi-TU, linked from hand-built objects
+)
+
+file(GLOB RUNTIME_TEST_SOURCES CONFIGURE_DEPENDS
+  RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/Test*.hip
+  ${CMAKE_CURRENT_SOURCE_DIR}/Test*.cpp)
+list(REMOVE_ITEM RUNTIME_TEST_SOURCES ${RUNTIME_TESTS_MANUAL})
+list(SORT RUNTIME_TEST_SOURCES)
+# Registered per mode below, not by the glob.
+list(REMOVE_ITEM RUNTIME_TEST_SOURCES TestFix1508VolatileGlobalStaleness.hip)
+
+foreach(RUNTIME_TEST_SOURCE IN LISTS RUNTIME_TEST_SOURCES)
+  add_hip_runtime_test(${RUNTIME_TEST_SOURCE})
+endforeach()
+
+# The staleness probe needs several work-groups to make progress against each
+# other and skips on a device that cannot run it, for instance where Mesa
+# deletes the spin loop. The host-allocation guard needs one work-item and no
+# inter-work-group visibility, and it is the check that catches an atomic
+# lowering faulting on pinned or managed memory, so it must not be lost with
+# the probe.
+add_hip_runtime_test(TestFix1508VolatileGlobalStaleness.hip MODES staleness guard)
+if(CHIP_VOLATILE_LOWERING_ATOMIC)
+  target_compile_definitions(TestFix1508VolatileGlobalStaleness
+    PRIVATE CHIP_VOLATILE_LOWERING_ATOMIC)
+endif()
+
+# hipGraphGetEdges overflowing the caller's arrays must abort at the free
+# instead of depending on the heap layout to surface it.
+set_tests_properties(TestFix1524GetEdgesCapacity PROPERTIES
+  ENVIRONMENT "MALLOC_CHECK_=3")
+
+# Names that the Test* glob does not match.
 add_hip_runtime_test(RegressionTest302.hip)
-add_hip_runtime_test(TestLargeGlobalVar.hip)
-# TestCompileError exercises runtime compilation through hiprtc which feeds the
-# in-tree LLVM SPIR-V backend; the test's intentional-failure path no longer
-# produces the expected diagnostic under the native-Vulkan toolchain.
-# Skip under CHIP_USE_NATIVE_VULKAN_SPIRV.
-if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
-  add_hip_runtime_test(TestCompileError.hip)
-  # TestCompileError intentionally triggers ZE_RESULT_ERROR_MODULE_LINK_FAILURE
-  # so we need to clear the default FAIL regex which would match "FAILURE"
-  set_tests_properties(TestCompileError PROPERTIES FAIL_REGULAR_EXPRESSION "")
-endif()
-add_hip_runtime_test(TestGlobalVarInit.hip)
-add_hip_runtime_test(TestArgVisitors.cpp)
-add_hip_runtime_test(TestLargeKernelArgLists.hip)
-add_hip_runtime_test(TestStlFunctions.hip)
-add_hip_runtime_test(TestStlFunctionsDouble.hip)
-add_hip_runtime_test(TestHIPMathFunctions.hip)
-add_hip_runtime_test(TestAtomics.hip)
-add_hip_runtime_test(TestIndirectMappedHostAlloc.hip)
-add_hip_runtime_test(TestThreadDetachCleanup.cpp)
-
-add_shell_test(TestAssert.bash)
-add_shell_test(TestAssertFail.bash)
-add_shell_test(TestForgottenModuleUnload.bash)
-
-# Vulkan compute SPIR-V does not support indirect calls / function pointers
-# without the non-portable SPV_INTEL_function_pointers extension. Skip these
-# tests when targeting native Vulkan SPIR-V.
-if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
-  add_hip_runtime_test(TestIndirectCall.hip)
-  add_hip_runtime_test(TestStructWithFnPtr.hip)
-endif()
-add_hip_runtime_test(TestHipInit.hip)
-
-add_shell_test(TestRuntimeWarnings.bash)
-
-add_hip_runtime_test(TestAPIs.hip)
-add_hip_runtime_test(TestMemFunctions.hip)
-add_hip_runtime_test(TestAlignAttrRuntime.hip)
-
-add_hip_runtime_test(TestBitInsert.hip)
-add_hip_runtime_test(TestBallot.hip)
-
-add_hip_runtime_test(TestNegativeHasNoIGBAs1.hip)
-add_hip_runtime_test(TestNegativeHasNoIGBAs2.hip)
-add_hip_runtime_test(TestPositiveHasNoIGBAs.hip)
+add_hip_runtime_test(host-math-funcs.hip)
 
 # CatchMemLeak1 monitors RSS growth which is unreliable on macOS
 # (different ru_maxrss units, PoCL JIT memory behavior varies)
@@ -126,8 +156,176 @@ endif()
 if(OpenCL_LIBRARY) # Depends on OpenCL
   add_hip_runtime_test(TestBufferDevAddr.hip)
 endif()
-add_hip_runtime_test(Test887.hip)
-add_hip_runtime_test(TestTemplatedConstantMemcpy.hip)
+# String literals are initialized program-scope globals, which rusticl/Mesa
+# rejects ("Initializer for CrossWorkgroup variable not yet supported").
+if(CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS)
+  add_hip_runtime_test(TestFix1693StringTableOffset.hip)
+  add_hip_runtime_test(TestFix1703ByteOffsetTable.hip)
+endif()
+
+add_shell_test(TestAssert.bash)
+add_shell_test(TestAssertFail.bash)
+add_shell_test(TestForgottenModuleUnload.bash)
+add_shell_test(TestModuleLoadFromFile.bash)
+add_shell_test(TestLinkHiprtc.bash)
+add_shell_test(TestRuntimeWarnings.bash)
+
+find_program(SPIRV_DIS spirv-dis)
+find_program(
+  CLANG_OFFLOAD_BUNDLER
+  NAMES clang-offload-bundler-${LLVM_VERSION_MAJOR} clang-offload-bundler
+  PATHS ${HIP_CLANG_PATH})
+if(SPIRV_DIS AND (NOT USE_NEW_OFFLOAD_DRIVER OR CLANG_OFFLOAD_BUNDLER))
+  add_shell_test(TestBoolKernelParamSPIRV.bash)
+endif()
+
+# The runtime's stderr must stay NUL-free at CHIP_LOGLEVEL=info (the Level
+# Zero build log dump wrote the driver's terminating NUL and printed the
+# "ZE Build Log:" line for empty logs; gtest death tests read captured stderr
+# as a C string). Runs TestFixByvalStructArgSize and inspects its stderr; only
+# meaningful for the build log path on the Level Zero backend.
+add_shell_test(TestFixZeBuildLogNul.bash)
+
+# spirv-extractor --check-for-doubles must see every device module in a binary,
+# not just the first, or a multi-TU test runs on a device without fp64.
+add_shell_test(TestFix1601ExtractorMultiTUDoubles.bash)
+
+# The same defect, asserted where the wrapper actually runs. The shell test
+# above cannot ship to the cross-staged aarch64 target, which takes no shell
+# tests at all, so build the two translation units into a fixture and register
+# THAT under the doubles wrapper: the fixture exits non-zero if it is ever
+# executed, so ctest goes red exactly when the wrapper fails to look past the
+# first device module, and reports a skip when it does. Only meaningful where
+# the wrapper is in use.
+if(CHIP_SKIP_TESTS_WITH_DOUBLES)
+  set_source_files_properties(
+    TestFix1601ExtractorMultiTUDoubles.hip
+    inputs/ExtractorMultiTUDoublesTU2.hip PROPERTIES LANGUAGE CXX)
+  add_executable(TestFix1601MultiTUDoublesFixture
+    TestFix1601ExtractorMultiTUDoubles.hip
+    inputs/ExtractorMultiTUDoublesTU2.hip)
+  set_target_properties(TestFix1601MultiTUDoublesFixture PROPERTIES
+    CXX_STANDARD_REQUIRED ON)
+  target_link_libraries(TestFix1601MultiTUDoublesFixture CHIP deviceInternal)
+  add_test(NAME TestFix1601MultiTUDoublesSkipped
+    COMMAND ${SKIP_DOUBLE_TESTS}
+            ${CMAKE_CURRENT_BINARY_DIR}/TestFix1601MultiTUDoublesFixture)
+  # Assert the wrapper's OUTPUT, not its exit status. On a tree without the fix
+  # for CHIP-SPV/chipStar#1592 the wrapper returns system()'s raw wait status
+  # from main(), which keeps only the low 8 bits, and every child outcome maps
+  # to 0 there: an exit code E arrives as E<<8, and a signal death arrives as
+  # the shell's own 128+signal, likewise shifted. So an exit-status gate cannot
+  # fail on such a tree, while a missing marker still can.
+  set_tests_properties(TestFix1601MultiTUDoublesSkipped PROPERTIES
+    PASS_REGULAR_EXPRESSION "HIP_SKIP_THIS_TEST: Kernel uses doubles"
+    SKIP_REGULAR_EXPRESSION "HIP_SKIP_THIS_TEST: Kernel uses doubles")
+endif()
+
+# spirv-extractor --check-for-doubles wraps every test when
+# CHIP_SKIP_TESTS_WITH_DOUBLES=ON; it must propagate the wrapped exit status.
+add_shell_test(TestFix1592ExtractorExitStatus.bash)
+
+# The same wrapper must also hand the test its arguments byte for byte; a
+# Catch2 case name containing a space was being re-split by the shell.
+add_shell_test(TestFix1600ExtractorArgvBoundaries.bash)
+
+# --validate and -o must handle a module of any SPIR-V version (#1696).
+add_shell_test(TestFix1696ExtractorSpirvVersion.bash)
+
+# The two volatile reproducers above are deliberately not registered as ctests:
+# both PASS on a chipStar built without HipLowerVolatileAccessesPass, so neither
+# can gate a regression. TestFixVolatileLoadLowering only checks that the
+# accesses still compute the right values and is the compile input for the
+# SPIR-V check below. TestFixKokkosUnorderedMapInsert is the real Kokkos insert
+# idiom and is kept for reference, but it is a race: measured pre-fix it failed
+# 1 of 3 runs on PVC and 0 of 3 on a B570 and a UHD 770.
+# TestFix1508VolatileGlobalStaleness replaces them as the gate. It removes the
+# race by priming the reader's cache before the writer runs, and pre-fix it
+# fails 35840 of 35840 readers on both PVC and B570 while passing on parts whose
+# global loads are already coherent. It is picked up by the Test*.hip glob.
+
+# Volatile global accesses must reach the SPIR-V producer rewritten to bypass
+# the core-private cache (Kokkos::volatile_load on PVC reads stale L1 data
+# otherwise), in whichever of the two forms this build selected. Inspects the
+# lowered device bitcode of TestFixVolatileLoadLowering.hip, and the SPIR-V
+# module when spirv-dis exists.
+add_shell_test(TestFixVolatileLoadLoweringSPIRV.bash)
+
+# The SPIR-V check above proves what chipStar emits; this one proves what the
+# consumer generates from it. IGC discards a cache hint when it widens adjacent
+# stores, which let an A380 run unfixed code while every SPIR-V level check
+# passed. Uses ocloc, which is an offline compiler and needs no GPU.
+add_shell_test(TestFixVolatileLoadLoweringISA.bash)
+
+add_shell_test(../run_testenvvars.sh)
+set_tests_properties(run_testenvvars PROPERTIES
+  TIMEOUT 60)
+
+######################################
+# Per-test properties, for tests registered above.
+######################################
+
+# This test checks if zeEventQuery is a blocking operation
+# TODO - this should check if immediate cmd lists are being used
+set_tests_properties(TestRecordEventBlocking PROPERTIES
+  TIMEOUT 60)
+
+# TestCompileError intentionally triggers ZE_RESULT_ERROR_MODULE_LINK_FAILURE
+# so we need to clear the default FAIL regex which would match "FAILURE"
+set_tests_properties(TestCompileError PROPERTIES FAIL_REGULAR_EXPRESSION "")
+
+# Reproducer for issue #632: __syncthreads() must fence global memory.
+set_tests_properties(TestSyncThreadsGlobalMem PROPERTIES TIMEOUT 300)
+
+set_tests_properties(TestIGCCaching PROPERTIES
+  TIMEOUT 60
+  ENVIRONMENT "CHIP_MODULE_CACHE_DIR=/tmp/chipstar_test_cache_igc")
+
+# Test hipLaunchHostFunc with multi-stream and events (from PR #1071)
+set_tests_properties(TestHipLaunchHostFuncMultiStream PROPERTIES
+  TIMEOUT 30)
+
+set_tests_properties(TestEventResetWarnFlood PROPERTIES
+  ENVIRONMENT "CHIP_LOGLEVEL=warn"
+  FAIL_REGULAR_EXPRESSION "FAIL;reset\\(\\) called while event is recording")
+
+# Reproducer for #1360 (sneaky_snake miscompile). Force -O2: the
+# __clz(0)-poison miscompile only manifests at -O1 and above.
+target_compile_options(TestSnakeMiscompileO2 PRIVATE -O2)
+
+# Reproducer for the unresolved C99 <cmath> float libcalls (tgammaf and co).
+# Run at warn level so the runtime's "Missing definition for 'tgammaf'" report
+# is visible, and fail on it: on Level Zero the unresolved import surfaces only
+# later, as ZE_RESULT_ERROR_INVALID_MODULE_UNLINKED after the relink fallback.
+set_tests_properties(TestFixStdCmathFloatLibcalls PROPERTIES
+  ENVIRONMENT "CHIP_LOGLEVEL=warn"
+  FAIL_REGULAR_EXPRESSION "FAIL;Missing definition for")
+
+######################################
+# Extra ctest invocations of already-registered executables.
+######################################
+
+add_test(NAME TestDefaultBackend_NoBE
+  COMMAND env -u CHIP_BE -u CHIP_DEVICE_TYPE -u CHIP_PLATFORM -u CHIP_DEVICE
+    ${CMAKE_CURRENT_BINARY_DIR}/TestDefaultBackend)
+set_tests_properties(TestDefaultBackend_NoBE PROPERTIES
+  PASS_REGULAR_EXPRESSION "PASS")
+
+# Regression test for https://github.com/CHIP-SPV/chipStar/issues/1199
+# hipGetBackendNativeHandles must return "opencl" or "level0" in NativeHandles[0],
+# never "default", even when CHIP_BE is unset.
+add_test(NAME TestNativeHandlesBackendName_NoBE
+  COMMAND env -u CHIP_BE -u CHIP_DEVICE_TYPE -u CHIP_PLATFORM -u CHIP_DEVICE
+    ${CMAKE_CURRENT_BINARY_DIR}/TestNativeHandlesBackendName)
+set_tests_properties(TestNativeHandlesBackendName_NoBE PROPERTIES
+  PASS_REGULAR_EXPRESSION "PASS"
+  SKIP_RETURN_CODE ${CHIP_SKIP_TEST}
+  SKIP_REGULAR_EXPRESSION "HIP_SKIP_THIS_TEST")
+
+######################################
+# Tests built by hand.
+######################################
+
 # Multi-TU test: same template instantiation in two separate TUs (#808)
 add_custom_command(
   OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/TemplatedKernelAddOne.o
@@ -173,65 +371,184 @@ set_tests_properties(TestTemplateKernelModules PROPERTIES
   SKIP_REGULAR_EXPRESSION "HIP_SKIP_THIS_TEST"
   TIMEOUT 60)
 
-add_shell_test(../run_testenvvars.sh)
-set_tests_properties(run_testenvvars PROPERTIES
-  TIMEOUT 60)
-
-add_hip_runtime_test(TestIGCCaching.hip)
-set_tests_properties(TestIGCCaching PROPERTIES
-  TIMEOUT 60
-  ENVIRONMENT "CHIP_MODULE_CACHE_DIR=/tmp/chipstar_test_cache_igc")
-
-add_hip_runtime_test(host-math-funcs.hip)
-add_hip_runtime_test(TestMemcpyAsyncPageable.hip)
-
-# Test that hipStreamWaitEvent correctly enforces cross-stream ordering.
-add_hip_runtime_test(TestEventRecordCircularDep.cpp)
-
-# Test that blocking streams implicitly synchronize with the default stream.
-add_hip_runtime_test(TestDefaultStreamImplicitSync.hip)
-
-add_hip_runtime_test(TestTypeCastIntrinsics.hip)
-add_hip_runtime_test(TestHipLaunchHostFunc.cpp)
-
-add_hip_runtime_test(TestBoolKernelParam.hip)
-add_hip_runtime_test(TestBoolParamShuffle.cpp)
-find_program(SPIRV_DIS spirv-dis)
-find_program(
-  CLANG_OFFLOAD_BUNDLER
-  NAMES clang-offload-bundler-${LLVM_VERSION_MAJOR} clang-offload-bundler
-  PATHS ${HIP_CLANG_PATH})
-if(SPIRV_DIS AND (NOT USE_NEW_OFFLOAD_DRIVER OR CLANG_OFFLOAD_BUNDLER))
-  add_shell_test(TestBoolKernelParamSPIRV.bash)
-endif()
-# Test hipLaunchHostFunc with multi-stream and events (from PR #1071)
-add_hip_runtime_test(TestHipLaunchHostFuncMultiStream.cpp)
-set_tests_properties(TestHipLaunchHostFuncMultiStream PROPERTIES
-  TIMEOUT 30)
-
-add_hip_runtime_test(TestDefaultBackend.cpp)
-add_test(NAME TestDefaultBackend_NoBE
-  COMMAND env -u CHIP_BE -u CHIP_DEVICE_TYPE -u CHIP_PLATFORM -u CHIP_DEVICE
-    ${CMAKE_CURRENT_BINARY_DIR}/TestDefaultBackend)
-set_tests_properties(TestDefaultBackend_NoBE PROPERTIES
-  PASS_REGULAR_EXPRESSION "PASS")
-
-# Regression test for https://github.com/CHIP-SPV/chipStar/issues/1199
-# hipGetBackendNativeHandles must return "opencl" or "level0" in NativeHandles[0],
-# never "default", even when CHIP_BE is unset.
-add_hip_runtime_test(TestNativeHandlesBackendName.cpp)
-add_test(NAME TestNativeHandlesBackendName_NoBE
-  COMMAND env -u CHIP_BE -u CHIP_DEVICE_TYPE -u CHIP_PLATFORM -u CHIP_DEVICE
-    ${CMAKE_CURRENT_BINARY_DIR}/TestNativeHandlesBackendName)
-set_tests_properties(TestNativeHandlesBackendName_NoBE PROPERTIES
-  PASS_REGULAR_EXPRESSION "PASS"
-  SKIP_RETURN_CODE ${CHIP_SKIP_TEST}
+# Module cache invalidation. The executable is built like any other runtime
+# test, but it has to be run several times with different compilation inputs
+# under one fresh cache directory, so it is registered through a driver script
+# instead of add_hip_runtime_test's single invocation.
+set_source_files_properties(TestModuleCacheInvalidation.hip PROPERTIES LANGUAGE CXX)
+add_executable(TestModuleCacheInvalidation TestModuleCacheInvalidation.hip)
+set_target_properties(TestModuleCacheInvalidation PROPERTIES CXX_STANDARD_REQUIRED ON)
+target_link_libraries(TestModuleCacheInvalidation CHIP deviceInternal)
+target_include_directories(TestModuleCacheInvalidation
+  PRIVATE $<TARGET_PROPERTY:CHIP,INCLUDE_DIRECTORIES>)
+target_compile_definitions(TestModuleCacheInvalidation
+  PRIVATE CHIP_SKIP_TEST=${CHIP_SKIP_TEST})
+add_test(NAME TestModuleCacheInvalidation
+  COMMAND ${CMAKE_COMMAND}
+    -DTEST_EXECUTABLE=$<TARGET_FILE:TestModuleCacheInvalidation>
+    -P ${CMAKE_SOURCE_DIR}/tests/run_module_cache_invalidation_test.cmake)
+set_tests_properties(TestModuleCacheInvalidation PROPERTIES
   SKIP_REGULAR_EXPRESSION "HIP_SKIP_THIS_TEST")
 
-add_hip_runtime_test(TestHeCBenchF16Max.hip)
-add_hip_runtime_test(TestHeCBenchLebesgue.hip)
+# A device compiler that terminates the process during a module build must not
+# leave the runtime deadlocked in its own exit handler (#1393). The exit is
+# injected by an LD_PRELOAD interposer rather than by feeding a backend a module
+# it rejects, so the test does not move with backend compiler behaviour, and a
+# driver script owns the verdict because the expected outcome is a specific
+# non-zero exit status.
+if(UNIX AND NOT APPLE)
+  set_source_files_properties(TestFix1393ExitDuringModuleBuild.hip
+    PROPERTIES LANGUAGE CXX)
+  add_executable(TestFix1393ExitDuringModuleBuild
+    TestFix1393ExitDuringModuleBuild.hip)
+  set_target_properties(TestFix1393ExitDuringModuleBuild PROPERTIES
+    CXX_STANDARD_REQUIRED ON)
+  target_link_libraries(TestFix1393ExitDuringModuleBuild CHIP deviceInternal)
+  target_include_directories(TestFix1393ExitDuringModuleBuild
+    PRIVATE $<TARGET_PROPERTY:CHIP,INCLUDE_DIRECTORIES>)
 
-add_hip_runtime_test(TestGraphAddDependenciesMulti.hip)
-add_hip_runtime_test(TestHipMemcpyInvalidPtr.hip)
+  add_library(ExitDuringModuleBuildInterposer MODULE
+    ExitDuringModuleBuildInterposer.cpp)
+  target_link_libraries(ExitDuringModuleBuildInterposer ${CMAKE_DL_LIBS})
+  # backtrace_symbols() names a frame only if its symbol is in a dynamic symbol
+  # table, which is how the interposer recognises getOrCreateModule.
+  target_link_options(ExitDuringModuleBuildInterposer PRIVATE -rdynamic)
 
-add_hip_runtime_test(TestGraphNullPtrValidation.hip)
+  add_test(NAME TestFix1393ExitDuringModuleBuild
+    COMMAND ${CMAKE_COMMAND}
+      -DTEST_EXECUTABLE=$<TARGET_FILE:TestFix1393ExitDuringModuleBuild>
+      -DINTERPOSER=$<TARGET_FILE:ExitDuringModuleBuildInterposer>
+      -DEXPECTED_EXIT_CODE=93
+      -DTEST_TIMEOUT=60
+      -P ${CMAKE_SOURCE_DIR}/tests/run_exit_during_module_build_test.cmake)
+  set_tests_properties(TestFix1393ExitDuringModuleBuild PROPERTIES
+    SKIP_REGULAR_EXPRESSION "HIP_SKIP_THIS_TEST"
+    TIMEOUT 120)
+endif()
+
+# A clFlush that fails with a status the conversion table does not map aborts
+# the process instead of raising a HIP error (#1604). The failure cannot be
+# provoked from HIP, so an interposer returns CL_OUT_OF_RESOURCES from one
+# clFlush call, and a driver script owns the verdict because it has to sweep
+# the ordinal and because the outcome under test is whether the process
+# survives at all.
+if(UNIX AND NOT APPLE)
+  set_source_files_properties(TestFix1604ClFlushErrorMap.hip
+    PROPERTIES LANGUAGE CXX)
+  add_executable(TestFix1604ClFlushErrorMap TestFix1604ClFlushErrorMap.hip)
+  set_target_properties(TestFix1604ClFlushErrorMap PROPERTIES
+    CXX_STANDARD_REQUIRED ON)
+  target_link_libraries(TestFix1604ClFlushErrorMap CHIP deviceInternal)
+  target_include_directories(TestFix1604ClFlushErrorMap
+    PRIVATE $<TARGET_PROPERTY:CHIP,INCLUDE_DIRECTORIES>)
+
+  add_library(ClFlushErrorInterposer MODULE ClFlushErrorInterposer.cpp)
+  target_link_libraries(ClFlushErrorInterposer ${CMAKE_DL_LIBS})
+
+  add_test(NAME TestFix1604ClFlushErrorMap
+    COMMAND ${CMAKE_COMMAND}
+      -DTEST_EXECUTABLE=$<TARGET_FILE:TestFix1604ClFlushErrorMap>
+      -DINTERPOSER=$<TARGET_FILE:ClFlushErrorInterposer>
+      -DTEST_TIMEOUT=60
+      -P ${CMAKE_SOURCE_DIR}/tests/run_clflush_error_map_test.cmake)
+  set_tests_properties(TestFix1604ClFlushErrorMap PROPERTIES
+    PASS_REGULAR_EXPRESSION "PASS"
+    SKIP_REGULAR_EXPRESSION "HIP_SKIP_THIS_TEST"
+    TIMEOUT 300)
+endif()
+
+# A failed device-side assertion must report its message on stderr, where ROCm
+# writes it and where gtest death tests (Kokkos hip_DeathTest.abort_from_device)
+# look for it; device printf only reaches stdout. The expected outcome is a
+# SIGABRT death plus specific stderr content, which add_hip_runtime_test cannot
+# express, so a driver script owns the verdict.
+#
+# Registered only with program-scope globals enabled: __assert_fail is a weak
+# noinline device function, so the abort flag it sets is loaded outside any
+# kernel and the globals-as-kernel-args lowering (HipGlobalVariables.cpp,
+# CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS=OFF) leaves it a program-scope
+# global with an initializer, which rusticl/Mesa rejects at spirv_to_nir
+# ("Initializer for CrossWorkgroup variable not yet supported"). Any device
+# abort reached through a non-inlined function fails the same way there.
+if(CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS)
+  set_source_files_properties(TestDeviceAbortStderr.hip PROPERTIES LANGUAGE CXX)
+  add_executable(TestDeviceAbortStderr TestDeviceAbortStderr.hip)
+  set_target_properties(TestDeviceAbortStderr PROPERTIES CXX_STANDARD_REQUIRED ON)
+  target_link_libraries(TestDeviceAbortStderr CHIP deviceInternal)
+  target_include_directories(TestDeviceAbortStderr
+    PRIVATE $<TARGET_PROPERTY:CHIP,INCLUDE_DIRECTORIES>)
+  add_test(NAME TestDeviceAbortStderr
+    COMMAND ${CMAKE_COMMAND}
+      -DTEST_EXECUTABLE=$<TARGET_FILE:TestDeviceAbortStderr>
+      -DTEST_TIMEOUT=60
+      -P ${CMAKE_SOURCE_DIR}/tests/run_device_abort_stderr_test.cmake)
+  set_tests_properties(TestDeviceAbortStderr PROPERTIES TIMEOUT 120)
+endif()
+# Reproducer for the unregistered comdat device variables (a function-local
+# static __device__ variable, an inline __device__ variable, a template static
+# data member). The bug needs two device modules carrying the same variables,
+# so the test is linked from two translation units, which
+# add_hip_runtime_test cannot express. Run at warn level so the runtime's
+# device variable diagnostics are visible in the log.
+#
+# The function-local static and the inline variable are not lowered by
+# HipGlobalVariables (not externally_initialized, local_unnamed_addr) and stay
+# initialized program-scope globals in the device module. That is what
+# CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS=OFF is built for avoiding: its
+# target drivers (rusticl/radeonsi) reject the module outright ("Initializer
+# for CrossWorkgroup variable not yet supported in Mesa", #1279), so the test
+# is only registered when the option is ON.
+if(CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS)
+set_source_files_properties(TestFixFunctionLocalStaticDeviceVar.hip
+  inputs/FunctionLocalStaticDeviceVarTU2.hip PROPERTIES LANGUAGE CXX)
+add_executable(TestFixFunctionLocalStaticDeviceVar
+  TestFixFunctionLocalStaticDeviceVar.hip
+  inputs/FunctionLocalStaticDeviceVarTU2.hip)
+set_target_properties(TestFixFunctionLocalStaticDeviceVar PROPERTIES
+  CXX_STANDARD_REQUIRED ON)
+target_link_libraries(TestFixFunctionLocalStaticDeviceVar CHIP deviceInternal)
+target_include_directories(TestFixFunctionLocalStaticDeviceVar
+  PRIVATE $<TARGET_PROPERTY:CHIP,INCLUDE_DIRECTORIES>)
+target_compile_definitions(TestFixFunctionLocalStaticDeviceVar
+  PRIVATE CHIP_SKIP_TEST=${CHIP_SKIP_TEST})
+add_test(NAME TestFixFunctionLocalStaticDeviceVar
+  COMMAND ${HIP_PROFILE_TESTS_COMMAND} ${SKIP_DOUBLE_TESTS}
+    ${CMAKE_CURRENT_BINARY_DIR}/TestFixFunctionLocalStaticDeviceVar)
+set_tests_properties(TestFixFunctionLocalStaticDeviceVar PROPERTIES
+  ENVIRONMENT "CHIP_LOGLEVEL=warn"
+  PASS_REGULAR_EXPRESSION "PASS"
+  FAIL_REGULAR_EXPRESSION "FAIL"
+  SKIP_RETURN_CODE ${CHIP_SKIP_TEST}
+  SKIP_REGULAR_EXPRESSION "HIP_SKIP_THIS_TEST"
+  TIMEOUT 120)
+endif()
+
+# The OpenCL backend's queue mode switch must not leak the barrier event it
+# enqueues (#1543). The leak cannot be seen through the HIP API, so an
+# LD_PRELOAD interposer keeps the reference balance of every barrier event and
+# a driver script turns its report into the verdict.
+if(UNIX AND NOT APPLE)
+  set_source_files_properties(TestFix1543SwitchModeEventLeak.hip
+    PROPERTIES LANGUAGE CXX)
+  add_executable(TestFix1543SwitchModeEventLeak
+    TestFix1543SwitchModeEventLeak.hip)
+  set_target_properties(TestFix1543SwitchModeEventLeak PROPERTIES
+    CXX_STANDARD_REQUIRED ON)
+  target_link_libraries(TestFix1543SwitchModeEventLeak CHIP deviceInternal)
+  target_include_directories(TestFix1543SwitchModeEventLeak
+    PRIVATE $<TARGET_PROPERTY:CHIP,INCLUDE_DIRECTORIES>)
+
+  add_library(BarrierEventLeakInterposer MODULE
+    BarrierEventLeakInterposer.cpp)
+  target_link_libraries(BarrierEventLeakInterposer ${CMAKE_DL_LIBS})
+
+  add_test(NAME TestFix1543SwitchModeEventLeak
+    COMMAND ${CMAKE_COMMAND}
+      -DTEST_EXECUTABLE=$<TARGET_FILE:TestFix1543SwitchModeEventLeak>
+      -DINTERPOSER=$<TARGET_FILE:BarrierEventLeakInterposer>
+      -DTEST_TIMEOUT=60
+      -P ${CMAKE_SOURCE_DIR}/tests/run_barrier_event_leak_test.cmake)
+  set_tests_properties(TestFix1543SwitchModeEventLeak PROPERTIES
+    SKIP_REGULAR_EXPRESSION "HIP_SKIP_THIS_TEST"
+    TIMEOUT 120)
+endif()

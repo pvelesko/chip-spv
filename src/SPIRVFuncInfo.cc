@@ -83,6 +83,8 @@ std::string_view SPVFuncInfo::Arg::getKindAsString() const {
     return "Sampler";
   case SPVTypeKind::DeviceGlobalHidden:
     return "DeviceGlobalHidden";
+  case SPVTypeKind::DeviceGlobal:
+    return "DeviceGlobal";
   }
 }
 
@@ -109,8 +111,9 @@ void SPVFuncInfo::visitClientArgsImpl(void **ClientArgList,
     // <<<>>>-syntax - not in a kernel parameter list.
     if (ArgTI.isWorkgroupPtr())
       continue;
-    // Phase H4: hidden device-global arg - never visible to the HIP client.
-    if (ArgKind == SPVTypeKind::DeviceGlobalHidden)
+    // Implicit device-global address arguments are provided by the runtime.
+    if (ArgKind == SPVTypeKind::DeviceGlobal ||
+        ArgKind == SPVTypeKind::DeviceGlobalHidden)
       continue;
 
     // Map kernel argument types to types as defined in HIP source code.
@@ -157,10 +160,15 @@ void SPVFuncInfo::visitKernelArgsImpl(void **ClientArgList,
     if (ArgKind == SPVTypeKind::Sampler)
       ArgListIndex--;
 
+    // DeviceGlobal args are implicit (provided by the runtime, not the client),
+    // so they don't consume an entry from the client argument list.
+    bool IsImplicit =
+        ArgTI.isWorkgroupPtr() || ArgKind == SPVTypeKind::DeviceGlobal;
+
     const void *ArgData = nullptr;
-    bool ConsumesClientSlot = !ArgTI.isWorkgroupPtr() &&
-                              ArgKind != SPVTypeKind::DeviceGlobalHidden;
-    if (ClientArgList && ConsumesClientSlot) {
+    bool IsHidden = ArgKind == SPVTypeKind::DeviceGlobal ||
+                    ArgKind == SPVTypeKind::DeviceGlobalHidden;
+    if (ClientArgList && !IsImplicit && !IsHidden) {
       ArgData = ClientArgList[ArgListIndex];
 
       // Clang geerated  argument list should not have nullptrs in it.
@@ -169,21 +177,18 @@ void SPVFuncInfo::visitKernelArgsImpl(void **ClientArgList,
 
     unsigned EffectiveIndex =
         ArgTI.KernelArgIndex >= 0 ? (unsigned)ArgTI.KernelArgIndex : ArgIndex;
-    // Use direct field assignment instead of nested aggregate
-    // initialization because brace-init through derived structs
-    // (KernelArg : Arg : SPVArgTypeInfo) was silently dropping the
-    // overridden Index in older toolchains.
     KernelArg KArg{};
     KArg.Kind = ArgKind;
     KArg.StorageClass = ArgTI.StorageClass;
     KArg.Size = ArgSize;
+    KArg.DevGlobalName = ArgTI.DevGlobalName;
     KArg.KernelArgIndex = ArgTI.KernelArgIndex;
     KArg.Index = EffectiveIndex;
     KArg.Data = ArgData;
     Visitor(KArg);
 
     ArgIndex++;
-    if (ConsumesClientSlot)
+    if (!IsHidden)
       ArgListIndex++;
   }
 }
@@ -205,6 +210,7 @@ unsigned SPVFuncInfo::getNumClientArgs() const {
   for (const auto &ArgTI : ArgTypeInfo_) {
     auto ArgKind = ArgTI.Kind;
     Count -= ArgKind == SPVTypeKind::Sampler || ArgTI.isWorkgroupPtr() ||
+             ArgKind == SPVTypeKind::DeviceGlobal ||
              ArgKind == SPVTypeKind::DeviceGlobalHidden;
   }
   return Count;

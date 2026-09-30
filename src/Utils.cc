@@ -24,6 +24,9 @@
 
 #include "logging.hh"
 
+#include <cctype>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <random>
 
@@ -206,7 +209,7 @@ std::optional<fs::path> getHIPCCPath() {
       }
   });
 
-  logDebug("HIPCC path: {}", HIPCCPath->c_str());
+  logDebug("HIPCC path: {}", HIPCCPath ? HIPCCPath->c_str() : "not found");
   return HIPCCPath;
 }
 
@@ -253,35 +256,128 @@ bool startsWith(std::string_view Str, std::string_view WithStr) {
          Str.substr(0, WithStr.size()) == WithStr;
 }
 
-std::string collectIGCEnvironmentVariables() {
-  std::vector<std::string> igcVars;
-  logDebug("Collecting IGC environment variables...");
-  
+uint64_t fnv1a64(const std::string &S) {
+  uint64_t Hash = UINT64_C(14695981039346656037);
+  for (unsigned char C : S) {
+    Hash ^= C;
+    Hash *= UINT64_C(1099511628211);
+  }
+  return Hash;
+}
+
+/// True when 'Name' has the shape of a Compute Runtime debug key.
+///
+/// NEO reads every declared key by bare name: EnvironmentVariableReader::
+/// getSetting() calls getenv(prefix + settingName) for each valid prefix and
+/// "" is one of them (shared/source/os_interface/debug_env_reader.cpp; the
+/// prefixes come from api_specific_config_{ocl,l0}.cpp and are
+/// {"NEO_OCL_"/"NEO_L0_", "NEO_", ""}). Under NEOReadDebugKeys any variable
+/// named like a declared key can therefore reach the compiler, and the cache
+/// key has to cover all of them.
+///
+/// Every one of the 750 names in shared/source/debug_settings/
+/// debug_variables_base.inl is a CamelCase C++ identifier: none contains an
+/// underscore and each has at least one lower-case letter. That is what
+/// separates them from the batch scheduler and launcher variables (PBS_*,
+/// PMIX_*, SLURM_*, HOSTNAME, PALS_APID, TMPDIR), which take a fresh value on
+/// every launch and, when hashed, make the key unique per run so the cache can
+/// never hit.
+static bool looksLikeNeoDebugKey(std::string_view Name) {
+  if (Name.empty() || !std::isalpha(static_cast<unsigned char>(Name.front())))
+    return false;
+  bool HasLower = false;
+  for (char C : Name) {
+    if (C == '_')
+      return false;
+    HasLower |= std::islower(static_cast<unsigned char>(C)) != 0;
+  }
+  return HasLower;
+}
+
+std::string collectCompilerEnvironmentVariables() {
+  // Environment variables that reach the device compiler and change the
+  // binary it produces.
+  //
+  // Prefixes:
+  //  - IGC_: complete for IGC by construction; its regkey reader literally
+  //    prepends "IGC_" to every declared flag before calling getenv
+  //    (intel-graphics-compiler, igc_regkeys.cpp, ReadIGCEnv).
+  //  - NEO: Compute Runtime's spelling prefix. Every NEO debug/release
+  //    variable is also readable as NEO_<name> (api_specific_config_ocl.cpp,
+  //    validClPrefixes = {"NEO_OCL_", "NEO_", ""}), and this also catches
+  //    NEOReadDebugKeys itself.
+  //  - Override: the bare-name NEO family that includes
+  //    OverrideDefaultFP64Settings, the motivating case: it switches on fp64
+  //    emulation and the x86 CI exports it on every job.
+  //
+  // Exact names: NEO release variables that match no prefix but are honored
+  // ungated by stock release drivers (release_variables_base.inl), plus the
+  // two ZET_ program-instrumentation switches that change the produced
+  // binary (L1 cache policy build options on debugger-attach products).
+  // ZE_* as a class is deliberately NOT matched: those select devices and
+  // layers, and device identity is keyed separately; hashing them only
+  // causes false invalidation.
+  static constexpr const char *CompilerEnvPrefixes[] = {"IGC_", "NEO",
+                                                        "Override"};
+  static constexpr const char *CompilerEnvExact[] = {
+      "ZET_ENABLE_PROGRAM_DEBUGGING", "ZET_ENABLE_PROGRAM_INSTRUMENTATION",
+      "EnableLEO", "ZEX_NUMBER_OF_CCS", "ONEAPI_PVC_SEND_WAR_WA"};
+
+  std::vector<std::string> Vars;
+  logDebug("Collecting device compiler environment variables...");
+
   // Access the environment variables through the global environ variable
   extern char **environ;
-  
-  for (char **env = environ; *env != nullptr; ++env) {
-    std::string envVar(*env);
-    if (startsWith(envVar, "IGC_")) {
-      logDebug("Found IGC variable: {}", envVar);
-      igcVars.push_back(envVar);
+
+  // With NEOReadDebugKeys set to a nonzero value, Compute Runtime reads all
+  // of its ~750 debug variables by bare name, and any of them may reach the
+  // compiler (InjectInternalBuildOptions is an arbitrary string appended to
+  // the build options). The prefix list above cannot cover those, so while the
+  // gate is on every variable shaped like a debug key is hashed as well. With
+  // the gate off (the normal case) none of them is read at all.
+  const char *DebugKeys = std::getenv("NEOReadDebugKeys");
+  const bool DebugKeysEnabled = DebugKeys && std::atoll(DebugKeys) != 0;
+
+  for (char **Env = environ; *Env != nullptr; ++Env) {
+    std::string_view EnvVar(*Env);
+    auto Eq = EnvVar.find('=');
+    if (Eq == std::string_view::npos)
+      continue; // Not a NAME=VALUE entry.
+    auto Name = EnvVar.substr(0, Eq);
+
+    bool Match = DebugKeysEnabled && looksLikeNeoDebugKey(Name);
+    if (!Match)
+      for (const char *Prefix : CompilerEnvPrefixes)
+        if (startsWith(Name, Prefix)) {
+          Match = true;
+          break;
+        }
+    if (!Match)
+      for (const char *Exact : CompilerEnvExact)
+        if (Name == Exact) {
+          Match = true;
+          break;
+        }
+    if (Match) {
+      logDebug("Found compiler variable: {}", EnvVar);
+      Vars.emplace_back(EnvVar);
     }
   }
-  
-  // Sort to ensure consistent ordering for cache key generation
-  std::sort(igcVars.begin(), igcVars.end());
-  
-  // Concatenate all IGC_ variables into a single string
-  std::string result;
-  for (const auto& var : igcVars) {
-    if (!result.empty()) {
-      result += ";";
+
+  // Sort so the key does not depend on the order the environment happens to be
+  // laid out in.
+  std::sort(Vars.begin(), Vars.end());
+
+  std::string Result;
+  for (const auto &Var : Vars) {
+    if (!Result.empty()) {
+      Result += ";";
     }
-    result += var;
+    Result += Var;
   }
-  
-  logDebug("Collected IGC variables string: '{}'", result);
-  return result;
+
+  logDebug("Collected compiler variables string: '{}'", Result);
+  return Result;
 }
 
 /// Deep copies kernel arguments pointed by 'CopyArg'. Bytes of the

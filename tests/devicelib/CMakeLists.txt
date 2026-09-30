@@ -25,12 +25,12 @@
 
 add_hip_test(implicitCasts.cpp)
 
+# Device-side malloc requires the device heap program-scope global, which is
+# omitted when CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS is OFF. Only register
+# this compile test when the feature is enabled.
 # Add this as a hipcc otherwise the `make all` will fail which is not convenient indicator for test failure
-# Device-side new/delete/malloc compiles into pointer-cast patterns the in-tree
-# LLVM SPIR-V backend cannot legalize (SPIRVLegalizePointerCast asserts on
-# aggregate loads). Vulkan compute also cannot support device-side malloc.
-# Skip under CHIP_USE_NATIVE_VULKAN_SPIRV.
-if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
+# Device malloc is unavailable on the native Vulkan path.
+if(CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS AND NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
   add_test(NAME "deviceMallocCompile"
     COMMAND ${CMAKE_BINARY_DIR}/bin/hipcc
     ${CMAKE_CURRENT_SOURCE_DIR}/deviceMallocCompile.cpp)
@@ -42,6 +42,13 @@ add_hip_test(shfl_sync.cpp)
 set_tests_properties(shfl_sync PROPERTIES
   FAIL_REGULAR_EXPRESSION "FAIL")
 set_tests_properties(shfl_sync PROPERTIES
+  PASS_REGULAR_EXPRESSION "PASS")
+
+add_hip_test(shfl_width.cpp)
+
+set_tests_properties(shfl_width PROPERTIES
+  FAIL_REGULAR_EXPRESSION "FAIL")
+set_tests_properties(shfl_width PROPERTIES
   PASS_REGULAR_EXPRESSION "PASS")
 
 # Verify OCML (irif.h) does not emit i128 - buggy irif uses wrong types for OpenCL
@@ -57,3 +64,50 @@ set_tests_properties(irif_no_i128 PROPERTIES
 add_hip_test(TestAtomicMinMaxFloat.cpp)
 set_tests_properties(TestAtomicMinMaxFloat PROPERTIES
   PASS_REGULAR_EXPRESSION "PASS")
+
+add_hip_test(TestStdModfFloat.cpp)
+set_tests_properties(TestStdModfFloat PROPERTIES
+  PASS_REGULAR_EXPRESSION "PASSED")
+
+add_hip_test(TestAtomicIncDecMod.cpp)
+set_tests_properties(TestAtomicIncDecMod PROPERTIES
+  PASS_REGULAR_EXPRESSION "PASSED")
+
+add_hip_test(TestAtomicFPMinMaxBuiltins.cpp)
+set_tests_properties(TestAtomicFPMinMaxBuiltins PROPERTIES
+  PASS_REGULAR_EXPRESSION "PASSED")
+
+add_hip_test(TestStdLlroundFloat.cpp)
+set_tests_properties(TestStdLlroundFloat PROPERTIES
+  PASS_REGULAR_EXPRESSION "PASSED")
+
+add_hip_test(TestStdLdexp.cpp)
+set_tests_properties(TestStdLdexp PROPERTIES
+  PASS_REGULAR_EXPRESSION "PASSED")
+
+# The long double / floating-point abs ambiguity of CHIP-SPV/chipStar#1583 only
+# shows up with a C++ standard library whose host math overloads are not
+# constexpr - libc++, i.e. every macOS build. libstdc++ marks them constexpr,
+# which makes them implicitly __host__ __device__ and hides the gap. Register
+# the compile check only where libc++ is actually usable.
+set(LIBCXX_PROBE_SRC ${CMAKE_CURRENT_BINARY_DIR}/libcxx_probe.cpp)
+file(WRITE ${LIBCXX_PROBE_SRC}
+  "#include <cmath>\nint main() { return static_cast<int>(std::sqrt(4.0)); }\n")
+execute_process(
+  COMMAND ${CLANG_ROOT_PATH_BIN}/clang++ -stdlib=libc++ -fsyntax-only ${LIBCXX_PROBE_SRC}
+  RESULT_VARIABLE LIBCXX_PROBE_RESULT
+  OUTPUT_QUIET ERROR_QUIET)
+if(LIBCXX_PROBE_RESULT EQUAL 0)
+  add_test(NAME "TestFix1583LongDoubleMath"
+    COMMAND ${CMAKE_BINARY_DIR}/bin/hipcc -stdlib=libc++ -c
+      -o ${CMAKE_CURRENT_BINARY_DIR}/TestFix1583LongDoubleMath.o
+      ${CMAKE_CURRENT_SOURCE_DIR}/TestFix1583LongDoubleMath.cpp)
+endif()
+
+# The integer-argument ambiguity of CHIP-SPV/chipStar#1586 is not libc++
+# specific: an unqualified call is ambiguous with any standard library,
+# because both candidates come from devicelib itself.
+add_test(NAME "TestFix1586IntArgMath"
+  COMMAND ${CMAKE_BINARY_DIR}/bin/hipcc -c
+    -o ${CMAKE_CURRENT_BINARY_DIR}/TestFix1586IntArgMath.o
+    ${CMAKE_CURRENT_SOURCE_DIR}/TestFix1586IntArgMath.cpp)

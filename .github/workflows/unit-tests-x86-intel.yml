@@ -1,0 +1,173 @@
+name: Unit tests (x86 Intel GPU)
+
+# chipStar's own HIP unit tests on Intel hardware: both SPIR-V producers,
+# both device classes (integrated and discrete), both backends.
+#
+# Single job on purpose. The previous layout was six jobs handing a ~13 GB
+# tree between them through /tmp/chipstar-ci-staging, which only worked
+# because exactly one runner answered [self-hosted, Linux, X64]. GitHub
+# cannot require that two jobs share a runner, so a second x86 machine broke
+# every consumer of that tree. One job cannot be split across hosts.
+
+on:
+  pull_request:
+    paths-ignore: "docs/**"
+  workflow_dispatch:
+
+concurrency:
+  group: meatloaf-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  chipstar-unit-tests:
+    name: chipStar unit tests (LLVM 23, native + translator)
+    runs-on: [self-hosted, Linux, X64]
+    env:
+      # Content-addressed kernel cache, persistent and shared across PRs: the
+      # key covers module SPIR-V, driver option strings, linked rtdevlib
+      # modules, device identity, the loader-delta digest of the libraries the
+      # runtime loaded at init, and the compiler environment. A chipStar
+      # change that alters device output therefore misses. Known gaps are in
+      # the README's Module Cache section.
+      #
+      # Not under /tmp: this runner reboots and clears it.
+      CHIP_MODULE_CACHE_DIR: /home/pvelesko/.cache/chipstar-ci
+      # IGC software fp64 emulation: Arc A380 (Alchemist) has no native fp64.
+      # Set for build and test alike, since kernels using doubles are compiled
+      # at build time.
+      IGC_EnableDPEmulation: "1"
+      OverrideDefaultFP64Settings: "1"
+      CHIP_LOGLEVEL: err
+      POCL_KERNEL_CACHE: "0"
+      # 10s under the 1800s test timeout so the runtime gives up first.
+      CHIP_L0_EVENT_TIMEOUT: "1790"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - name: Sanity-check runner (page locking, OpenCL devices)
+        shell: bash
+        run: |
+          set -e
+          echo '#include <sys/mman.h>
+          #include <stdlib.h>
+          int main() { void *p = malloc(4096); return mlock(p, 4096); }' \
+            | gcc -x c - -o /tmp/mlocktest && /tmp/mlocktest \
+            && echo "Page locking works" || { echo "Page locking failed"; exit 1; }
+          source scripts/module-env.sh
+          module load oneapi/2025.0.4 opencl/dgpu
+          clinfo -l | grep "Platform #0" || { echo "No OpenCL devices detected."; exit 1; }
+
+      # =====================================================================
+      # Lane 1: in-tree SPIR-V backend
+      # =====================================================================
+      - name: Build chipStar (native SPIR-V backend)
+        shell: bash
+        run: |
+          set -e
+          source scripts/module-env.sh
+          module load oneapi/2025.0.4 llvm/23.0 level-zero/dgpu
+          ./install_chipstar.py -c chipstar --with-tests --no-install -j 8 \
+            --cmake-flags="-DCHIP_LLVM_USE_INTERGRATED_SPIRV=ON -DCHIP_ATOMICS_CACHE_BYPASS_WORKAROUND=ON"
+
+      - name: Test native, igpu opencl
+        shell: bash
+        run: |
+          set -e
+          source scripts/module-env.sh
+          module load oneapi/2025.0.4 llvm/23.0 opencl/igpu
+          nt=$(cat /opt/actions-runner/num-threads.txt 2>/dev/null || nproc)
+          cd build && ../scripts/check.py ./ igpu opencl --num-threads=$nt --timeout=1800
+
+      - name: Test native, igpu level0
+        shell: bash
+        run: |
+          set -e
+          source scripts/module-env.sh
+          module load oneapi/2025.0.4 llvm/23.0 level-zero/igpu
+          nt=$(cat /opt/actions-runner/num-threads.txt 2>/dev/null || nproc)
+          cd build && ../scripts/check.py ./ igpu level0 --num-threads=$nt --timeout=1800
+
+      - name: Test native, dgpu opencl
+        shell: bash
+        run: |
+          set -e
+          source scripts/module-env.sh
+          module load oneapi/2025.0.4 llvm/23.0 opencl/dgpu
+          nt=$(cat /opt/actions-runner/num-threads.txt 2>/dev/null || nproc)
+          cd build && ../scripts/check.py ./ dgpu opencl --num-threads=$nt --timeout=1800
+
+      - name: Test native, dgpu level0
+        shell: bash
+        run: |
+          set -e
+          source scripts/module-env.sh
+          module load oneapi/2025.0.4 llvm/23.0 level-zero/dgpu
+          nt=$(cat /opt/actions-runner/num-threads.txt 2>/dev/null || nproc)
+          cd build && ../scripts/check.py ./ dgpu level0 --num-threads=$nt --timeout=1800
+
+      # =====================================================================
+      # Lane 2: llvm-spirv translator
+      #
+      # One LLVM 23 toolchain serves both lanes: chipStar's patches landed in
+      # llvm#213052, so the SPIRV-target build also drives the translator and
+      # the producer is chosen per build by CHIP_LLVM_USE_INTERGRATED_SPIRV.
+      # The installer wipes and recreates build/ per invocation, so the two
+      # configurations never share incremental state.
+      # =====================================================================
+      - name: Build chipStar (llvm-spirv translator)
+        shell: bash
+        run: |
+          set -e
+          source scripts/module-env.sh
+          module load oneapi/2025.0.4 llvm/23.0 level-zero/dgpu
+          ./install_chipstar.py -c chipstar --with-tests --no-install -j 8 \
+            --cmake-flags="-DCHIP_LLVM_USE_INTERGRATED_SPIRV=OFF -DCHIP_ATOMICS_CACHE_BYPASS_WORKAROUND=ON"
+
+      - name: Test translator, igpu opencl
+        shell: bash
+        run: |
+          set -e
+          source scripts/module-env.sh
+          module load oneapi/2025.0.4 llvm/23.0 opencl/igpu
+          nt=$(cat /opt/actions-runner/num-threads.txt 2>/dev/null || nproc)
+          cd build && ../scripts/check.py ./ igpu opencl --num-threads=$nt --timeout=1800
+
+      - name: Test translator, igpu level0
+        shell: bash
+        run: |
+          set -e
+          source scripts/module-env.sh
+          module load oneapi/2025.0.4 llvm/23.0 level-zero/igpu
+          nt=$(cat /opt/actions-runner/num-threads.txt 2>/dev/null || nproc)
+          cd build && ../scripts/check.py ./ igpu level0 --num-threads=$nt --timeout=1800
+
+      - name: Test translator, dgpu opencl
+        shell: bash
+        run: |
+          set -e
+          source scripts/module-env.sh
+          module load oneapi/2025.0.4 llvm/23.0 opencl/dgpu
+          nt=$(cat /opt/actions-runner/num-threads.txt 2>/dev/null || nproc)
+          cd build && ../scripts/check.py ./ dgpu opencl --num-threads=$nt --timeout=1800
+
+      - name: Test translator, dgpu level0
+        shell: bash
+        run: |
+          set -e
+          source scripts/module-env.sh
+          module load oneapi/2025.0.4 llvm/23.0 level-zero/dgpu
+          nt=$(cat /opt/actions-runner/num-threads.txt 2>/dev/null || nproc)
+          cd build && ../scripts/check.py ./ dgpu level0 --num-threads=$nt --timeout=1800
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-logs-x86
+          path: |
+            build/checkpy_*.txt
+            build/Testing/**/LastTest.log
+          if-no-files-found: ignore

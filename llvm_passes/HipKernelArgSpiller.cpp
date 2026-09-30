@@ -314,6 +314,8 @@ static bool spillKernelArgs(Function *F) {
 #endif
     auto SrcAlign = DL.getABITypeAlign(AllocaTy);
     auto *LocalCopy = createEntryAlloca(B, AllocaTy);
+    auto ParamAlign = F->getParamAlign(OrigArg.getArgNo()).valueOrOne();
+    LocalCopy->setAlignment(std::max(LocalCopy->getAlign(), ParamAlign));
     auto AllocSizeInBitsOpt = LocalCopy->getAllocationSizeInBits(DL);
     assert(AllocSizeInBitsOpt);
 #if LLVM_VERSION_MAJOR > 17
@@ -328,7 +330,9 @@ static bool spillKernelArgs(Function *F) {
     CallArgs.push_back(LocalCopy);
   }
 
-  B.CreateCall(F, CallArgs); // Call the original kernel.
+  auto *Call = B.CreateCall(F, CallArgs); // Call the original kernel.
+  Call->setCallingConv(F->getCallingConv());
+  Call->setAttributes(F->getAttributes().removeFnAttributes(F->getContext()));
 
   annotateSpilledArgs(NewF, ArgsToSpill);
 
@@ -358,6 +362,7 @@ PreservedAnalyses HipKernelArgSpillerPass::run(Module &M,
                             : PreservedAnalyses::all();
 }
 
+#ifndef CHIP_COMBINED_PASS_PLUGIN
 extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
 llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, PASS_NAME, LLVM_VERSION_STRING,
@@ -373,3 +378,4 @@ llvmGetPassPluginInfo() {
                 });
           }};
 }
+#endif // CHIP_COMBINED_PASS_PLUGIN

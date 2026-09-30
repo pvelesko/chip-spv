@@ -14,6 +14,24 @@ function(add_hip_test MAIN_SOURCE)
   add_dependencies(build_tests "${EXEC_NAME}")
 endfunction()
 
+# configure_llvm.sh must not depend on the network to check out a pinned tag it
+# already has. Needs only git, so it runs everywhere.
+add_test(NAME configure_llvm_pinned_fetch
+  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/configure_llvm_pinned_fetch.bash
+    ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/configure_llvm.sh)
+set_tests_properties(configure_llvm_pinned_fetch PROPERTIES
+  FAIL_REGULAR_EXPRESSION "FAIL"
+  PASS_REGULAR_EXPRESSION "PASSED")
+
+# The Mali workflow's image GC must not delete the image the run just built.
+# Needs only text processing, no docker.
+add_test(NAME cross_image_gc
+  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/cross_image_gc.bash
+    ${CMAKE_CURRENT_SOURCE_DIR}/../.github/workflows/unit-tests-arm64-mali.yml)
+set_tests_properties(cross_image_gc PROPERTIES
+  FAIL_REGULAR_EXPRESSION "FAIL"
+  PASS_REGULAR_EXPRESSION "PASSED")
+
 add_subdirectory(compiler)
 add_subdirectory(cuda)
 add_subdirectory(devicelib)
@@ -24,3 +42,57 @@ add_subdirectory(runtime)
 add_subdirectory(libraries)
 add_subdirectory(benchmarks)
 add_subdirectory(regression)
+
+# Reproducer for CHIP-SPV/chipStar#1488. clang loads lib/libLLVMHipSpvPasses.so
+# as a pass plugin (through --hip-path) while compiling HIP device code, so
+# every object compiled from a HIP source has to be ordered after that link.
+# The walk follows order-only inputs, which is where the Ninja generator puts
+# target-level dependencies. One probe per registration path: the Test* glob
+# in runtime/, add_hip_test(), and the catch suite, whose own CMake tree
+# compiles with hipcc.bin and never links CHIP.
+if(CMAKE_GENERATOR MATCHES "Ninja")
+  find_package(Python3 COMPONENTS Interpreter)
+endif()
+if(CMAKE_GENERATOR MATCHES "Ninja" AND Python3_Interpreter_FOUND)
+  set(BUILD_ORDER_PROBES
+    $<TARGET_OBJECTS:TestKernelArgs>
+    $<TARGET_OBJECTS:TestFixUmul64hi>)
+  if(TARGET ErrorHandlingTest)
+    list(APPEND BUILD_ORDER_PROBES $<TARGET_OBJECTS:ErrorHandlingTest>)
+  endif()
+  add_test(NAME TestFix1488PassPluginBuildOrder
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/check_build_order.py
+      --ninja ${CMAKE_MAKE_PROGRAM} --build-dir ${CMAKE_BINARY_DIR}
+      --required $<TARGET_FILE:LLVMHipPasses> ${BUILD_ORDER_PROBES})
+endif()
+
+# Reproduce #1486: the SPIRV-Tools ExternalProject named its compilers by bare
+# name, so a PATH that differs between two builds made cmake wipe the
+# external's cache and `ninja install` wrote to /usr/local. Script test:
+# configures the module on its own and drives the generated configure step.
+add_test(NAME TestFix1486SpirvToolsInstallPrefix
+  COMMAND ${CMAKE_COMMAND}
+    -DCHIPSTAR_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+    -DGENERATOR=${CMAKE_GENERATOR}
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/TestFix1486SpirvToolsInstallPrefix.cmake)
+set_tests_properties(TestFix1486SpirvToolsInstallPrefix PROPERTIES TIMEOUT 300)
+
+# Reproduce #1632: a build directory reconfigured with a different
+# LLVM_CONFIG_BIN kept the first LLVM's tools, packages and compilers.
+add_test(NAME TestFix1632LlvmConfigChanged
+  COMMAND ${CMAKE_COMMAND}
+    -DCHIPSTAR_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+    -DLLVM_CONFIG_BIN=${LLVM_CONFIG_BIN}
+    -DGENERATOR=${CMAKE_GENERATOR}
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/TestFix1632LlvmConfigChanged.cmake)
+set_tests_properties(TestFix1632LlvmConfigChanged PROPERTIES TIMEOUT 300
+  SKIP_REGULAR_EXPRESSION "HIP_SKIP_THIS_TEST")
+
+add_test(NAME TestFix1635HostTarget
+  COMMAND ${CMAKE_COMMAND}
+    -DCXX_COMPILER=${CMAKE_CXX_COMPILER}
+    -DCXX_COMPILER_TARGET=${CMAKE_CXX_COMPILER_TARGET}
+    -DHIP_INFO=${CMAKE_BINARY_DIR}/share/.hipInfo
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/TestFix1635HostTarget.cmake)
+set_tests_properties(TestFix1635HostTarget PROPERTIES
+  SKIP_REGULAR_EXPRESSION "HIP_SKIP_THIS_TEST")

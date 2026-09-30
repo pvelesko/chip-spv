@@ -32,10 +32,18 @@
 
 #include "CHIPBackend.hh"
 #include "CHIPBindingsInternal.hh"
+
+#include <sstream>
 // CHIPGraphNode
 //*************************************************************************************
 void CHIPGraphNode::DFS(std::vector<CHIPGraphNode *> CurrPath,
                         std::vector<std::vector<CHIPGraphNode *>> &Paths) {
+  // A node that is already on the path depends on itself through a cycle;
+  // the walk would never reach a root.
+  if (std::find(CurrPath.begin(), CurrPath.end(), this) != CurrPath.end())
+    CHIPERR_LOG_AND_THROW("Graph node " + Msg +
+                              " depends on itself through a cycle",
+                          hipErrorInvalidValue);
   CurrPath.push_back(this);
   for (auto &Dep : Dependencies_) {
     Dep->DFS(CurrPath, Paths);
@@ -85,8 +93,10 @@ CHIPGraph::CHIPGraph(const CHIPGraph &OriginalGraph) {
 
 CHIPGraphNodeKernel::CHIPGraphNodeKernel(const CHIPGraphNodeKernel &Other)
     : CHIPGraphNode(Other) {
-  Params_ = Other.Params_;
-  ExecItem_ = Other.ExecItem_->clone();
+  // Other.Params_.kernelParams points into Other's own argument buffer.
+  // Going through setParams() gives the copy its own argument bytes, exec
+  // item and kernel handle, so it does not depend on Other staying alive.
+  setParams(Other.Params_);
 }
 
 CHIPGraphNode *CHIPGraphNodeKernel::clone() const {
@@ -94,36 +104,14 @@ CHIPGraphNode *CHIPGraphNodeKernel::clone() const {
   return NewNode;
 }
 
-void CHIPGraphNodeKernel::setParams(const hipKernelNodeParams Params) {
-  // Update Params_ and rebuild the ExecItem_ so the change reaches launch().
-  // The original implementation only assigned Params_, leaving ExecItem_ —
-  // which is what execute() actually launches — pointing at the old kernel
-  // and the old argument bytes. That made hipGraphExecKernelNodeSetParams
-  // a no-op at runtime.
-  Params_.blockDim = Params.blockDim;
-  Params_.extra = Params.extra;
-  Params_.func = Params.func;
-  Params_.gridDim = Params.gridDim;
-  Params_.sharedMemBytes = Params.sharedMemBytes;
-
-  auto *Dev = Backend->getActiveDevice();
-  chipstar::Kernel *ChipKernel = Dev->findKernel(HostPtr(Params_.func));
-  if (!ChipKernel)
-    CHIPERR_LOG_AND_THROW("Could not find requested kernel",
-                          hipErrorInvalidDeviceFunction);
-
-  ArgList_.clear();
-  ArgData_.clear();
-  copyKernelArgs(ArgList_, ArgData_, Params.kernelParams,
-                 *ChipKernel->getFuncInfo());
-  Params_.kernelParams = ArgList_.data();
-
-  ExecItem_ = Backend->createExecItem(Params_.gridDim, Params_.blockDim,
-                                      Params_.sharedMemBytes, nullptr);
-  ExecItem_->setKernel(ChipKernel);
-  ExecItem_->setArgs(Params.kernelParams);
-  ExecItem_->setupAllArgs();
+std::string CHIPGraphNodeKernel::getKernelName() const {
+  return ExecItem_->getKernel()->getName();
 }
+
+// Defined here rather than in the header: CHIPBackend.hh includes CHIPGraph.hh
+// before chipstar::ExecItem is complete, and deleting through an incomplete
+// type would skip ExecItem's virtual destructor.
+CHIPGraphNodeKernel::~CHIPGraphNodeKernel() { delete ExecItem_; }
 
 void CHIPGraphNodeMemset::execute(chipstar::Queue *Queue) const {
   const unsigned int Val = Params_.value;
@@ -145,65 +133,203 @@ void CHIPGraphNodeMemcpy::execute(chipstar::Queue *Queue) const {
   }
 }
 void CHIPGraphNodeKernel::execute(chipstar::Queue *Queue) const {
-  // Graph kernel nodes bypass the regular hipLaunchKernel entry point, so
-  // device-side __constant__ / __device__ globals referenced by the kernel
-  // are never allocated. Without this, the OpenCL backend hits
-  // "Internal chipStar error: device global not allocated" when it tries
-  // to bind a hidden DeviceGlobal arg. Mirror what hipLaunchKernelInternal
-  // does up front.
-  Backend->getActiveDevice()->prepareDeviceVariables(HostPtr(Params_.func));
+  // Ensure the kernel module's device variables are allocated before launch.
+  // The normal hipLaunchKernel path does this, but graph-node execution
+  // bypasses it — which matters when globals are lowered to kernel arguments
+  // (their device address must be bound at launch).
+  if (auto *K = ExecItem_->getKernel())
+    if (const void *HPtr = K->getHostPtr())
+      Queue->getDevice()->prepareDeviceVariables(HostPtr(HPtr));
   Queue->launch(ExecItem_);
 }
 
 CHIPGraphNodeKernel::CHIPGraphNodeKernel(const hipKernelNodeParams *TheParams)
     : CHIPGraphNode(hipGraphNodeTypeKernel) {
-  Params_.blockDim = TheParams->blockDim;
-  Params_.extra = TheParams->extra;
-  Params_.func = TheParams->func;
-  Params_.gridDim = TheParams->gridDim;
-  Params_.sharedMemBytes = TheParams->sharedMemBytes;
-
-  auto Dev = Backend->getActiveDevice();
-  chipstar::Kernel *ChipKernel = Dev->findKernel(HostPtr(Params_.func));
-  if (!ChipKernel)
-    CHIPERR_LOG_AND_THROW("Could not find requested kernel",
-                          hipErrorInvalidDeviceFunction);
-
-  copyKernelArgs(ArgList_, ArgData_, TheParams->kernelParams,
-                 *ChipKernel->getFuncInfo());
-  Params_.kernelParams = ArgList_.data();
-
-  ExecItem_ = Backend->createExecItem(Params_.gridDim, Params_.blockDim,
-                                      Params_.sharedMemBytes, nullptr);
-  ExecItem_->setKernel(ChipKernel);
-  ExecItem_->setArgs(TheParams->kernelParams);
-  ExecItem_->setupAllArgs();
+  setParams(*TheParams);
 }
 
 CHIPGraphNodeKernel::CHIPGraphNodeKernel(const void *HostFunction, dim3 GridDim,
                                          dim3 BlockDim, void **Args,
                                          size_t SharedMem)
     : CHIPGraphNode(hipGraphNodeTypeKernel) {
-  Type_ = hipGraphNodeTypeKernel;
-  Params_.blockDim = BlockDim;
-  Params_.extra = nullptr;
-  Params_.func = const_cast<void *>(HostFunction);
-  Params_.gridDim = GridDim;
-  Params_.sharedMemBytes = SharedMem;
+  hipKernelNodeParams Params = {};
+  Params.func = const_cast<void *>(HostFunction);
+  Params.gridDim = GridDim;
+  Params.blockDim = BlockDim;
+  Params.sharedMemBytes = SharedMem;
+  Params.kernelParams = Args;
+  Params.extra = nullptr;
+  setParams(Params);
+}
 
-  auto Dev = Backend->getActiveDevice();
-  chipstar::Kernel *ChipKernel = Dev->findKernel(HostPtr(HostFunction));
+void CHIPGraphNodeKernel::setParams(const hipKernelNodeParams &Params) {
+  auto *Dev = Backend->getActiveDevice();
+  chipstar::Kernel *ChipKernel = Dev->findKernel(HostPtr(Params.func));
   if (!ChipKernel)
     CHIPERR_LOG_AND_THROW("Could not find requested kernel",
                           hipErrorInvalidDeviceFunction);
 
-  copyKernelArgs(ArgList_, ArgData_, Args, *ChipKernel->getFuncInfo());
+  // Copy into fresh buffers before touching the members: Params may be this
+  // node's own getParams() result, whose kernelParams point into ArgData_.
+  std::vector<char> ArgData;
+  std::vector<void *> ArgList;
+  copyKernelArgs(ArgList, ArgData, Params.kernelParams,
+                 *ChipKernel->getFuncInfo());
+  ArgData_.swap(ArgData);
+  ArgList_.swap(ArgList);
+
+  Params_.func = Params.func;
+  Params_.gridDim = Params.gridDim;
+  Params_.blockDim = Params.blockDim;
+  Params_.sharedMemBytes = Params.sharedMemBytes;
+  Params_.extra = Params.extra;
   Params_.kernelParams = ArgList_.data();
 
-  ExecItem_ = Backend->createExecItem(GridDim, BlockDim, SharedMem, nullptr);
+  delete ExecItem_;
+  ExecItem_ = Backend->createExecItem(Params_.gridDim, Params_.blockDim,
+                                      Params_.sharedMemBytes, nullptr);
   ExecItem_->setKernel(ChipKernel);
+  // Give this graph node a private kernel handle so that another node
+  // launching the same kernel does not clobber this node's argument
+  // bindings when both are queued before execution (issue #782).
+  ExecItem_->useIndependentKernelHandle();
   ExecItem_->setArgs(Params_.kernelParams);
+  // setupAllArgs() binds implicit device-global address arguments, so the
+  // module's device variables must be allocated first. The normal launch path
+  // does this, but a graph node is built before any launch.
+  Dev->prepareDeviceVariables(HostPtr(Params_.func));
   ExecItem_->setupAllArgs();
+}
+
+static std::string dotEscape(const std::string &Str) {
+  std::string Out;
+  for (char C : Str) {
+    if (C == '"' || C == '\\')
+      Out += '\\';
+    Out += C;
+  }
+  return Out;
+}
+
+static std::string dim3ToString(dim3 Dim) {
+  return "(" + std::to_string(Dim.x) + "," + std::to_string(Dim.y) + "," +
+         std::to_string(Dim.z) + ")";
+}
+
+static std::string ptrToString(const void *Ptr) {
+  std::ostringstream Out;
+  Out << Ptr;
+  return Out.str();
+}
+
+/// Emits the nodes and edges of Graph; child graphs become nested clusters.
+static void writeDotBody(CHIPGraph *Graph, std::ostream &Out, unsigned Flags) {
+  const bool Verbose = Flags & hipGraphDebugDotFlagsVerbose;
+  const bool KernelParams =
+      Verbose || (Flags & hipGraphDebugDotFlagsKernelNodeParams);
+  const bool MemsetParams =
+      Verbose || (Flags & hipGraphDebugDotFlagsMemsetNodeParams);
+  const bool HostParams =
+      Verbose || (Flags & hipGraphDebugDotFlagsHostNodeParams);
+  const bool EventParams =
+      Verbose || (Flags & hipGraphDebugDotFlagsEventNodeParams);
+  const bool Handles = Verbose || (Flags & hipGraphDebugDotFlagsHandles);
+
+  for (auto *Node : Graph->getNodes()) {
+    std::string Label;
+    switch (Node->getType()) {
+    case hipGraphNodeTypeKernel: {
+      auto *Kernel = static_cast<CHIPGraphNodeKernel *>(Node);
+      Label = "KERNEL\\n" + dotEscape(Kernel->getKernelName());
+      if (KernelParams) {
+        auto Params = Kernel->getParams();
+        Label += "\\ngrid " + dim3ToString(Params.gridDim) + " block " +
+                 dim3ToString(Params.blockDim) + " sharedMem " +
+                 std::to_string(Params.sharedMemBytes);
+      }
+      break;
+    }
+    case hipGraphNodeTypeMemcpy:
+      Label = "MEMCPY";
+      break;
+    case hipGraphNodeTypeMemset: {
+      Label = "MEMSET";
+      if (MemsetParams) {
+        auto Params = static_cast<CHIPGraphNodeMemset *>(Node)->getParams();
+        Label += "\\ndst " + ptrToString(Params.dst) + " value " +
+                 std::to_string(Params.value) + " elementSize " +
+                 std::to_string(Params.elementSize) + " width " +
+                 std::to_string(Params.width) + " height " +
+                 std::to_string(Params.height);
+      }
+      break;
+    }
+    case hipGraphNodeTypeHost: {
+      Label = "HOST";
+      if (HostParams) {
+        auto Params = static_cast<CHIPGraphNodeHost *>(Node)->getParams();
+        Label += "\\nfn " + ptrToString((const void *)Params.fn) +
+                 " userData " + ptrToString(Params.userData);
+      }
+      break;
+    }
+    case hipGraphNodeTypeGraph:
+      Label = "CHILD_GRAPH";
+      break;
+    case hipGraphNodeTypeEmpty:
+      Label = "EMPTY";
+      break;
+    case hipGraphNodeTypeWaitEvent: {
+      Label = "WAIT_EVENT";
+      if (EventParams)
+        Label += "\\nevent " +
+                 ptrToString(
+                     static_cast<CHIPGraphNodeWaitEvent *>(Node)->getEvent());
+      break;
+    }
+    case hipGraphNodeTypeEventRecord: {
+      Label = "EVENT_RECORD";
+      if (EventParams)
+        Label +=
+            "\\nevent " +
+            ptrToString(
+                static_cast<CHIPGraphNodeEventRecord *>(Node)->getEvent());
+      break;
+    }
+    case hipGraphNodeTypeMemcpyFromSymbol:
+      Label = "MEMCPY_FROM_SYMBOL";
+      break;
+    case hipGraphNodeTypeMemcpyToSymbol:
+      Label = "MEMCPY_TO_SYMBOL";
+      break;
+    default:
+      Label = "NODE_TYPE_" + std::to_string(Node->getType());
+      break;
+    }
+    if (Handles)
+      Label += "\\n" + ptrToString(Node);
+
+    Out << "  \"" << ptrToString(Node) << "\" [label=\"" << Label << "\"];\n";
+
+    if (Node->getType() == hipGraphNodeTypeGraph) {
+      Out << "  subgraph \"cluster_" << ptrToString(Node)
+          << "\" {\n  label=\"CHILD_GRAPH\";\n";
+      writeDotBody(static_cast<CHIPGraphNodeGraph *>(Node)->getGraph(), Out,
+                   Flags);
+      Out << "  }\n";
+    }
+  }
+
+  for (auto *Node : Graph->getNodes())
+    for (auto *Dep : Node->getDependencies())
+      Out << "  \"" << ptrToString(Dep) << "\" -> \"" << ptrToString(Node)
+          << "\";\n";
+}
+
+void CHIPGraph::writeDot(std::ostream &Out, unsigned Flags) {
+  Out << "digraph {\n  node [shape=box];\n";
+  writeDotBody(this, Out, Flags);
+  Out << "}\n";
 }
 
 int NodeCounter = 1;
@@ -238,8 +364,19 @@ void CHIPGraphExec::launch(chipstar::Queue *Queue) {
     }
     logDebug("Executing nodes: {}", NodesInThisLevel);
     for (auto Node : Nodes) {
+      // The schedule is built from the original nodes, but what runs is the
+      // node's copy in the compiled graph: it holds the parameters set through
+      // hipGraphExec*NodeSetParams and the hipGraphNodeSetEnabled switch, and
+      // edits to the original node after instantiation do not reach it. A
+      // node the original graph gained after instantiation has no copy and
+      // runs as it is. A disabled node behaves like an empty node.
+      auto *ExecNode = CompiledGraph_.nodeLookup(Node);
+      if (ExecNode && !ExecNode->isEnabled()) {
+        logDebug("Skipping disabled {}", Node->Msg);
+        continue;
+      }
       logDebug("Executing {}", Node->Msg);
-      Node->execute(Queue);
+      (ExecNode ? ExecNode : Node)->execute(Queue);
       Queue->finish();
     }
 
@@ -262,7 +399,12 @@ void unchainUnnecessaryDeps(std::vector<CHIPGraphNode *> Path,
 
   for (int i = 0; i < SubPath.size(); i++) {
     if (SubPath[i] != Path[i]) {
-      SubPath[i - 1]->removeDependency(SubPath[i]);
+      // Paths were enumerated before any pruning, so several (Path, SubPath)
+      // pairs can single out the same redundant edge; an earlier pair may
+      // already have removed it.
+      auto Deps = SubPath[i - 1]->getDependencies();
+      if (std::find(Deps.begin(), Deps.end(), SubPath[i]) != Deps.end())
+        SubPath[i - 1]->removeDependency(SubPath[i]);
       break;
     }
   }
@@ -280,6 +422,9 @@ std::vector<CHIPGraphNode *> CHIPGraph::getLeafNodes() {
 }
 
 void CHIPGraphExec::pruneGraph_() {
+  // Prune the executable's own copy of the graph. The caller keeps using the
+  // original hipGraph_t, and hipGraphGetEdges on it has to keep reporting the
+  // edges the caller added.
   std::vector<CHIPGraphNode *> LeafNodes_ = CompiledGraph_.getLeafNodes();
 
   for (auto LeafNode : LeafNodes_) {
@@ -342,33 +487,14 @@ std::vector<CHIPGraphNode *> CHIPGraph::getRootNodes() {
   return RootNodes;
 }
 
-std::unordered_set<const CHIPGraphExec *> &CHIPGraphExec::liveSet() {
-  static std::unordered_set<const CHIPGraphExec *> Set;
-  return Set;
-}
-std::mutex &CHIPGraphExec::liveSetMtx() {
-  static std::mutex Mtx;
-  return Mtx;
-}
-
 void CHIPGraphExec::compile() {
-  // Only run the queue-extraction pass once. Subsequent launches re-use
-  // ExecQueues_; the user may have called hipGraphDestroy on the source
-  // graph in the meantime, in which case touching OriginalGraph_->getNodes()
-  // would dereference freed memory (Unit_hipGraphLaunch_Negative covers this).
-  if (Compiled_)
-    return;
-  Compiled_ = true;
-  ExtractSubGraphs_();
+  // Every launch rebuilds the schedule from scratch; the levels queued by the
+  // previous launch would otherwise run again in front of the new ones.
+  ExecQueues_ = {};
   pruneGraph_();
   logDebug("{} CHIPGraphExec::compile()", (void *)this);
-  // Build ExecQueues_ from the CompiledGraph_ — this is the structure
-  // ExtractSubGraphs_ inlined child-graph nodes into, and the clone whose
-  // dependency edges were remapped via the copy constructor. Using
-  // OriginalGraph_ here would leave child-graph wrappers in the queue and
-  // never schedule the inlined subgraph nodes.
-  std::vector<CHIPGraphNode *> Nodes = CompiledGraph_.getNodes();
-  auto RootNodesVec = CompiledGraph_.getRootNodes();
+  std::vector<CHIPGraphNode *> Nodes = OriginalGraph_->getNodes();
+  auto RootNodesVec = OriginalGraph_->getRootNodes();
   std::set<CHIPGraphNode *> RootNodes(RootNodesVec.begin(), RootNodesVec.end());
   ExecQueues_.push(RootNodes);
   //  Remove root nodes from the set of nodes
@@ -412,6 +538,13 @@ void CHIPGraphExec::compile() {
     }
 
     if (NodeIter == Nodes.end()) {
+      // A pass that places no node would repeat forever: every remaining node
+      // waits on a node outside this graph or on a node that is itself still
+      // waiting (a cycle, or a graph without a root).
+      if (NextSet.empty())
+        CHIPERR_LOG_AND_THROW("Graph node " + Nodes.front()->Msg +
+                                  " depends on a node that can never run",
+                              hipErrorInvalidValue);
       PrevLevelNodes.insert(NextSet.begin(), NextSet.end());
       ExecQueues_.push(NextSet);
       NextSet.clear();
@@ -425,81 +558,30 @@ void CHIPGraphNodeHost::execute(chipstar::Queue *Queue) const {
   Params_.fn(Params_.userData);
 }
 
-void CHIPGraphExec::ExtractSubGraphs_() {
-  // Operate on a reference to CompiledGraph_'s node vector so that node
-  // erase/insert mutations actually persist. The previous `auto Nodes = ...`
-  // bound to a copy, throwing away the inlining work and leaving the wrapper
-  // CHIPGraphNodeGraph in place — its execute() is a no-op, so the child
-  // graph never ran.
-  auto &Nodes = CompiledGraph_.getNodes();
-  // Track which subgraphs we've already expanded so a self-referencing or
-  // diamond-referenced child graph doesn't blow up here. Without this guard,
-  // a graph that adds itself as a child node (legal CUDA pattern, exercised
-  // by Unit_hipGraphAddChildGraphNode_OrgGraphAsChildGraph) recursively
-  // re-expands its own nodes and hangs the launch.
-  std::set<CHIPGraph *> Expanded;
-  for (int i = 0; i < (int)Nodes.size(); i++) {
-    auto Node = Nodes[i];
-    if (Node->getType() != hipGraphNodeTypeGraph)
-      continue;
+// Defined out of line because CHIPGraph is only declared after this node
+// class in the header. hipGraphAddChildGraphNode documents childGraph as the
+// "Graph to clone into this node", so the node owns a clone rather than
+// aliasing the caller's graph.
+CHIPGraphNodeGraph::CHIPGraphNodeGraph(const CHIPGraph *Graph)
+    : CHIPGraphNode(hipGraphNodeTypeGraph), SubGraph_(new CHIPGraph(*Graph)) {}
 
-    auto *SubGraphNode = static_cast<CHIPGraphNodeGraph *>(Node);
-    auto *SubGraph = SubGraphNode->getGraph();
+CHIPGraphNodeGraph::CHIPGraphNodeGraph(const CHIPGraphNodeGraph &Other)
+    : CHIPGraphNode(Other), SubGraph_(new CHIPGraph(*Other.SubGraph_)) {}
 
-    // Snapshot the wrapper's actual graph-edge neighbours up front so we
-    // can detach the wrapper cleanly. These are the topological parents
-    // and children of the wrapper, NOT the vector neighbours at i-1/i+1.
-    auto WrapperDeps = SubGraphNode->getDependencies();
-    auto WrapperDependants = SubGraphNode->getDependants();
+CHIPGraphNodeGraph::~CHIPGraphNodeGraph() { delete SubGraph_; }
 
-    auto eraseWrapper = [&]() {
-      // Detach the wrapper from neighbours so dangling pointers don't
-      // confuse the level-builder in compile().
-      for (auto *Dep : WrapperDeps)
-        Dep->removeDependant(SubGraphNode);
-      for (auto *Dn : WrapperDependants)
-        Dn->removeDependency(SubGraphNode);
-      Nodes.erase(Nodes.begin() + i);
-      --i;
-    };
+void CHIPGraphNodeGraph::setGraph(const CHIPGraph *Graph) {
+  auto *Clone = new CHIPGraph(*Graph);
+  delete SubGraph_;
+  SubGraph_ = Clone;
+}
 
-    // Self-reference / already-expanded: drop the wrapper without
-    // re-injecting subgraph nodes (they're already present in the parent
-    // or recursively reachable). Still rewire wrapper neighbours so the
-    // wrapper isn't left as a stale dependency on the surviving copy of
-    // those nodes — fall through to compile() using just those.
-    if (SubGraph == OriginalGraph_ || !Expanded.insert(SubGraph).second) {
-      // Bridge: wrapper's parents become deps of wrapper's children so the
-      // ordering survives wrapper removal.
-      for (auto *Dn : WrapperDependants) {
-        for (auto *Dep : WrapperDeps) {
-          Dn->addDependency(Dep);
-        }
-      }
-      eraseWrapper();
-      continue;
-    }
-
-    // Inline the subgraph: child roots inherit the wrapper's deps; child
-    // leaves inherit the wrapper's dependants.
-    auto RootNodes = SubGraph->getRootNodes();
-    auto LeafNodes = SubGraph->getLeafNodes();
-
-    for (auto *Root : RootNodes) {
-      for (auto *Dep : WrapperDeps)
-        Root->addDependency(Dep);
-    }
-    for (auto *Leaf : LeafNodes) {
-      for (auto *Dn : WrapperDependants)
-        Dn->addDependency(Leaf);
-    }
-
-    eraseWrapper();
-    // Inject the subgraph's nodes into the compiled parent.
-    for (auto *SubNode : SubGraph->getNodes()) {
-      Nodes.push_back(SubNode);
-    }
-  }
+void CHIPGraphNodeGraph::execute(chipstar::Queue *Queue) const {
+  // The schedule runs this node after all of its dependencies and before all
+  // of its dependants, so running the child graph to completion here keeps
+  // the ordering the parent graph asked for.
+  CHIPGraphExec SubGraphExec(SubGraph_);
+  SubGraphExec.launch(Queue);
 }
 
 void CHIPGraphNodeEventRecord::execute(chipstar::Queue *Queue) const {

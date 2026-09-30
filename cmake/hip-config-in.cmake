@@ -106,8 +106,13 @@ if(WIN32)
   #set_and_check(hip_HIPCC_EXECUTABLE "${hip_BIN_INSTALL_DIR}/hipcc.bat")
   #set_and_check(hip_HIPCONFIG_EXECUTABLE "${hip_BIN_INSTALL_DIR}/hipconfig.bat")
 else()
-  set(hip_HIPCC_EXECUTABLE $<INSTALL_INTERFACE:@CHIP_INSTALL_DIR@>$<BUILD_INTERFACE:${CHIP_BUILD_DIR}/bin/hipcc> )
-  set(hip_HIPCONFIG_EXECUTABLE $<INSTALL_INTERFACE:@CHIP_INSTALL_DIR@>$<BUILD_INTERFACE:${CHIP_BUILD_DIR}/bin/hipconfig> )
+  # Plain cmake variable assignment — generator expressions are inert here
+  # (the *_INTERFACE forms only resolve inside target-property contexts), so
+  # using them produced an empty string when consumers (e.g. LAMMPS GPU
+  # package) evaluated HIP_HIPCC_EXECUTABLE in add_custom_command. Resolve
+  # to the static install path; the file is rendered by configure_file at
+  # install time.
+  set(hip_HIPCC_EXECUTABLE "${hip_BIN_INSTALL_DIR}/hipcc")
 endif()
 
 if(NOT HIP_CXX_COMPILER)
@@ -147,6 +152,13 @@ endif()
 #     NO_DEFAULT_PATH)
 
 include( "${CMAKE_CURRENT_LIST_DIR}/hip-targets.cmake" )
+
+# AMD HIP exports hiprtc::hiprtc; create an alias so consumers
+# (e.g. OpenMM) that do find_package(hiprtc) / target_link_libraries(... hiprtc::hiprtc)
+# work with chipStar's hip::hiprtc-lib target.
+if(NOT TARGET hiprtc::hiprtc)
+  add_library(hiprtc::hiprtc ALIAS hip::hiprtc-lib)
+endif()
 
 # Required for Threads::Threads target used by hip::CHIP
 find_dependency(Threads)

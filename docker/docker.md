@@ -49,7 +49,7 @@ To run the Docker image with GPU support, follow these steps:
 
 2. Unload PoCL module to expose Intel GPUs (if available):
    ```
-   module unload pocl/5.0-llvm-15
+   module unload pocl/main-llvm-22.0-native
    ```
 
 3. Run a GPU-accelerated sample:
@@ -64,9 +64,9 @@ This process allows you to run the chipStar Docker image with GPU support, enabl
 - Base: Ubuntu latest
 - User: 'chipStarUser' with sudo, video, render group access
 - Core tools: gcc, g++, cmake, python3, git, OpenCL dev environment
-- LLVM/Clang: Customizable version (default 15)
+- LLVM/Clang: 22.0 with the native (integrated) SPIR-V backend (`llvm/22.0-native`)
 - Lmod: For environment module management
-- POCL: Portable OpenCL implementation
+- POCL: Portable OpenCL implementation (built from `main` for LLVM 22 support)
 - Intel OneAPI: Via Miniconda, includes MKL, TBB, DPC++
 - Level Zero API: For low-level device control
 
@@ -87,46 +87,18 @@ Key components:
 
 Purpose: Enhances the development environment with code quality tools specifically for C++ projects, enabling better code analysis and consistency checks.
 
-## DockerfileFull Overview
-
-This layer builds upon the base image and adds:
-
-- Multiple LLVM/Clang versions (16, 17, 18)
-- POCL (Portable Computing Language) for each LLVM version
-
-Key components:
-- LLVM/Clang versions 16, 17, and 18:
-  - Built from source
-  - Installed in /apps/llvm/${LLVM_VERSION}
-  - Environment modules created for each version
-- POCL 4.0:
-  - Built for each LLVM version
-  - Installed in /apps/pocl/4.0-llvm-${LLVM_VERSION}
-  - Environment modules created for each version
-
-Build process for each LLVM/POCL pair:
-1. Configure and build LLVM
-2. Install LLVM and create its environment module
-3. Clone POCL repository
-4. Configure and build POCL
-5. Install POCL and create its environment module
-
-Purpose: Provides a comprehensive development environment with multiple LLVM toolchains and corresponding POCL installations, allowing for flexible OpenCL development and testing across different LLVM versions, suitable for CI use. 
-
-
-
 ## DockerfileLatest Overview
 
 This layer builds upon the base image and adds:
 
 - Additional Python packages
-- LLVM/Clang 15 environment setup
+- LLVM/Clang 22 (native SPIR-V backend) environment setup
 - Vim common tools
 - chipStar build and installation
 
 Key components:
 - PyYAML: Python package for YAML parsing
-- LLVM/Clang 15: Loaded as a module
+- LLVM/Clang 22 (native SPIR-V backend): Loaded via `llvm/22.0-native` module
 - Vim common: Includes 'xxd' utility
 - chipStar: 
   - Cloned from GitHub

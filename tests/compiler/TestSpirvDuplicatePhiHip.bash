@@ -1,0 +1,46 @@
+#!/bin/bash
+# Regression test for HipCoalesceDuplicatePhiPredsPass (CHIP-SPV/chipStar#1680).
+# Compiles a small HIP kernel that mirrors a real-world crash pattern, keeps the
+# lowered device bitcode, translates it to SPIR-V with the build's llvm-spirv,
+# and validates it. Without the pass, an llvm-spirv lacking
+# KhronosGroup/SPIRV-LLVM-Translator#3866 emits an OpPhi that lists a
+# predecessor block more than once and spirv-val rejects the module.
+#
+set -eu
+
+SRC_DIR="@CMAKE_CURRENT_SOURCE_DIR@"
+HIPCC="@CMAKE_BINARY_DIR@/bin/hipcc"
+LLVM_SPIRV="@LLVM_SPIRV@"
+SPIRV_VAL="@CHIP_SPIRV_VAL@"
+OUT="@CMAKE_CURRENT_BINARY_DIR@/@TEST_NAME@.d"
+
+# Only the external translator emits the duplicate; skip on the in-tree backend.
+if [ "${LLVM_SPIRV}" = "NOT_NEEDED" ] || [ ! -x "${LLVM_SPIRV}" ]; then
+  echo "external llvm-spirv not in use; skipping"
+  exit 0
+fi
+if [ ! -x "${SPIRV_VAL}" ]; then
+  echo "FAIL: spirv-val not found at '${SPIRV_VAL}'"
+  exit 1
+fi
+
+rm -rf "${OUT}"
+mkdir -p "${OUT}"
+cd "${OUT}"
+
+# -O3 so the optimizer threads the shared-return switch; --save-temps keeps the
+# lowered device bitcode (the input the SPIR-V writer consumes).
+# -fno-jump-tables stops LLVM 23 turning the switch into a lookup table.
+"${HIPCC}" -O3 -fno-jump-tables --save-temps=cwd -c "${SRC_DIR}/TestSpirvDuplicatePhiHip.hip" \
+  -o "${OUT}/TestSpirvDuplicatePhiHip.o"
+
+BC=$(ls "${OUT}"/*-lower.bc 2>/dev/null | head -1)
+if [ -z "${BC}" ]; then
+  echo "FAIL: no lowered device bitcode (*-lower.bc) produced by hipcc"
+  exit 1
+fi
+
+# No --spirv-max-version: llvm-spirv rejects a cap below a versioned triple.
+"${LLVM_SPIRV}" "${BC}" -o "${OUT}/TestSpirvDuplicatePhiHip.spv"
+"${SPIRV_VAL}" "${OUT}/TestSpirvDuplicatePhiHip.spv"
+echo "PASSED"

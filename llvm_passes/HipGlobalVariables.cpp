@@ -47,6 +47,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "PassPluginCompat.h"
 
 #define DEBUG_TYPE "hip-lower-gv"
@@ -91,6 +92,13 @@ static Instruction *createKernelStub(Module &M, StringRef Name,
   return B.CreateRetVoid();
 }
 
+/// True if the runtime zeroes GVar instead of the init kernel.
+static bool isHostFilled(const GlobalVariable *GVar) {
+  return GVar->hasInitializer() && GVar->getInitializer()->isNullValue() &&
+         GVar->getParent()->getDataLayout().getTypeStoreSize(
+             GVar->getValueType()) >= ChipVarFillThreshold;
+}
+
 // Emit a shadow kernel for relaying properties about the original variable.
 static void emitGlobalVarInfoShadowKernel(Module &M,
                                           const GlobalVariable *GVar) {
@@ -104,7 +112,7 @@ static void emitGlobalVarInfoShadowKernel(Module &M,
   //   void <ChipVarInfoPrefix>Foo(int64_t *info) {
   //     info[0] = sizeof(Foo);      // In bytes.
   //     info[1] = alignof(Foo);     // In bytes.
-  //     info[2] = <HasInitializer>; // [0, 1].
+  //     info[2] = 0, ChipVarInitGridStride or ChipVarInitHostFill;
   //   }
   //
   // *1: Emitted by emitIndirectGlobalVariable().
@@ -130,9 +138,12 @@ static void emitGlobalVarInfoShadowKernel(Module &M,
       Builder.CreateConstInBoundsGEP1_64(Builder.getInt64Ty(), InfoArg, 1);
   Builder.CreateStore(Builder.getInt64(Alignment), Ptr);
 
-  // info[2] = <HasInitializer>;
+  // info[2] = 0, ChipVarInitGridStride or ChipVarInitHostFill;
+  int64_t InitKind = !GVar->hasInitializer() ? 0
+                     : isHostFilled(GVar)    ? ChipVarInitHostFill
+                                             : ChipVarInitGridStride;
   Ptr = Builder.CreateConstInBoundsGEP1_64(Builder.getInt64Ty(), InfoArg, 2);
-  Builder.CreateStore(Builder.getInt64(GVar->hasInitializer()), Ptr);
+  Builder.CreateStore(Builder.getInt64(InitKind), Ptr);
 }
 
 // Emit a shadow kernel for setting the transformed global variable to point to
@@ -167,6 +178,70 @@ static void emitGlobalVarBindShadowKernel(Module &M, GlobalVariable *GVar,
   Builder.CreateStore(AddrAsInt, GVar);
 }
 
+/// get_global_id(0) and get_global_size(0) of an init kernel.
+struct WorkItemIds {
+  Value *Gid;
+  Value *Gsz;
+};
+
+static Value *emitWorkItemCall(Module &M, IRBuilder<> &B, StringRef Name) {
+  auto *FTy = FunctionType::get(B.getInt64Ty(), {B.getInt32Ty()}, false);
+  auto *F = dyn_cast<Function>(M.getOrInsertFunction(Name, FTy).getCallee());
+  if (!F || F->getFunctionType() != FTy)
+    report_fatal_error(Twine(Name) + " is not declared as i64(i32)",
+                       /*GenCrashDiag=*/false);
+  F->setCallingConv(CallingConv::SPIR_FUNC);
+  CallInst *Call = B.CreateCall(F, {B.getInt32(0)});
+  Call->setCallingConv(CallingConv::SPIR_FUNC);
+  return Call;
+}
+
+/// Emit at the start of the kernel so the ids dominate every init loop.
+static WorkItemIds emitWorkItemIds(Module &M, IRBuilder<> &B) {
+  return {emitWorkItemCall(M, B, "_Z13get_global_idj"),
+          emitWorkItemCall(M, B, "_Z15get_global_sizej")};
+}
+
+/// Emit `for (i = gid; i < N; i += gsize) Dst[i] = Src ? Src[i] : 0;`.
+static void emitGridStrideInitLoop(IRBuilder<> &Builder, const WorkItemIds &Ids,
+                                   Value *Dst, Value *Src, uint64_t Size,
+                                   uint64_t Alignment) {
+  uint64_t ElemSize = 1;
+  if (Size % 8 == 0 && Alignment >= 8)
+    ElemSize = 8;
+  else if (Size % 4 == 0 && Alignment >= 4)
+    ElemSize = 4;
+  Type *ElemTy = Builder.getIntNTy(ElemSize * 8);
+
+  BasicBlock *Pre = Builder.GetInsertBlock();
+  Function *F = Pre->getParent();
+  BasicBlock *Cont =
+      Pre->splitBasicBlock(Builder.GetInsertPoint(), "gvinit.cont");
+  Pre->getTerminator()->eraseFromParent();
+  BasicBlock *Check =
+      BasicBlock::Create(F->getContext(), "gvinit.check", F, Cont);
+  BasicBlock *Body =
+      BasicBlock::Create(F->getContext(), "gvinit.body", F, Cont);
+
+  IRBuilder<> B(Pre);
+  B.CreateBr(Check);
+  B.SetInsertPoint(Check);
+  PHINode *Idx = B.CreatePHI(B.getInt64Ty(), 2, "gvinit.i");
+  Idx->addIncoming(Ids.Gid, Pre);
+  B.CreateCondBr(B.CreateICmpULT(Idx, B.getInt64(Size / ElemSize)), Body, Cont);
+
+  B.SetInsertPoint(Body);
+  Value *Val = Constant::getNullValue(ElemTy);
+  if (Src)
+    Val = B.CreateAlignedLoad(ElemTy, B.CreateGEP(ElemTy, Src, Idx),
+                              Align(ElemSize));
+  B.CreateAlignedStore(Val, B.CreateGEP(ElemTy, Dst, Idx), Align(ElemSize));
+  Idx->addIncoming(B.CreateAdd(Idx, Ids.Gsz, "gvinit.next"), Body);
+  B.CreateBr(Check);
+
+  Builder.SetInsertPoint(Cont, Cont->getFirstInsertionPt());
+}
+
 // Returns a constant expression rewritten as instructions if needed.
 //
 // Global variable references found in the GVarMap are replaced with a load from
@@ -178,7 +253,27 @@ static Value *expandConstant(Constant *C, GVarMapT &GVarMap,
 
   if (isa<ConstantData>(C)) return C;
 
-  if (isa<ConstantAggregate>(C)) return C;
+  if (auto *CA = dyn_cast<ConstantAggregate>(C)) {
+    SmallVector<Value *, 4> Ops;
+    bool AnyOpExpanded = false;
+    for (Value *Op : CA->operand_values()) {
+      Value *V =
+          expandConstant(cast<Constant>(Op), GVarMap, Builder, InsnCache);
+      Ops.push_back(V);
+      AnyOpExpanded |= !isa<Constant>(V);
+    }
+
+    if (!AnyOpExpanded) return CA;
+
+    // Rebuild the aggregate element by element from the expanded operands.
+    Value *Agg = PoisonValue::get(CA->getType());
+    for (unsigned I = 0; I < Ops.size(); ++I)
+      Agg = isa<VectorType>(CA->getType())
+                ? Builder.CreateInsertElement(Agg, Ops[I], I)
+                : Builder.CreateInsertValue(Agg, Ops[I], I);
+    InsnCache[CA] = cast<Instruction>(Agg);
+    return Agg;
+  }
 
   if (auto *GVar = dyn_cast<GlobalVariable>(C)) {
     if (GVarMap.count(GVar)) {
@@ -217,8 +312,9 @@ static Value *expandConstant(Constant *C, GVarMapT &GVarMap,
 }
 
 /// Create initializer value for emitGlobalVarInitShadowKernel that can be
-/// used as source (a pointer) for memcpy.
-static Value *createCopyableValue(Module &M, Constant *Initializer) {
+/// used as the source (a pointer) of the initializing copy.
+static Value *createCopyableValue(Module &M, Constant *Initializer,
+                                  MaybeAlign Alignment) {
   // Name does not really matter but having <ChipVarPrefix> prefix in it we can
   // distinguish chipStar emitted values from source code originated ones and
   // handle them correctly.
@@ -227,6 +323,8 @@ static Value *createCopyableValue(Module &M, Constant *Initializer) {
       M, Initializer->getType(), /* IsConstant = */ true,
       GlobalValue::PrivateLinkage, Initializer, Name, nullptr,
       GlobalValue::NotThreadLocal, SpirvUniformConstantAS);
+  // The destination's alignment, so the copy loop can read wide elements.
+  InitValue->setAlignment(Alignment);
   return InitValue;
 }
 
@@ -255,41 +353,32 @@ static bool hasNoRuntimeConstants(Constant *C, const GVarMapT &GVarMap) {
   return false; // Default answer if we can't fully analyze the constant.
 }
 
-// Emit a shadow kernel for initialing the global variable.
-static void emitGlobalVarInitShadowKernel(Module &M, GlobalVariable *GVar,
-                                          GlobalVariable *OriginalGVar,
-                                          GVarMapT GVarMap) {
+// Emit the initialization IR for a single global variable at the Builder's
+// current insertion point (inside a shadow kernel body). See #582: this body
+// is shared by the per-variable init shadow kernel and the single combined
+// init kernel.
+static void emitGlobalVarInitBody(Module &M, IRBuilder<> &Builder,
+                                  const WorkItemIds &Ids, GlobalVariable *GVar,
+                                  GlobalVariable *OriginalGVar,
+                                  GVarMapT &GVarMap) {
   // For original global variable in pseudo code:
   //
   //   SomeType Foo = SomeInit;
   //
-  // A) Emit the following shadow kernel in pseudo code:
+  // A) Emit a loop partitioned across the work items of the launch:
+  //     for (i = gid; i < sizeof(SomeType) / sizeof(E); i += gsize)
+  //       ((E *)<ChipVarPrefix>Foo)[i] = SomeInit is zero ? 0 : ((E *)&Foo)[i];
   //
-  //   SomeType* <ChipVarPrefix>Foo; // *1
-  //   void <ChipVarInitPrefix>Foo() {
-  //     memcpy(<ChipVarPrefix>Foo, &Foo, sizeof(SomeType));
-  //   }
-  //
-  // B) Emit the following shadow kernel in pseudo code:
-  //
-  //   SomeType* <ChipVarPrefix>Foo; // *1
-  //   void <ChipVarInitPrefix>Foo() {
+  // B) Emit (fallback for initializers referencing other lowered variables
+  //    whose addresses are resolved at runtime):
   //     *<ChipVarPrefix>Foo = SomeInit;
-  //   }
+  //    This alternative should be avoided as it may lead to bad native
+  //    code-gen.
   //
-  // This alternative should be avoided as it may lead to bad native code-gen.
-  // This is used as fallback for variables with references to other variables
-  // whose addresses are resolved at runtime (aka. the variables being lowered
-  // in this pass).
-  //
-  // *1: Emitted by emitIndirectGlobalVariable().
-  //
+  // <ChipVarPrefix>Foo (i.e. GVar) is emitted by emitIndirectGlobalVariable().
 
   assert(GVar->getValueType()->isIntegerTy(64));
   assert(OriginalGVar->hasInitializer());
-
-  auto Name = std::string(ChipVarInitPrefix) + OriginalGVar->getName().str();
-  IRBuilder<> Builder(createKernelStub(M, Name, {}));
 
   // GVar is i64; load and convert to pointer.
   auto *PtrAS = PointerType::get(M.getContext(), SpirvCrossWorkGroupAS);
@@ -300,11 +389,14 @@ static void emitGlobalVarInitShadowKernel(Module &M, GlobalVariable *GVar,
     Value *AddrInt = Builder.CreateLoad(GVar->getValueType(), GVar);
     Value *Ptr = Builder.CreateIntToPtr(AddrInt, PtrAS);
 
-    auto *InitSrc = createCopyableValue(M, OriginalGVar->getInitializer());
     auto Alignment = OriginalGVar->getAlign();
     auto Size =
         M.getDataLayout().getTypeStoreSize(OriginalGVar->getValueType());
-    Builder.CreateMemCpy(Ptr, Alignment, InitSrc, MaybeAlign(1), Size);
+    Constant *Init = OriginalGVar->getInitializer();
+    Value *InitSrc =
+        Init->isNullValue() ? nullptr : createCopyableValue(M, Init, Alignment);
+    emitGridStrideInitLoop(Builder, Ids, Ptr, InitSrc, Size,
+                           Alignment.valueOrOne().value());
     return;
   }
 
@@ -314,6 +406,11 @@ static void emitGlobalVarInitShadowKernel(Module &M, GlobalVariable *GVar,
   // variables we are going to replace with load instructions so we need to
   // rewrite the constant expression as a sequence of instructions.
   LLVM_DEBUG(dbgs() << "May have runtime constants: " << *OriginalGVar << "\n");
+
+  // B) stores the whole value, so only work item 0 runs it.
+  Instruction *Rest = &*Builder.GetInsertPoint();
+  Builder.SetInsertPoint(SplitBlockAndInsertIfThen(
+      Builder.CreateICmpEQ(Ids.Gid, Builder.getInt64(0)), Rest, false));
   Const2InstMapT Cache;
   Value *Init =
       expandConstant(OriginalGVar->getInitializer(), GVarMap, Builder, Cache);
@@ -324,6 +421,38 @@ static void emitGlobalVarInitShadowKernel(Module &M, GlobalVariable *GVar,
 
   // *<ChipVarPrefix>Foo = SomeInit;
   Builder.CreateStore(Init, Ptr);
+  Builder.SetInsertPoint(Rest);
+}
+
+// Emit a per-variable shadow kernel for initializing the global variable.
+// Emitted in the globals-as-kernel-args (rusticl) lowering, where each init
+// kernel is later reworked to take the storage address as an argument.
+static void emitGlobalVarInitShadowKernel(Module &M, GlobalVariable *GVar,
+                                          GlobalVariable *OriginalGVar,
+                                          GVarMapT GVarMap) {
+  auto Name = std::string(ChipVarInitPrefix) + OriginalGVar->getName().str();
+  IRBuilder<> Builder(createKernelStub(M, Name, {}));
+  WorkItemIds Ids = emitWorkItemIds(M, Builder);
+  emitGlobalVarInitBody(M, Builder, Ids, GVar, OriginalGVar, GVarMap);
+}
+
+// Emit a single combined shadow kernel that initializes ALL host-accessible
+// program-scope variables in one kernel launch. This avoids the O(N) launch
+// overhead of launching one single-work-item init kernel per variable (#582).
+// The InitVars are (lowered-i64-GVar, original-GVar) pairs; the caller has
+// already filtered out variables without initializers, the host-filled ones
+// and the special device-heap-null case. Returns true if a kernel was emitted.
+static bool emitCombinedGlobalVarInitKernel(
+    Module &M,
+    ArrayRef<std::pair<GlobalVariable *, GlobalVariable *>> InitVars,
+    GVarMapT &GVarMap) {
+  if (InitVars.empty())
+    return false;
+  IRBuilder<> Builder(createKernelStub(M, ChipVarInitAllName, {}));
+  WorkItemIds Ids = emitWorkItemIds(M, Builder);
+  for (auto &Pair : InitVars)
+    emitGlobalVarInitBody(M, Builder, Ids, Pair.first, Pair.second, GVarMap);
+  return true;
 }
 
 static bool shouldLower(const GlobalVariable &GVar) {
@@ -493,20 +622,36 @@ static GVarMapT emitIndirectGlobalVariables(Module &M) {
   return GVarMap;
 }
 
+// Returns true if C takes the address of a global variable in GVarMap.
+static bool refersToLoweredGlobal(Constant *C, const GVarMapT &GVarMap) {
+  if (auto *GVar = dyn_cast<GlobalVariable>(C))
+    return GVarMap.count(GVar);
+  if (!isa<ConstantExpr>(C) && !isa<ConstantAggregate>(C))
+    return false;
+  return any_of(C->operand_values(), [&](Value *Op) {
+    return refersToLoweredGlobal(cast<Constant>(Op), GVarMap);
+  });
+}
+
 // Find global device variables that are not host accessible but which should be
 // reinitialized on hipDeviceReset() call - for example, static local variables.
-static std::vector<GlobalVariable *> findResettableNonSymbolGVs(Module &M) {
+static std::vector<GlobalVariable *>
+findResettableNonSymbolGVs(Module &M, const GVarMapT &GVarMap) {
   std::vector<GlobalVariable *> Result;
   for (GlobalVariable &GV : M.globals()) {
     if (GV.hasSection()) // Non-user defined variable - e.g. llvm.used
                          // intrinsic.
       continue;
+    if (GVarMap.count(&GV))
+      continue;
     // So far, all host-inaccessible global device variables either has a COMDAT
     // section or lacks the externally_initialized attribute.
     if (GV.isExternallyInitialized() && !GV.hasComdat())
       continue;
-    if (GV.isConstant() || !GV.hasInitializer() ||
-        isa<UndefValue>(GV.getInitializer()))
+    if (!GV.hasInitializer() || isa<UndefValue>(GV.getInitializer()))
+      continue;
+    // A constant needs the reset kernel only to learn a lowered global's address.
+    if (GV.isConstant() && !refersToLoweredGlobal(GV.getInitializer(), GVarMap))
       continue;
     if (GV.getAddressSpace() == SpirvWorkgroupAS)
       continue;
@@ -519,46 +664,287 @@ static std::vector<GlobalVariable *> findResettableNonSymbolGVs(Module &M) {
 // Emit a kernel for resetting GVs back to their initialization value.
 // Returns true if any code emitted and false otherwise.
 bool emitNonSymbolInitializerKernel(const std::vector<GlobalVariable *> GVs,
-                                    Module &M) {
+                                    Module &M, const GVarMapT &GVarMap) {
   if (GVs.empty())
     return false;
   IRBuilder<> Builder(createKernelStub(M, ChipNonSymbolResetKernelName));
   for (auto *GV : GVs) {
     assert(GV->hasInitializer());
     Builder.CreateStore(GV->getInitializer(), GV);
+    // A lowered global's address is known only at runtime, via the store above.
+    if (refersToLoweredGlobal(GV->getInitializer(), GVarMap)) {
+      GV->setInitializer(Constant::getNullValue(GV->getValueType()));
+      GV->setConstant(false);
+    }
   }
   return true;
 }
+
+#ifndef CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS
+// ===========================================================================
+// rusticl/radeonsi path: lower device globals to implicit kernel arguments.
+//
+// Some OpenCL drivers (rusticl/radeonsi on Mesa/ACO) cannot consume
+// program-scope CrossWorkgroup globals. The default lowering above leaves an
+// i64 `__chip_var_addr_<name>` address holder which trips them. Here we run a
+// post-transform that removes those globals and instead passes each global's
+// device address as an implicit trailing kernel pointer argument:
+//
+//   * every kernel that loads `__chip_var_addr_<G>` gets a trailing
+//     `i8 addrspace(1)*` parameter per distinct G it uses; the load is replaced
+//     by ptrtoint(param).
+//   * a `__chip_gvararg_<kernel>` annotation (NUL-separated original global
+//     names, in parameter order) tells the runtime which global feeds each
+//     trailing arg. spirv.cc strips this annotation before the driver sees it.
+//   * the `__chip_var_init_<G>` shadow kernel is reworked to take the storage
+//     address as its argument (instead of reading the global), and the
+//     `__chip_var_bind_<G>` shadow kernel (which only stored into the global)
+//     is removed. `__chip_var_info_<G>` is left intact.
+//
+// The appended args must remain the TRAILING kernel args: the runtime marks
+// the last N args as DeviceGlobal by position. HipKernelArgSpiller — the only
+// later pass modifying kernel parameter lists — replaces args in place
+// without changing their count or positions.
+// ===========================================================================
+
+// Replace, inside function F, all LoadInst that load `GV` with ptrtoint(NewPtr).
+static void replaceGlobalLoadsWith(Function &F, GlobalVariable *GV,
+                                   Value *NewPtr) {
+  IRBuilder<> B(F.getContext());
+  SmallVector<LoadInst *, 4> Loads;
+  for (User *U : GV->users())
+    if (auto *LD = dyn_cast<LoadInst>(U))
+      if (LD->getFunction() == &F)
+        Loads.push_back(LD);
+  for (auto *LD : Loads) {
+    B.SetInsertPoint(LD);
+    Value *AsInt = B.CreatePtrToInt(NewPtr, LD->getType());
+    LD->replaceAllUsesWith(AsInt);
+    LD->eraseFromParent();
+  }
+}
+
+// Clone F into a new function with `NumExtra` extra trailing i8 addrspace(1)*
+// parameters, moving the body over. Returns the new function (old one erased).
+// The caller is responsible for wiring the extra args.
+static Function *appendPtrArgs(Function *F, unsigned NumExtra) {
+  LLVMContext &C = F->getContext();
+  auto *PtrTy = PointerType::get(C, SpirvCrossWorkGroupAS);
+  SmallVector<Type *> ArgTys;
+  for (auto &A : F->args())
+    ArgTys.push_back(A.getType());
+  for (unsigned i = 0; i < NumExtra; ++i)
+    ArgTys.push_back(PtrTy);
+  auto *NewFT = FunctionType::get(F->getReturnType(), ArgTys, F->isVarArg());
+  auto *NF = Function::Create(NewFT, F->getLinkage(), F->getAddressSpace(), "",
+                              F->getParent());
+  NF->setCallingConv(F->getCallingConv());
+  NF->setVisibility(F->getVisibility());
+  NF->setAttributes(F->getAttributes()); // function + existing-arg attributes
+  NF->copyMetadata(F, 0); // function-level metadata (!dbg, !reqd_* etc.)
+  NF->takeName(F);
+  // Move the body across and rewire the original arguments.
+  NF->splice(NF->begin(), F);
+  for (unsigned i = 0; i < F->arg_size(); ++i) {
+    F->getArg(i)->replaceAllUsesWith(NF->getArg(i));
+    NF->getArg(i)->takeName(F->getArg(i));
+  }
+  F->eraseFromParent();
+  return NF;
+}
+
+// Emit the `__chip_gvararg_<kernel>` annotation: a constant i8 array holding the
+// NUL-separated original global names in trailing-argument order.
+static void emitGVarArgAnnotation(Module &M, StringRef KernelName,
+                                  ArrayRef<std::string> GlobalNames) {
+  std::string Buf;
+  for (auto &N : GlobalNames) {
+    Buf += N;
+    Buf += '\0';
+  }
+  auto *Init = ConstantDataArray::getString(M.getContext(), Buf,
+                                             /*AddNull=*/false);
+  auto Name = (Twine(ChipGVarArgPrefix) + KernelName).str();
+  new GlobalVariable(M, Init->getType(), /*isConstant=*/true,
+                     GlobalValue::ExternalLinkage, Init, Name, nullptr,
+                     GlobalValue::NotThreadLocal, SpirvCrossWorkGroupAS);
+}
+
+// Original device-global name from a `__chip_var_addr_<name>` address holder.
+static std::string originalNameOf(const GlobalVariable *NewGV) {
+  StringRef N = NewGV->getName();
+  N.consume_front(ChipVarPrefix);
+  return N.str();
+}
+
+// Returns true if F is a chipStar-generated shadow kernel (info/bind/init or
+// the non-symbol reset kernel).
+static bool isShadowKernel(const Function &F) {
+  StringRef N = F.getName();
+  return N.starts_with(ChipVarInfoPrefix) || N.starts_with(ChipVarBindPrefix) ||
+         N.starts_with(ChipVarInitPrefix) || N == ChipNonSymbolResetKernelName;
+}
+
+// A lowered address-holder global can be safely converted to kernel arguments
+// only if every use is either a load inside a user (SPIR_KERNEL) kernel, a load
+// inside its OWN init shadow kernel, or the store inside its OWN bind shadow
+// kernel. Anything else — the address taken (ptrtoint/GEP/constexpr), a load in
+// a non-kernel device function, or a cross-reference from another global's init
+// kernel (e.g. mutually-referencing pointers `Foo=&Bar; Bar=&Foo`) — cannot be
+// expressed as a per-global trailing argument, so we leave such globals as
+// program-scope (which still works on drivers that support them).
+static bool isConvertibleGlobal(GlobalVariable *GV) {
+  std::string OrigName = originalNameOf(GV);
+  std::string OwnInit = (Twine(ChipVarInitPrefix) + OrigName).str();
+  std::string OwnBind = (Twine(ChipVarBindPrefix) + OrigName).str();
+  for (User *U : GV->users()) {
+    auto *I = dyn_cast<Instruction>(U);
+    if (!I)
+      return false; // constant expression use, etc.
+    Function *F = I->getFunction();
+    StringRef FN = F->getName();
+    if (isa<LoadInst>(I)) {
+      if (FN == OwnInit)
+        continue;
+      if (F->getCallingConv() == CallingConv::SPIR_KERNEL && !isShadowKernel(*F))
+        continue; // load in a user kernel
+      return false; // cross-ref init, or load in a non-kernel function
+    }
+    if (isa<StoreInst>(I)) {
+      if (FN == OwnBind)
+        continue; // own bind kernel's store
+      return false;
+    }
+    return false; // any other use kind
+  }
+  return true;
+}
+
+static bool lowerGlobalsToKernelArgs(Module &M, GVarMapT &GVarMap) {
+  if (GVarMap.empty())
+    return false;
+
+  // The lowered address-holder globals we can safely convert to kernel args.
+  // Non-convertible ones are left as program-scope globals (driver fallback).
+  SmallVector<GlobalVariable *, 8> GVs;
+  for (auto &Kv : GVarMap)
+    if (isConvertibleGlobal(Kv.second))
+      GVs.push_back(Kv.second);
+  if (GVs.empty())
+    return false;
+
+  // 1) Rework each `__chip_var_init_<G>` shadow kernel to take the storage
+  //    address as a trailing pointer arg instead of loading the global.
+  for (auto *GV : GVs) {
+    std::string OrigName = originalNameOf(GV);
+    auto *InitF = M.getFunction((Twine(ChipVarInitPrefix) + OrigName).str());
+    if (!InitF || InitF->isDeclaration())
+      continue;
+    Function *NInit = appendPtrArgs(InitF, 1);
+    replaceGlobalLoadsWith(*NInit, GV, NInit->getArg(NInit->arg_size() - 1));
+  }
+
+  // 2) Transform user kernels: append a pointer arg per global they load.
+  SmallVector<Function *, 16> UserKernels;
+  for (auto &F : M)
+    if (F.getCallingConv() == CallingConv::SPIR_KERNEL && !F.isDeclaration() &&
+        !isShadowKernel(F))
+      UserKernels.push_back(&F);
+
+  for (Function *F : UserKernels) {
+    // Collect, in deterministic order, the globals this kernel loads (GVs is
+    // duplicate-free, so Used is too).
+    SmallVector<GlobalVariable *, 4> Used;
+    for (auto *GV : GVs)
+      for (User *U : GV->users())
+        if (auto *LD = dyn_cast<LoadInst>(U))
+          if (LD->getFunction() == F) {
+            Used.push_back(GV);
+            break;
+          }
+    if (Used.empty())
+      continue;
+
+    Function *NF = appendPtrArgs(F, Used.size());
+    unsigned Base = NF->arg_size() - Used.size();
+    std::vector<std::string> Names;
+    for (unsigned j = 0; j < Used.size(); ++j) {
+      replaceGlobalLoadsWith(*NF, Used[j], NF->getArg(Base + j));
+      Names.push_back(originalNameOf(Used[j]));
+    }
+    emitGVarArgAnnotation(M, NF->getName(), Names);
+  }
+
+  // 3) Remove the `__chip_var_bind_<G>` shadow kernels (now pointless) and the
+  //    address-holder globals themselves. Erasing the bind kernel first drops
+  //    the only remaining use of the global.
+  for (auto *GV : GVs) {
+    std::string OrigName = originalNameOf(GV);
+    if (auto *BindF = M.getFunction((Twine(ChipVarBindPrefix) + OrigName).str()))
+      BindF->eraseFromParent();
+    GV->replaceAllUsesWith(PoisonValue::get(GV->getType()));
+    GV->eraseFromParent();
+  }
+  return true;
+}
+#endif // !CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS
 
 static bool lowerGlobalVariables(Module &M) {
   bool Changed = false;
 
   // Lower host accessible global device variables.
   GVarMapT GVarMap = emitIndirectGlobalVariables(M);
+
+  // Lower global device variables which are not accessible by the host but
+  // should be reset on hipDeviceReset() call. For example: static function
+  // local variables. First, so the replacement below rewrites what it stores.
+  auto NonSymbolGVs = findResettableNonSymbolGVs(M, GVarMap);
+  Changed |= emitNonSymbolInitializerKernel(NonSymbolGVs, M, GVarMap);
+
   if (!GVarMap.empty()) {
+    // Collect (lowered-i64-GVar, original-GVar) pairs that need initialization,
+    // in a deterministic order, for the combined init kernel (#582).
+    std::vector<std::pair<GlobalVariable *, GlobalVariable *>> InitVars;
     for (auto Kv : GVarMap) {
       emitGlobalVarInfoShadowKernel(M, Kv.first);
       emitGlobalVarBindShadowKernel(M, Kv.second, Kv.first);
       if (Kv.first->hasInitializer()) {
-        // Skip init kernel only for __chipspv_device_heap which has a
-        // pointer-typed null initializer that clspv cannot handle.
+        // Skip init for __chipspv_device_heap which has a pointer-typed
+        // null initializer that clspv cannot handle.
         bool IsDeviceHeapNull =
             Kv.first->getName() == ChipDeviceHeapName &&
             Kv.first->getInitializer()->isNullValue();
-        if (!IsDeviceHeapNull)
-          emitGlobalVarInitShadowKernel(M, Kv.second, Kv.first, GVarMap);
+        if (!IsDeviceHeapNull && !isHostFilled(Kv.first))
+          InitVars.push_back(std::make_pair(Kv.second, Kv.first));
       }
     }
+#ifdef CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS
+    // Program-scope-globals path (default): initialize all variables from a
+    // single combined shadow kernel launched once, instead of one
+    // single-work-item init kernel launch per variable (#582).
+    emitCombinedGlobalVarInitKernel(M, InitVars, GVarMap);
+#else
+    // Globals-as-kernel-args (rusticl) path: keep per-variable init kernels;
+    // lowerGlobalsToKernelArgs() reworks each to take the storage address as
+    // an argument.
+    for (auto &Pair : InitVars)
+      emitGlobalVarInitShadowKernel(M, Pair.first, Pair.second, GVarMap);
+#endif
     replaceGlobalVariableUses(GVarMap);
     eraseMappedGlobalVariables(GVarMap);
     Changed |= true;
+#ifndef CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS
+    // rusticl path: convert the lowered address-holder globals to implicit
+    // kernel arguments (the globals themselves are removed here).
+    lowerGlobalsToKernelArgs(M, GVarMap);
+#endif
   }
 
-  // Lower global device variables which are not accessible by the host but
-  // should be reset on hipDeviceReset() call. For example: static function
-  // local variables.
-  auto NonSymbolGVs = findResettableNonSymbolGVs(M);
-  Changed |= emitNonSymbolInitializerKernel(NonSymbolGVs, M);
+  // Keep the reset kernel last: JIT caches key on the module's function order.
+  if (auto *ResetKernel = M.getFunction(ChipNonSymbolResetKernelName)) {
+    ResetKernel->removeFromParent();
+    M.getFunctionList().push_back(ResetKernel);
+  }
 
   return Changed;
 }
@@ -570,6 +956,7 @@ PreservedAnalyses HipGlobalVariablesPass::run(Module &M,
                                  : PreservedAnalyses::all();
 }
 
+#ifndef CHIP_COMBINED_PASS_PLUGIN
 extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
 llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "hip-lower-gv", LLVM_VERSION_STRING,
@@ -585,3 +972,4 @@ llvmGetPassPluginInfo() {
                 });
           }};
 }
+#endif // CHIP_COMBINED_PASS_PLUGIN

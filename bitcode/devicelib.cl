@@ -123,16 +123,12 @@ EXPORT int __chip__fns32(unsigned long int mask, unsigned int base, int offset) 
 EXPORT unsigned /* long */ long int
 __chip_umul64hi(unsigned /* long */ long int x,
                 unsigned /* long */ long int y) {
-  unsigned /* long */ long int mul =
-      (unsigned /* long */ long int)x * (unsigned /* long */ long int)y;
-  return (unsigned /* long */ long int)(mul >> 64);
+  return (unsigned /* long */ long int)mul_hi((ulong)x, (ulong)y);
 }
 
 EXPORT /* long */ long int __chip_mul64hi(/* long */ long int x,
                                           /* long */ long int y) {
-  unsigned /* long */ long int mul =
-      (unsigned /* long */ long int)x * (unsigned /* long */ long int)y;
-  return (/* long */ long int)(mul >> 64);
+  return (/* long */ long int)mul_hi((long)x, (long)y);
 }
 
 EXPORT unsigned int __chip_sad(int x, int y, unsigned int z) {
@@ -516,7 +512,27 @@ EXPORT double __chip_sincos_f64(double x, DEFAULT_AS double *cos) {
 /* other */
 
 // local_barrier
-EXPORT void __chip_syncthreads() { barrier(CLK_LOCAL_MEM_FENCE); }
+EXPORT void __chip_syncthreads() {
+  // __syncthreads() must order GLOBAL memory as well as local/shared memory
+  // (CUDA/HIP semantics): writes to global memory before the barrier must be
+  // visible to all threads in the block afterwards. Omitting
+  // CLK_GLOBAL_MEM_FENCE causes rare wrong results for kernels that hand data
+  // between threads through global memory across __syncthreads() (issue #632).
+  barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+}
+
+// Work-group collectives backing __syncthreads_and/_or/_count. The barrier
+// semantics are provided by __chip_syncthreads() in the callers
+// (sync_and_util.hh); work_group_* are themselves convergent collectives.
+EXPORT int __chip_group_all(int predicate) { return work_group_all(predicate); }
+
+EXPORT int __chip_group_any(int predicate) { return work_group_any(predicate); }
+
+// __syncthreads_count: returns the number of threads with a true predicate,
+// not a ballot bitmask (blocks can exceed 64 threads).
+EXPORT ulong __chip_group_ballot(int predicate) {
+  return work_group_reduce_add(predicate ? 1 : 0);
+}
 
 // local_fence
 EXPORT void __chip_threadfence_block() { mem_fence(CLK_LOCAL_MEM_FENCE); }
@@ -579,33 +595,41 @@ EXPORT long __chip_ctz_li(long var) { return ctz(var); }
 */
 
 #define DEF_CHIP_ATOMIC2_ORDER_SCOPE(NAME, OP, ORDER, SCOPE)                  \
-  int OVLD atomic_##OP##_explicit (volatile __generic int *, int,             \
+  int OVLD atomic_##OP##_explicit (volatile __generic atomic_int *, int,      \
                                    memory_order order, memory_scope scope);   \
-  uint OVLD atomic_##OP##_explicit (volatile __generic uint *, uint,          \
+  uint OVLD atomic_##OP##_explicit (volatile __generic atomic_uint *, uint,   \
                                     memory_order order, memory_scope scope);  \
-  ulong OVLD atomic_##OP##_explicit (volatile __generic ulong *, ulong,       \
+  ulong OVLD atomic_##OP##_explicit (volatile __generic atomic_ulong *, ulong,\
                                      memory_order order, memory_scope scope); \
   int __chip_atomic_##NAME##_i (DEFAULT_AS int *address, int i)               \
   {                                                                           \
-    return atomic_##OP##_explicit ((volatile __generic int *)address, i,      \
-                                   memory_order_##ORDER,                      \
-                                   memory_scope_##SCOPE);                     \
+    return atomic_##OP##_explicit (                                           \
+        (volatile __generic atomic_int *)address, i,                          \
+        memory_order_##ORDER, memory_scope_##SCOPE);                          \
   }                                                                           \
   uint __chip_atomic_##NAME##_u (DEFAULT_AS uint *address, uint ui)           \
   {                                                                           \
-    return atomic_##OP##_explicit ((volatile __generic uint *)address, ui,    \
-                                   memory_order_##ORDER,                      \
-                                   memory_scope_##SCOPE);                     \
+    return atomic_##OP##_explicit (                                           \
+        (volatile __generic atomic_uint *)address, ui,                        \
+        memory_order_##ORDER, memory_scope_##SCOPE);                          \
   }                                                                           \
   ulong __chip_atomic_##NAME##_l (DEFAULT_AS ulong *address, ulong ull)       \
   {                                                                           \
-    return atomic_##OP##_explicit ((volatile __generic ulong *)address, ull,  \
-                                   memory_order_##ORDER,                      \
-                                   memory_scope_##SCOPE);                     \
+    return atomic_##OP##_explicit (                                           \
+        (volatile __generic atomic_ulong *)address, ull,                      \
+        memory_order_##ORDER, memory_scope_##SCOPE);                          \
   }
 
+// CUDA's atomicAdd / atomicSub / atomicMin / ... provide atomicity only,
+// not ordering — see CUDA C Programming Guide "Atomic Functions". ROCm/HIP
+// matches that on AMD. Default chipStar atomics here used memory_order_seq_cst,
+// which forces full device-scope acquire+release fences per atomic op on
+// Intel GPU (level0/opencl), serializing every contended atomic. Switch to
+// memory_order_relaxed to match CUDA/ROCm semantics (atomicity, no fences) —
+// drastically faster on hot, contended atomics. The _system and _block
+// variants keep seq_cst for now.
 #define DEF_CHIP_ATOMIC2(NAME, OP)                                            \
-  DEF_CHIP_ATOMIC2_ORDER_SCOPE (NAME, OP, seq_cst, device)                    \
+  DEF_CHIP_ATOMIC2_ORDER_SCOPE (NAME, OP, relaxed, device)                    \
   DEF_CHIP_ATOMIC2_ORDER_SCOPE (NAME##_system, OP, seq_cst, all_svm_devices)  \
   DEF_CHIP_ATOMIC2_ORDER_SCOPE (NAME##_block, OP, seq_cst, work_group)
 
@@ -832,33 +856,44 @@ EXPORT uint __chip_atomic_dec2_u(DEFAULT_AS uint *address, uint val) {
 }
 /**********************************************************************/
 
-// Use the Intel versions for now by default, since the Intel OpenCL CPU
-// driver still implements only them, not the KHR versions.
-#define sub_group_shuffle intel_sub_group_shuffle
-#define sub_group_shuffle_xor intel_sub_group_shuffle_xor
-
+// Use the KHR subgroup shuffles (cl_khr_subgroup_shuffle). They lower to
+// OpGroupNonUniformShuffle{,Xor}, which every OpenCL target chipStar supports
+// consumes. The intel_sub_group_shuffle* builtins require SPV_INTEL_subgroups,
+// which non-Intel drivers (e.g. Mali) reject at program-build time (#635).
+// Kept inline (rather than a linked rtdevlib module like ballot) because some
+// of those drivers also cannot clLinkProgram, so shuffle-only kernels must
+// stay single-module and take the direct clBuildProgram path.
 int OVLD sub_group_shuffle(int var, uint srcLane);
+uint OVLD sub_group_shuffle(uint var, uint srcLane);
+long OVLD sub_group_shuffle(long var, uint srcLane);
+ulong OVLD sub_group_shuffle(ulong var, uint srcLane);
 float OVLD sub_group_shuffle(float var, uint srcLane);
+double OVLD sub_group_shuffle(double var, uint srcLane);
 int OVLD sub_group_shuffle_xor(int var, uint value);
+uint OVLD sub_group_shuffle_xor(uint var, uint value);
+long OVLD sub_group_shuffle_xor(long var, uint value);
+ulong OVLD sub_group_shuffle_xor(ulong var, uint value);
 float OVLD sub_group_shuffle_xor(float var, uint value);
+double OVLD sub_group_shuffle_xor(double var, uint value);
 
-// Compute the full warp lane id given a subwarp of size wSize and
-// a "logical" lane id within it.
+// Compute the absolute subgroup lane id for an __shfl (indexed) shuffle.
 //
-// Assumes that each subwarp behaves as a separate entity
-// with a starting logical lane ID of 0.
+// CUDA semantics: when wSize < warpSize, the warp is partitioned into
+// contiguous segments of `wSize` lanes, each behaving as a separate
+// entity with logical lane IDs 0..wSize-1. The requested srcLane is
+// taken modulo wSize (i.e. it wraps within the caller's own segment;
+// srcLane values outside [0, wSize-1] never escape the segment), and it
+// is then rebased onto the caller's segment. wSize is a power of two.
 __attribute__((always_inline)) static int warpLaneId(int subWarpLaneId,
                                                      int wSize) {
-  if (wSize == DEFAULT_WARP_SIZE)
-    return subWarpLaneId;
   unsigned laneId = get_sub_group_local_id();
-  unsigned logicalSubWarp = laneId / wSize;
-  return logicalSubWarp * wSize + subWarpLaneId;
+  unsigned segmentBase = (laneId / (unsigned)wSize) * (unsigned)wSize;
+  unsigned laneInSeg = (unsigned)subWarpLaneId % (unsigned)wSize;
+  return segmentBase + laneInSeg;
 }
 
 #define __SHFL(T)                                                              \
   EXPORT OVLD T __shfl(T var, int srcLane, int wSize) {                        \
-    int laneId = get_sub_group_local_id();                                     \
     return sub_group_shuffle(var, warpLaneId(srcLane, wSize));                 \
   }
 
@@ -869,9 +904,21 @@ __SHFL(ulong);
 __SHFL(float);
 __SHFL(double);
 
+// CUDA semantics for __shfl_xor with a width < warpSize: the source lane
+// is laneId ^ laneMask. If that XOR result lands outside the caller's
+// width-segment (i.e. it would reference a later/earlier group), the
+// caller keeps its own value. For width == warpSize this reduces to a
+// plain butterfly shuffle. laneMask is applied to the absolute lane id
+// (not masked to the segment) so that high bits correctly send the
+// access out of the segment.
 #define __SHFL_XOR(T)                                                          \
-  EXPORT OVLD T __shfl_xor(T var, int value, int warpSizeOverride) {           \
-    return sub_group_shuffle_xor(var, value);                                  \
+  EXPORT OVLD T __shfl_xor(T var, int laneMask, int wSize) {                   \
+    int laneId = get_sub_group_local_id();                                     \
+    int segmentBase = (laneId / wSize) * wSize;                                \
+    int srcLane = laneId ^ laneMask;                                           \
+    if (srcLane < segmentBase || srcLane >= segmentBase + wSize)              \
+      srcLane = laneId;                                                        \
+    return sub_group_shuffle(var, srcLane);                                    \
   }
 
 __SHFL_XOR(int);
@@ -917,60 +964,52 @@ __SHFL_DOWN(ulong);
 __SHFL_DOWN(float);
 __SHFL_DOWN(double);
 
+// _sync shuffle variants.
+//
+// The `mask` argument names the set of lanes that participate in the
+// exchange (they are assumed already converged). The width-parameterized
+// index math is delegated to the non-sync implementations above, which are
+// correct for every width in {1,2,...,warpSize} and for arbitrary srcLane/
+// delta/laneMask values.
+//
+// Mask handling:
+//  * mask == 0            : this lane does not participate; return 0.
+//  * mask == 0xFFFFFFFF   : the whole warp participates -> exact semantics.
+//  * any other mask       : the OpenCL/SPIR-V subgroup shuffle builtins can
+//    only express whole-subgroup exchanges, so an arbitrary participation
+//    mask cannot be honored in general. We fall back to the full
+//    width-segment shuffle, which is correct whenever the participating
+//    lanes cover complete width-segments (the common reduction pattern,
+//    e.g. mask selecting every lane of each 0..width-1 segment). A truly
+//    sparse/partial mask that omits lanes inside an active segment is the
+//    only remaining unsupported case; results for the omitted lanes are
+//    then whatever the underlying segment lane holds rather than undefined.
 #define __SHFL_SYNC(T)                                                         \
   EXPORT OVLD T __shfl_sync(unsigned mask, T var, int srcLane, int width) {    \
-    if (mask == 0) {                                                           \
+    if (mask == 0)                                                            \
       return 0;                                                                \
-    } else if (mask == 0xFFFFFFFF) {                                           \
-      return __shfl(var, srcLane, width);                                      \
-    } else {                                                                   \
-      if (get_sub_group_local_id() == 0) {                                     \
-        printf("warning: Partial mask in __shfl_sync is not fully supported\n");\
-      }                                                                        \
-      return __shfl(var, srcLane, width);                                      \
-    }                                                                          \
+    return __shfl(var, srcLane, width);                                        \
   }
 
 #define __SHFL_UP_SYNC(T)                                                      \
   EXPORT OVLD T __shfl_up_sync(unsigned mask, T var, unsigned int delta, int width) { \
-    if (mask == 0) {                                                           \
+    if (mask == 0)                                                            \
       return 0;                                                                \
-    } else if (mask == 0xFFFFFFFF) {                                           \
-      return __shfl_up(var, delta, width);                                     \
-    } else {                                                                   \
-      if (get_sub_group_local_id() == 0) {                                     \
-        printf("warning: Partial mask in __shfl_up_sync is not fully supported\n");\
-      }                                                                        \
-      return __shfl_up(var, delta, width);                                     \
-    }                                                                          \
+    return __shfl_up(var, delta, width);                                       \
   }
 
 #define __SHFL_DOWN_SYNC(T)                                                    \
   EXPORT OVLD T __shfl_down_sync(unsigned mask, T var, unsigned int delta, int width) { \
-    if (mask == 0) {                                                           \
+    if (mask == 0)                                                            \
       return 0;                                                                \
-    } else if (mask == 0xFFFFFFFF) {                                           \
-      return __shfl_down(var, delta, width);                                   \
-    } else {                                                                   \
-      if (get_sub_group_local_id() == 0) {                                     \
-        printf("warning: Partial mask in __shfl_down_sync is not fully supported\n");\
-      }                                                                        \
-      return __shfl_down(var, delta, width);                                   \
-    }                                                                          \
+    return __shfl_down(var, delta, width);                                     \
   }
 
 #define __SHFL_XOR_SYNC(T)                                                     \
   EXPORT OVLD T __shfl_xor_sync(unsigned mask, T var, int laneMask, int width) { \
-    if (mask == 0) {                                                           \
+    if (mask == 0)                                                            \
       return 0;                                                                \
-    } else if (mask == 0xFFFFFFFF) {                                           \
-      return __shfl_xor(var, laneMask, width);                                 \
-    } else {                                                                   \
-      if (get_sub_group_local_id() == 0) {                                     \
-        printf("warning: Partial mask in __shfl_xor_sync is not fully supported\n");\
-      }                                                                        \
-      return __shfl_xor(var, laneMask, width);                                 \
-    }                                                                          \
+    return __shfl_xor(var, laneMask, width);                                   \
   }
 
 __SHFL_SYNC(int);
@@ -1013,7 +1052,7 @@ EXPORT OVLD int __chip_any(int predicate) {
   return __chip_ballot(predicate) != 0;
 }
 
-EXPORT OVLD unsigned __chip_ballot_sync(unsigned mask, int predicate) {
+EXPORT OVLD ulong __chip_ballot_sync(unsigned mask, int predicate) {
   if (mask == 0) {
     return 0;
   } else if (mask == 0xFFFFFFFF) {
@@ -1057,11 +1096,36 @@ EXPORT OVLD void __chip_syncwarp() {
   return sub_group_barrier(CLK_GLOBAL_MEM_FENCE);
 }
 
+// Targets of the c_to_opencl.def entries whose OpenCL counterpart is not a
+// plain builtin.
+//
+// scalbln takes a long exponent and ldexp an int. ldexp already returns 0 or
+// infinity for any finite nonzero x once |k| passes a few thousand, so
+// clamping the exponent to int changes nothing.
+static OVLD float __chip_scalbln(float x, long n) {
+  return ldexp(x, (int)clamp(n, (long)INT_MIN, (long)INT_MAX));
+}
+static OVLD double __chip_scalbln(double x, long n) {
+  return ldexp(x, (int)clamp(n, (long)INT_MIN, (long)INT_MAX));
+}
+// nexttowardf(x, y): y is a long double, a 64-bit double on spirv64. C
+// returns y converted to float when x == y (which is how -0.0f steps to
+// +0.0f), and otherwise the next float after x in the direction of y.
+static float __chip_nexttoward(float x, double y) {
+  if (isnan(y) || x == y)
+    return (float)y;
+  return nextafter(x, y > x ? INFINITY : -INFINITY);
+}
+
 // See c_to_opencl.def for details.
 #define DEF_UNARY_FN_MAP(FROM_FN_, TO_FN_, TYPE_)                              \
   TYPE_ __chip_c2ocl_##FROM_FN_(TYPE_ x) { return TO_FN_(x); }
 #define DEF_BINARY_FN_MAP(FROM_FN_, TO_FN_, TYPE_)                             \
   TYPE_ __chip_c2ocl_##FROM_FN_(TYPE_ x, TYPE_ y) { return TO_FN_(x, y); }
+#define DEF_UNARY_FN_MAP_RET(FROM_FN_, TO_FN_, RET_TYPE_, TYPE_)               \
+  RET_TYPE_ __chip_c2ocl_##FROM_FN_(TYPE_ x) { return TO_FN_(x); }
+#define DEF_BINARY_FN_MAP_MIXED(FROM_FN_, TO_FN_, TYPE_, TYPE2_)               \
+  TYPE_ __chip_c2ocl_##FROM_FN_(TYPE_ x, TYPE2_ y) { return TO_FN_(x, y); }
 #include "c_to_opencl.def"
 #undef UNARY_FN
 #undef BINARY_FN

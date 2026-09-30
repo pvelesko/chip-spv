@@ -21,6 +21,7 @@
  */
 
 #include "CHIPBackendOpenCL.hh"
+#include "ModuleCache.hh"
 #include "Utils.hh"
 #include "spirv_to_vulkan.hh"
 
@@ -28,10 +29,13 @@
 #include <sstream>
 #include <sys/stat.h>
 
-#include "Utils.hh"
+#include <algorithm>
 #include <chrono>
+#include <map>
+#include <unordered_set>
 #include <thread>
 #include <fstream>
+#include <unistd.h>
 
 // Auto-generated header that lives in <build-dir>/bitcode.
 #include "rtdevlib-modules.h"
@@ -598,7 +602,7 @@ void CHIPDeviceOpenCL::populateDevicePropertiesImpl() {
           : 0;
   HipDeviceProps_.integrated = 0;
   HipDeviceProps_.maxSharedMemoryPerMultiProcessor =
-      HipDeviceProps_.sharedMemPerBlock * 16;
+      HipDeviceProps_.sharedMemPerBlock;
   HipDeviceProps_.cooperativeLaunch = 0;
   HipDeviceProps_.cooperativeMultiDeviceLaunch = 0;
   HipDeviceProps_.cooperativeMultiDeviceUnmatchedFunc = 0;
@@ -649,6 +653,17 @@ void CHIPDeviceOpenCL::populateDevicePropertiesImpl() {
   HipDeviceProps_.concurrentManagedAccess = 0;
   HipDeviceProps_.pageableMemoryAccess = 0;
   HipDeviceProps_.pageableMemoryAccessUsesHostPageTables = 0;
+  // Asked of the allocation kind that backs hipHostMalloc on this device.
+  if (AllocStrat == AllocationStrategy::IntelUSM) {
+    cl_bitfield HostCaps = 0;
+    clGetDeviceInfo(ClDevice->get(), CL_DEVICE_HOST_MEM_CAPABILITIES_INTEL,
+                    sizeof(HostCaps), &HostCaps, nullptr);
+    HipDeviceProps_.hostNativeAtomicSupported =
+        (HostCaps & CL_UNIFIED_SHARED_MEMORY_ATOMIC_ACCESS_INTEL) ? 1 : 0;
+  } else {
+    HipDeviceProps_.hostNativeAtomicSupported =
+        HasUnifiedMemorySupport && SupportsSVMAtomics ? 1 : 0;
+  }
 
   auto Max1D2DWidth = ClDevice->getInfo<CL_DEVICE_IMAGE2D_MAX_WIDTH>();
   auto Max2DHeight = ClDevice->getInfo<CL_DEVICE_IMAGE2D_MAX_HEIGHT>();
@@ -762,6 +777,12 @@ void CHIPQueueOpenCL::recordEvent(chipstar::Event *ChipEvent) {
 
   ChipEventCL->recordEventCopy(enqueueMarker());
   ChipEventCL->setRecording();
+
+  // hipEventQuery polls the marker with clGetEventInfo, which never flushes,
+  // so submit the marker now or an implementation that submits lazily (Mali)
+  // never completes it.
+  clStatus = clFlush(get()->get());
+  CHIPERR_CHECK_LOG_AND_THROW_TABLE(clFlush);
 }
 
 void CHIPEventOpenCL::recordEventCopy(
@@ -801,6 +822,8 @@ bool CHIPEventOpenCL::wait() {
   clStatus = clWaitForEvents(1, &ClEvent);
 
   CHIPERR_CHECK_LOG_AND_THROW_TABLE(clWaitForEvents);
+  // Control returns to the host, which may now dereference managed memory.
+  static_cast<CHIPContextOpenCL *>(getContext())->mapManagedForHost();
   return true;
 }
 
@@ -903,9 +926,15 @@ static void dumpProgramLog(CHIPDeviceOpenCL &ChipDev, cl::Program Prog) {
             ChipDev.getName(), Log);
 }
 
+/// Create a program from IL and compile it with exactly the given options.
+///
+/// The caller decides the options: the user's program and the rtdevlib
+/// modules are compiled with different strings (see computeBuildOptions and
+/// computeRtDevLibOptions), and both are hashed into the cache key, so this
+/// must not add or recompute anything.
 static cl::Program compileIL(cl::Context Ctx, CHIPDeviceOpenCL &ChipDev,
                              const void *IL, size_t Length,
-                             const std::string &Options = "") {
+                             const std::string &Options) {
   cl_int Err;
   auto start = std::chrono::high_resolution_clock::now();
   cl::Program Prog(clCreateProgramWithIL(Ctx.get(), IL, Length, &Err));
@@ -917,11 +946,8 @@ static cl::Program compileIL(cl::Context Ctx, CHIPDeviceOpenCL &ChipDev,
 
   cl_device_id DevId = ChipDev.get()->get();
   auto Start = std::chrono::high_resolution_clock::now();
-  auto Flags = ChipEnvVars.hasJitOverride() ? ChipEnvVars.getJitFlagsOverride()
-                                            : ChipEnvVars.getJitFlags() + " " +
-                                                  Backend->getDefaultJitFlags();
-  logInfo("JIT flags: {}", Flags);
-  Err = clCompileProgram(Prog.get(), 1, &DevId, Flags.c_str(), 0, nullptr,
+  logInfo("JIT flags: {}", Options);
+  Err = clCompileProgram(Prog.get(), 1, &DevId, Options.c_str(), 0, nullptr,
                          nullptr, nullptr, nullptr);
   auto End = std::chrono::high_resolution_clock::now();
   auto Duration =
@@ -933,14 +959,52 @@ static cl::Program compileIL(cl::Context Ctx, CHIPDeviceOpenCL &ChipDev,
   return Prog;
 }
 
-template <size_t N>
-static cl::Program compileIL(cl::Context Ctx, CHIPDeviceOpenCL &ChipDev,
-                             std::array<unsigned char, N> IL,
-                             const std::string &Options = "") {
-  return compileIL(Ctx, ChipDev, IL.data(), IL.size());
+/// One rtdevlib module selected for linking into a device program.
+struct RtDevLibModule {
+  const char *Name;
+  const unsigned char *Data;
+  size_t Size;
+};
+
+/// Pick the rtdevlib modules to link into a program on this device.
+///
+/// Which implementation is chosen depends on device capabilities (native vs
+/// emulated atomics, fp64 support, ballot), so the selection is part of what
+/// determines the final binary. The cache key hashes the modules this returns,
+/// which is why selection lives here rather than inline in the link path: the
+/// key and the link have to agree, and duplicating the capability checks would
+/// let them drift apart silently.
+static std::vector<RtDevLibModule>
+selectRuntimeObjects(CHIPDeviceOpenCL &ChipDev) {
+  std::vector<RtDevLibModule> Modules;
+  auto Add = [&](auto &Source, const char *Name) -> void {
+    Modules.push_back({Name, Source.data(), Source.size()});
+  };
+
+  if (ChipDev.hasFP32AtomicAdd())
+    Add(chipstar::atomicAddFloat_native, "atomicAddFloat_native");
+  else
+    Add(chipstar::atomicAddFloat_emulation, "atomicAddFloat_emulation");
+
+  if (ChipDev.hasDoubles()) {
+    if (ChipDev.hasFP64AtomicAdd())
+      Add(chipstar::atomicAddDouble_native, "atomicAddDouble_native");
+    else
+      Add(chipstar::atomicAddDouble_emulation, "atomicAddDouble_emulation");
+  }
+
+  Add(chipstar::atomicMinMaxFloat_emulation, "atomicMinMaxFloat_emulation");
+
+  if (ChipDev.hasBallot())
+    Add(chipstar::ballot_native, "ballot_native");
+
+  // No fall-back implementation for ballot - let linker raise an error.
+
+  return Modules;
 }
 
 static void appendRuntimeObjects(cl::Context Ctx, CHIPDeviceOpenCL &ChipDev,
+                                 const std::string &Options,
                                  std::vector<cl::Program> &Objects) {
 
   // TODO: Minor optimization opportunity. Link modules based on
@@ -948,255 +1012,196 @@ static void appendRuntimeObjects(cl::Context Ctx, CHIPDeviceOpenCL &ChipDev,
 
   // TODO: Reuse already compiled modules.
 
-  auto AppendSource = [&](auto &Source, const std::string &Name) -> void {
+  for (const auto &Module : selectRuntimeObjects(ChipDev)) {
     if (ChipEnvVars.getDumpSpirv()) {
-      auto Str = std::string_view(reinterpret_cast<const char *>(Source.data()),
-                                  Source.size());
-      if (auto DumpPath = dumpSpirv(Str, Name))
-        logDebug("Dumped runtime object '{}' SPIR-V binary to '{}'", Name,
-                 fs::absolute(*DumpPath).c_str());
+      auto Str = std::string_view(reinterpret_cast<const char *>(Module.Data),
+                                  Module.Size);
+      if (auto DumpPath = dumpSpirv(Str, Module.Name))
+        logDebug("Dumped runtime object '{}' SPIR-V binary to '{}'",
+                 Module.Name, fs::absolute(*DumpPath).c_str());
     }
-    Objects.push_back(compileIL(Ctx, ChipDev, Source));
-  };
-
-  if (ChipDev.hasFP32AtomicAdd())
-    AppendSource(chipstar::atomicAddFloat_native, "atomicAddFloat_native");
-  else
-    AppendSource(chipstar::atomicAddFloat_emulation, "atomicAddFloat_emulation");
-
-  if (ChipDev.hasDoubles()) {
-    if (ChipDev.hasFP64AtomicAdd())
-      AppendSource(chipstar::atomicAddDouble_native, "atomicAddDouble_native");
-    else
-      AppendSource(chipstar::atomicAddDouble_emulation, "atomicAddDouble_emulation");
+    Objects.push_back(
+        compileIL(Ctx, ChipDev, Module.Data, Module.Size, Options));
   }
-
-  AppendSource(chipstar::atomicMinMaxFloat_emulation, "atomicMinMaxFloat_emulation");
-
-  if (ChipDev.hasBallot())
-    AppendSource(chipstar::ballot_native, "ballot_native");
-
-  // No fall-back implementation for ballot - let linker raise an error.
 }
 
-static void save(const cl::Program &program, const std::string &cacheName) {
+/// Flags passed to clLinkProgram for the rtdevlib link step.
+///
+/// Intel's driver is the only one given optimization flags here, so the value
+/// depends on the device as well as the environment. Computed in one place so
+/// the cache key and the actual link cannot disagree.
+static std::string computeLinkFlags(CHIPDeviceOpenCL &ChipDev) {
+  std::string Vendor = ChipDev.get()->getInfo<CL_DEVICE_VENDOR>();
+  bool IsIntelGPU = (Vendor.find("Intel") != std::string::npos) &&
+                    (ChipDev.get()->getInfo<CL_DEVICE_TYPE>() &
+                     CL_DEVICE_TYPE_GPU);
+  if (!IsIntelGPU)
+    return "";
+  return ChipEnvVars.hasJitOverride()
+             ? ChipEnvVars.getJitFlagsOverride()
+             : ChipEnvVars.getJitFlags() + " " + Backend->getDefaultJitFlags();
+}
+
+/// The options string handed to clBuildProgram / clCompileProgram.
+///
+/// Computed in one place for both the rtdevlib (compile+link) path and the
+/// direct clBuildProgram path, so the two cannot disagree and the cache key
+/// hashes exactly what the driver receives.
+static std::string computeBuildOptions() {
+  return ChipEnvVars.hasJitOverride()
+             ? ChipEnvVars.getJitFlagsOverride()
+             : Backend->getDefaultJitFlags() + " " + ChipEnvVars.getJitFlags();
+}
+
+/// The options string handed to clCompileProgram for each rtdevlib module.
+///
+/// The rtdevlib is chipStar's own library, built from OpenCL C 2.0 sources
+/// (generic address space, fp atomics), so it needs a -cl-std of CL2.0 or
+/// newer: the Intel CPU runtime resolves the builtins of an IL program
+/// according to -cl-std and cannot link the library's generic-pointer float
+/// atomic in a CL1.x environment. CHIP_JIT_FLAGS_OVERRIDE replaces the
+/// backend defaults (-cl-std=CL3.0 among them) for the user's program; a
+/// user's option string that sets no -cl-std at all gets the defaults put
+/// back in front of it for the library, so that the user's flags still reach
+/// the library (-cl-opt-disable when debugging, fast-math) without stripping
+/// its language level. A user's explicit -cl-std is respected as is. Hashed
+/// into the cache key separately from BuildOptions, since the two strings
+/// differ under such an override.
+static std::string computeRtDevLibOptions(const std::string &BuildOptions) {
+  if (BuildOptions.find("-cl-std=") != std::string::npos)
+    return BuildOptions;
+  return Backend->getDefaultJitFlags() + " " + BuildOptions;
+}
+
+/// Compute the module cache key.
+///
+/// The cached artifact is the device binary the driver produces, which is a
+/// pure function of the inputs handed to it: the IL, the options and link
+/// flags exactly as the driver receives them, the rtdevlib modules linked
+/// alongside (chosen per device capability, and linked after the cache
+/// lookup, so nothing else covers them), which device for, which driver and
+/// device compiler will do the compiling (the loader delta -- the driver
+/// version string alone provably misses a compiler-only upgrade), and the
+/// environment that compiler reads.
+///
+/// Deliberately NOT a chipStar version or build id. Such a token changes on
+/// every commit and would evict the whole cache for changes that cannot
+/// affect a single kernel -- the common case, since most chipStar work is
+/// host side and leaves the SPIR-V byte identical.
+static std::string
+computeCacheKey(std::string_view Il, const std::string &BuildOptions,
+                const std::string &LinkFlags, bool NeedsRtDevLib,
+                const std::string &RtDevLibOptions,
+                const std::vector<RtDevLibModule> &RtDevLibModules,
+                CHIPDeviceOpenCL &ChipDev) {
+  namespace cache = chipstar::cache;
+  cache::KeyBuilder KB;
+  KB.add(cache::KeyField::BackendTag, "opencl")
+      .add(cache::KeyField::Il, Il)
+      .add(cache::KeyField::BuildOptions, BuildOptions)
+      .add(cache::KeyField::LinkFlags, LinkFlags)
+      // compile+link and a direct clCreateProgramWithIL+clBuildProgram do
+      // not produce the same binary, so which path ran is part of the key.
+      .add(cache::KeyField::BranchFlag, NeedsRtDevLib);
+  if (NeedsRtDevLib)
+    KB.add(cache::KeyField::RtDevLibOptions, RtDevLibOptions);
+  for (const auto &Module : RtDevLibModules) {
+    KB.add(cache::KeyField::RtDevLibName, Module.Name);
+    KB.add(cache::KeyField::RtDevLibBytes, Module.Data, Module.Size);
+  }
+  KB.add(cache::KeyField::DeviceName,
+         ChipDev.get()->getInfo<CL_DEVICE_NAME>())
+      .add(cache::KeyField::DriverVersion,
+           ChipDev.get()->getInfo<CL_DRIVER_VERSION>())
+      .add(cache::KeyField::LoaderDelta, cache::loaderDeltaDigest())
+      .add(cache::KeyField::Environment,
+           collectCompilerEnvironmentVariables());
+  std::string Key = KB.finish();
+  logDebug("Generated cache key: '{}'", Key);
+  return Key;
+}
+
+/// Extract this device's compiled binary from a built program. Empty on any
+/// failure (which simply means the module is not cached this time).
+static std::vector<unsigned char>
+extractDeviceBinary(const cl::Program &Program, cl_device_id DevId) {
+  std::vector<size_t> Sizes;
+  std::vector<cl::Device> Devices;
+  if (Program.getInfo(CL_PROGRAM_BINARY_SIZES, &Sizes) != CL_SUCCESS ||
+      Program.getInfo(CL_PROGRAM_DEVICES, &Devices) != CL_SUCCESS ||
+      Sizes.size() != Devices.size())
+    return {};
+
+  size_t Index = Devices.size();
+  for (size_t I = 0; I < Devices.size(); ++I)
+    if (Devices[I]() == DevId) {
+      Index = I;
+      break;
+    }
+  if (Index == Devices.size() || Sizes[Index] == 0)
+    return {};
+
+  // CL_PROGRAM_BINARIES takes one destination pointer per device; leave the
+  // others null so the driver skips them.
+  std::vector<std::vector<unsigned char>> Storage(Devices.size());
+  std::vector<unsigned char *> Pointers(Devices.size(), nullptr);
+  Storage[Index].resize(Sizes[Index]);
+  Pointers[Index] = Storage[Index].data();
+  if (clGetProgramInfo(Program(), CL_PROGRAM_BINARIES,
+                       Pointers.size() * sizeof(unsigned char *),
+                       Pointers.data(), nullptr) != CL_SUCCESS)
+    return {};
+  return std::move(Storage[Index]);
+}
+
+/// Try to reconstruct a program for this device from a cached entry.
+/// A hit means "we did not JIT": the marker is emitted only after the
+/// binary actually built. Bytes that fail to build are REJECTED and the
+/// caller recompiles.
+static bool loadCachedProgram(cl::Context &Ctx, CHIPDeviceOpenCL &ChipDev,
+                              const std::string &Key, cl::Program &ProgramOut) {
+  namespace cache = chipstar::cache;
+  if (!ChipEnvVars.getModuleCacheDir().has_value())
+    return false;
+
+  auto Entry = cache::load(ChipEnvVars.getModuleCacheDir().value(), "opencl",
+                           Key); // emits the MISS marker itself
+  if (!Entry)
+    return false;
+
+  std::vector<cl::Device> Devices{*ChipDev.get()};
+  cl::Program::Binaries Binaries{std::vector<unsigned char>(
+      Entry.data().begin(), Entry.data().end())};
+  cl_int Err = CL_SUCCESS;
+  cl::Program Program(Ctx, Devices, Binaries, nullptr, &Err);
+  if (Err == CL_SUCCESS)
+    Err = Program.build();
+  if (Err != CL_SUCCESS) {
+    cache::logOutcome("opencl", Key, cache::Outcome::Rejected,
+                      "build-from-binary");
+    return false;
+  }
+  ProgramOut = Program;
+  cache::logOutcome("opencl", Key, cache::Outcome::Hit, "");
+  return true;
+}
+
+/// Store the binary just built for this device. Failure only costs the next
+/// process a recompile.
+static void storeProgram(const cl::Program &Program, CHIPDeviceOpenCL &ChipDev,
+                         const std::string &Key) {
+  namespace cache = chipstar::cache;
   if (!ChipEnvVars.getModuleCacheDir().has_value()) {
     logTrace("Module caching is disabled");
     return;
   }
-
-  std::string cacheDir = ChipEnvVars.getModuleCacheDir().value();
-  // Create the cache directory if it doesn't exist
-  std::filesystem::create_directories(cacheDir);
-  std::string fullPath = cacheDir + "/" + cacheName;
-
-  // Step 1: Get the sizes of the binaries for each device
-  std::vector<size_t> binarySizes;
-  program.getInfo(CL_PROGRAM_BINARY_SIZES, &binarySizes);
-
-  size_t numDevices = binarySizes.size();
-
-  if (numDevices == 0) {
-    logError("No devices associated with the program.");
+  auto Binary = extractDeviceBinary(Program, ChipDev.get()->get());
+  if (Binary.empty()) {
+    logDebug("No binary to cache for this device");
     return;
   }
-
-  // Step 2: Allocate memory for each binary
-  std::vector<unsigned char *> binaries(numDevices, nullptr);
-  for (size_t i = 0; i < numDevices; ++i) {
-    if (binarySizes[i] > 0) {
-      binaries[i] = new unsigned char[binarySizes[i]];
-    } else {
-      logError("Binary size for device {} is zero.", i);
-      return;
-    }
-  }
-
-  // Step 3: Retrieve the binaries
-  cl_int err = clGetProgramInfo(program(), CL_PROGRAM_BINARIES,
-                                numDevices * sizeof(unsigned char *),
-                                binaries.data(), nullptr);
-  if (err != CL_SUCCESS) {
-    logError("clGetProgramInfo(CL_PROGRAM_BINARIES) failed with error {}", err);
-    // Clean up allocated memory
-    for (auto ptr : binaries) {
-      delete[] ptr;
-    }
-    return;
-  }
-
-  // Step 4: Write the binaries to the output file
-  std::ofstream outFile(fullPath, std::ios::out | std::ios::binary);
-  if (!outFile) {
-    logError("Failed to open file for writing kernel binary");
-    // Clean up allocated memory
-    for (auto ptr : binaries) {
-      delete[] ptr;
-    }
-    return;
-  }
-
-  size_t totalBinarySize = 0;
-  for (size_t i = 0; i < numDevices; ++i) {
-    logTrace("Writing binary for device {}: {} bytes", i, binarySizes[i]);
-    outFile.write(reinterpret_cast<const char *>(binaries[i]), binarySizes[i]);
-    if (!outFile) {
-      logError("Failed to write binary data to file");
-      outFile.close();
-      // Clean up allocated memory
-      for (auto ptr : binaries) {
-        delete[] ptr;
-      }
-      return;
-    }
-    totalBinarySize += binarySizes[i];
-  }
-
-  outFile.close();
-
-  // Step 5: Verify the file size
-  std::ifstream inFile(fullPath,
-                       std::ios::in | std::ios::binary | std::ios::ate);
-  if (!inFile) {
-    logError("Failed to open file for reading to verify size");
-    // Clean up allocated memory
-    for (auto ptr : binaries) {
-      delete[] ptr;
-    }
-    return;
-  }
-  std::streampos fileSize = inFile.tellg();
-  inFile.close();
-
-  if (fileSize != static_cast<std::streampos>(totalBinarySize)) {
-    logError("File size mismatch. Expected: {}, Actual: {}", totalBinarySize,
-             fileSize);
-    // Clean up allocated memory
-    for (auto ptr : binaries) {
-      delete[] ptr;
-    }
-    return;
-  }
-
-  logTrace("Kernel binary cached as {}", fullPath);
-  logTrace("Number of binaries: {}", numDevices);
-
-  // Step 6: Clean up allocated memory
-  for (auto ptr : binaries) {
-    delete[] ptr;
-  }
-}
-
-static bool load(cl::Context &context, const std::vector<cl::Device> &devices,
-                 const std::string &cacheName, cl::Program &program) {
-  if (!ChipEnvVars.getModuleCacheDir().has_value()) {
-    return false;
-  }
-
-  std::string cacheDir = ChipEnvVars.getModuleCacheDir().value();
-  std::string fullPath = cacheDir + "/" + cacheName;
-
-  logTrace("Loading kernel binary from cache at {}", fullPath);
-
-  std::ifstream inFile(fullPath,
-                       std::ios::in | std::ios::binary | std::ios::ate);
-  if (!inFile) {
-    return false;
-  }
-
-  size_t size = inFile.tellg();
-  logTrace("File size according to tellg(): {}", size);
-
-  inFile.seekg(0, std::ios::beg);
-
-  std::vector<char> binary(size);
-  inFile.read(binary.data(), size);
-
-  if (inFile.fail()) {
-    logError("Failed to read file. Error: {}", strerror(errno));
-    return false;
-  }
-
-  size_t bytesRead = inFile.gcount();
-  logTrace("Bytes actually read: {}", bytesRead);
-
-  inFile.close();
-
-  try {
-    cl::Program::Binaries binaries(
-        1, std::vector<unsigned char>(binary.begin(), binary.end()));
-    logTrace("loading Binary size: {}", binary.size());
-
-    if (binary.empty()) {
-      logError("Binary data is empty. Deleting the cache file.");
-      std::remove(fullPath.c_str());
-      return false;
-    }
-
-    cl_int err;
-    program = cl::Program(context, devices, binaries, nullptr, &err);
-    assert(err == CL_SUCCESS);
-    logTrace("Program created successfully");
-
-    auto buildStart = std::chrono::high_resolution_clock::now();
-    err = program.build();
-    auto buildEnd = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> buildElapsed = buildEnd - buildStart;
-    logInfo("clProgramBuild took {} seconds", buildElapsed.count());
-    if (err != CL_SUCCESS) {
-      logError("Failed to build program from binary: {}", err);
-      return false;
-    }
-
-    // Print kernels available in the program
-    std::vector<cl::Kernel> kernels;
-    err = program.createKernels(&kernels);
-    if (err != CL_SUCCESS) {
-      logError("Failed to create kernels: {}", err);
-    } else {
-      logTrace("Kernels available in the program:");
-      for (const auto &kernel : kernels) {
-        std::string kernelName;
-        err = kernel.getInfo(CL_KERNEL_FUNCTION_NAME, &kernelName);
-        if (err == CL_SUCCESS) {
-          logTrace("  {}", kernelName);
-        } else {
-          logError("Failed to get kernel name: {}", err);
-        }
-      }
-    }
-
-    if (err != CL_SUCCESS) {
-      logError("Failed to create program from binary: {}", err);
-      return false;
-    }
-  } catch (const std::exception &e) {
-    logError("OpenCL error creating program from binary: {}", e.what());
-    return false;
-  }
-
-  logTrace("Kernel binary loaded from cache as {}", fullPath);
-  return true;
-}
-
-std::string generateCacheName(const std::string &strIn,
-                              const std::string &deviceName) {
-  std::hash<std::string> hasher;
-  std::string combinedStr = strIn + deviceName;
-
-  // Include IGC_ environment variables in cache key
-  std::string igcVars = collectIGCEnvironmentVariables();
-  logDebug("IGC variables for cache key: '{}'", igcVars);
-  if (!igcVars.empty()) {
-    combinedStr += ";" + igcVars;
-  }
-
-  logDebug("Combined string for cache key: '{}'",
-           combinedStr.substr(0, 200) + "...");
-  size_t hash = hasher(combinedStr);
-  std::string cacheKey = std::to_string(hash);
-  logDebug("Generated cache key: '{}'", cacheKey);
-  return cacheKey;
+  cache::store(ChipEnvVars.getModuleCacheDir().value(), "opencl", Key,
+               Binary.data(), Binary.size());
 }
 
 void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
@@ -1208,37 +1213,37 @@ void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
 
   int Err;
   auto SrcBin = Src_->getBinary();
-  std::string buildOptions =
-      Backend->getDefaultJitFlags() + " " + ChipEnvVars.getJitFlags();
-  std::string binAsStr = std::string(SrcBin.begin(), SrcBin.end());
 
-  // Include device name in cache key
-  std::string deviceName = ChipDevOcl->getName();
-  std::string cacheName =
-      generateCacheName(binAsStr + buildOptions, deviceName);
+  // Everything the driver will be given has to be known before the lookup, so
+  // that the key covers it.
+  std::string buildOptions = computeBuildOptions();
+  bool NeedsRtDevLib = spirvNeedsRtdevlib(SrcBin);
+  std::string RtDevLibOptions;
+  std::vector<RtDevLibModule> RtDevLibModules;
+  if (NeedsRtDevLib) {
+    RtDevLibOptions = computeRtDevLibOptions(buildOptions);
+    RtDevLibModules = selectRuntimeObjects(*ChipDevOcl);
+  }
+  std::string Flags = computeLinkFlags(*ChipDevOcl);
+
+  std::string CacheKey =
+      computeCacheKey(SrcBin, buildOptions, Flags, NeedsRtDevLib,
+                      RtDevLibOptions, RtDevLibModules, *ChipDevOcl);
 
   bool cached =
-      load(*ChipCtxOcl->get(), {*ChipDevOcl->get()}, cacheName, Program_);
+      loadCachedProgram(*ChipCtxOcl->get(), *ChipDevOcl, CacheKey, Program_);
 
   if (!cached) {
-    if (spirvNeedsRtdevlib(Src_->getBinary())) {
+    if (NeedsRtDevLib) {
       // Compile + link: compile main module, append rtdevlib, link together.
       cl::Program ClMainObj =
           compileIL(*ChipCtxOcl->get(), *ChipDevOcl, SrcBin.data(),
-                    SrcBin.size(), buildOptions.c_str());
+                    SrcBin.size(), buildOptions);
       std::vector<cl::Program> ClObjects;
       ClObjects.push_back(ClMainObj);
-      appendRuntimeObjects(*ChipCtxOcl->get(), *ChipDevOcl, ClObjects);
+      appendRuntimeObjects(*ChipCtxOcl->get(), *ChipDevOcl, RtDevLibOptions,
+                           ClObjects);
 
-      std::string Flags = "";
-      std::string vendor = ChipDevOcl->get()->getInfo<CL_DEVICE_VENDOR>();
-      bool isIntelGPU =
-          (vendor.find("Intel") != std::string::npos) &&
-          (ChipDevOcl->get()->getInfo<CL_DEVICE_TYPE>() & CL_DEVICE_TYPE_GPU);
-      if (isIntelGPU)
-        Flags = ChipEnvVars.hasJitOverride() ? ChipEnvVars.getJitFlagsOverride()
-                                             : ChipEnvVars.getJitFlags() + " " +
-                                                   Backend->getDefaultJitFlags();
       logInfo("Linking {} program objects", ClObjects.size());
       Program_ =
           cl::linkProgram(ClObjects, Flags.c_str(), nullptr, nullptr, &Err);
@@ -1246,7 +1251,7 @@ void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
         logError("clLinkProgram failed: {} (0x{:x})", Err, (unsigned)Err);
         dumpProgramLog(*ChipDevOcl, Program_);
         CHIPERR_LOG_AND_THROW("Device library link step failed.",
-                              hipErrorInitializationError);
+                              hipErrorSharedObjectInitFailed);
       }
     } else {
       // No rtdevlib needed. Build directly with clBuildProgram, bypassing
@@ -1302,7 +1307,6 @@ void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
         logDebug("CHIP_VULKANIZE_SPIRV unset, passing plain OpenCL SPIR-V");
       }
 
-      cl_int CreateErr;
       // Detect Vulkan-flavored SPIR-V (Logical addressing, GLSL450 memory
       // model) emitted by HIPSPV's chipstar-vulkan triple — those go through
       // clCreateProgramWithBinary so clvk skips its OpenCL→Vulkan clspv
@@ -1338,26 +1342,20 @@ void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
         cl_int BinStatus;
         Program_ = cl::Program(clCreateProgramWithBinary(
             ChipCtxOcl->get()->get(), 1, &Dev, &LenSz, &BinPtr, &BinStatus,
-            &CreateErr));
+            &clStatus));
       } else {
         Program_ = cl::Program(clCreateProgramWithIL(
-            ChipCtxOcl->get()->get(), ILData, ILSize, &CreateErr));
+            ChipCtxOcl->get()->get(), ILData, ILSize, &clStatus));
       }
       CHIPERR_CHECK_LOG_AND_THROW_TABLE(clCreateProgramWithIL);
       cl_device_id DevId = ChipDevOcl->get()->get();
-      auto Flags = ChipEnvVars.hasJitOverride()
-                       ? ChipEnvVars.getJitFlagsOverride()
-                       : ChipEnvVars.getJitFlags() + " " +
-                             Backend->getDefaultJitFlags();
-      Err = clBuildProgram(Program_.get(), 1, &DevId, Flags.c_str(),
+      Err = clBuildProgram(Program_.get(), 1, &DevId, buildOptions.c_str(),
                            nullptr, nullptr);
       dumpProgramLog(*ChipDevOcl, Program_);
       if (Err != CL_SUCCESS)
         CHIPERR_LOG_AND_THROW("Program build failed.",
-                              hipErrorInitializationError);
+                              hipErrorSharedObjectInitFailed);
     }
-
-    save(Program_, cacheName);
   }
 
   std::vector<cl::Kernel> Kernels;
@@ -1386,10 +1384,12 @@ void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
   CHIPERR_CHECK_LOG_AND_THROW_TABLE(clCreateKernelsInProgram);
 
   logTrace("Kernels in CHIPModuleOpenCL: {} \n", Kernels.size());
+  std::unordered_set<std::string> BuiltKernelNames;
   for (auto &Krnl : Kernels) {
     std::string HostFName;
-    Err = Krnl.getInfo(CL_KERNEL_FUNCTION_NAME, &HostFName);
+    clStatus = Krnl.getInfo(CL_KERNEL_FUNCTION_NAME, &HostFName);
     CHIPERR_CHECK_LOG_AND_THROW_TABLE(clGetKernelInfo);
+    BuiltKernelNames.insert(HostFName);
     auto *FuncInfo = findFunctionInfo(HostFName);
     if (!FuncInfo) {
       continue;
@@ -1398,6 +1398,29 @@ void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
         new CHIPKernelOpenCL(Krnl, ChipDevOcl, HostFName, FuncInfo, this);
     addKernel(ChipKernel);
   }
+
+  // A successful build is not proof that every kernel of the source module
+  // made it into the program: the Arm Mali driver accepts a module with an
+  // unresolved function import, reports CL_SUCCESS with an empty build log,
+  // and leaves out the kernels that call the import. The host side later
+  // binds every registered __global__ function of the source module to a
+  // program kernel by name, so a program lacking one is a module that failed
+  // to load, not a module with a faulting kernel.
+  std::string MissingKernels;
+  for (const auto &Info : Src_->Kernels)
+    if (!BuiltKernelNames.count(Info.Name))
+      MissingKernels += (MissingKernels.empty() ? "" : ", ") + Info.Name;
+  if (!MissingKernels.empty())
+    CHIPERR_LOG_AND_THROW(
+        "Built program lacks kernel(s) of the source module (unresolved "
+        "device function?): " +
+            MissingKernels,
+        hipErrorSharedObjectInitFailed);
+
+  // Persist only a program known to hold every kernel; a cached copy of an
+  // incomplete one would fail the same check on every later process anyway.
+  if (!cached)
+    storeProgram(Program_, *ChipDevOcl, CacheKey);
 
   auto end = std::chrono::high_resolution_clock::now();
   std::chrono::duration<double> elapsed = end - start;
@@ -1467,9 +1490,8 @@ Borrowed<cl::Kernel> CHIPKernelOpenCL::borrowUniqueKernelHandle() {
   // NOTE: clCloneKernel is not used here due to its experience on
   // Intel (GPU) OpenCL which crashed if clSetKernelArgSVMPointer() was
   // called on the original cl_kernel.
-  cl_int Err;
-  auto *NewK = new cl::Kernel(*Module->get(), Name_.c_str(), &Err);
-  if (Err != CL_SUCCESS) {
+  auto *NewK = new cl::Kernel(*Module->get(), Name_.c_str(), &clStatus);
+  if (clStatus != CL_SUCCESS) {
     delete NewK;
     CHIPERR_CHECK_LOG_AND_THROW_TABLE(clCreateKernel);
   }
@@ -1521,13 +1543,15 @@ bool CHIPContextOpenCL::allDevicesSupportFineGrainSVMorUSM() {
 
 void CHIPContextOpenCL::freeImpl(void *Ptr) {
   LOCK(ContextMtx); // CHIPContextOpenCL::MemManager_
+  if (keepsManagedMapped())
+    untrackManagedAllocation(Ptr);
   MemManager_.free(Ptr);
 }
 
 cl::Context *CHIPContextOpenCL::get() { return &ClContext; }
 CHIPContextOpenCL::CHIPContextOpenCL(cl::Context CtxIn, cl::Device Dev,
                                      cl::Platform Plat)
-    : Platform_(Plat), ClContext(CtxIn) {
+    : Platform_(Plat), ClContext(CtxIn), ClDevice_(Dev) {
   logTrace("CHIPContextOpenCL Initialized via OpenCL Context pointer.");
 }
 
@@ -1538,7 +1562,122 @@ void *CHIPContextOpenCL::allocateImpl(size_t Size, size_t Alignment,
   LOCK(ContextMtx); // CHIPContextOpenCL::MemManager_
 
   Retval = MemManager_.allocate(Size, Alignment, MemType);
+  // hipMallocManaged allocates hipMemoryTypeUnified; hipMemoryTypeManaged is
+  // the hipHostRegister backing store, which the host never dereferences.
+  if (Retval && MemType == hipMemoryTypeUnified && keepsManagedMapped())
+    trackManagedAllocation(Retval, Size);
   return Retval;
+}
+
+cl::CommandQueue &CHIPContextOpenCL::getManagedMapQueue() {
+  if (!ManagedMapQueue_()) {
+    cl_int Err = CL_SUCCESS;
+    ManagedMapQueue_ = cl::CommandQueue(ClContext, ClDevice_, 0, &Err);
+    if (Err != CL_SUCCESS)
+      CHIPERR_LOG_AND_THROW("Failed to create the managed memory map queue: " +
+                                std::to_string(Err),
+                            hipErrorRuntimeMemory);
+  }
+  return ManagedMapQueue_;
+}
+
+void CHIPContextOpenCL::trackManagedAllocation(void *Ptr, size_t Size) {
+  std::lock_guard<std::mutex> Lock(ManagedMapMtx_);
+  // Nothing on the device can reference a brand new allocation, so the map
+  // needs no wait list.
+  cl_int Err = clEnqueueSVMMap(getManagedMapQueue()(), CL_TRUE,
+                               CL_MAP_READ | CL_MAP_WRITE, Ptr, Size, 0,
+                               nullptr, nullptr);
+  if (Err != CL_SUCCESS)
+    CHIPERR_LOG_AND_THROW("clEnqueueSVMMap failed for a managed allocation: " +
+                              std::to_string(Err),
+                          hipErrorRuntimeMemory);
+  ManagedMaps_[Ptr] = ManagedMapEntry{Size, true};
+}
+
+void CHIPContextOpenCL::untrackManagedAllocation(void *Ptr) {
+  std::lock_guard<std::mutex> Lock(ManagedMapMtx_);
+  auto It = ManagedMaps_.find(Ptr);
+  if (It == ManagedMaps_.end())
+    return;
+  if (It->second.Mapped) {
+    // clSVMFree does not wait for enqueued commands, so the unmap has to be
+    // complete before the memory goes back to the allocator.
+    cl_command_queue Queue = getManagedMapQueue()();
+    cl_int Err = clEnqueueSVMUnmap(Queue, Ptr, 0, nullptr, nullptr);
+    if (Err == CL_SUCCESS)
+      Err = clFinish(Queue);
+    if (Err != CL_SUCCESS)
+      logWarn("clEnqueueSVMUnmap failed for managed allocation {}: {}", Ptr,
+              Err);
+  }
+  ManagedMaps_.erase(It);
+}
+
+void CHIPContextOpenCL::unmapManagedForDevice(cl_command_queue Queue) {
+  if (!keepsManagedMapped())
+    return;
+  std::lock_guard<std::mutex> Lock(ManagedMapMtx_);
+  for (auto &[Ptr, Entry] : ManagedMaps_) {
+    if (!Entry.Mapped)
+      continue;
+    // Queue is in-order, so the unmap completes before the command the
+    // caller enqueues next; the map it undoes was blocking and is done.
+    cl_int Err = clEnqueueSVMUnmap(Queue, Ptr, 0, nullptr, nullptr);
+    if (Err != CL_SUCCESS)
+      CHIPERR_LOG_AND_THROW(
+          "clEnqueueSVMUnmap failed for a managed allocation: " +
+              std::to_string(Err),
+          hipErrorRuntimeMemory);
+    Entry.Mapped = false;
+    logTrace("Unmapped managed allocation {} for the device", Ptr);
+  }
+}
+
+void CHIPContextOpenCL::mapManagedForHost() {
+  if (!keepsManagedMapped())
+    return;
+  std::lock_guard<std::mutex> Lock(ManagedMapMtx_);
+  bool AnyUnmapped = false;
+  for (const auto &[Ptr, Entry] : ManagedMaps_)
+    AnyUnmapped |= !Entry.Mapped;
+  if (!AnyUnmapped)
+    return;
+
+  // A coarse grained SVM buffer must not be mapped while a kernel that uses
+  // it executes, and a kernel on another stream may still be running, so the
+  // map waits for the work in flight on every queue of the device. Queues
+  // that have had nothing submitted since their last finish() are skipped.
+  std::vector<cl_event> Markers;
+  auto AddMarkers = [&](chipstar::Queue *Q) {
+    if (Q && !Q->isEmptyQueue())
+      static_cast<CHIPQueueOpenCL *>(Q)->enqueueIdleMarkers(Markers);
+  };
+  for (auto *Q : ChipDevice_->getQueuesNoLock())
+    AddMarkers(Q);
+  AddMarkers(ChipDevice_->getLegacyDefaultQueue());
+  if (ChipDevice_->isPerThreadStreamUsedNoLock())
+    AddMarkers(ChipDevice_->getPerThreadDefaultQueueNoLock());
+
+  cl_command_queue MapQueue = getManagedMapQueue()();
+  cl_int Err = CL_SUCCESS;
+  for (auto &[Ptr, Entry] : ManagedMaps_) {
+    if (Entry.Mapped)
+      continue;
+    Err = clEnqueueSVMMap(MapQueue, CL_TRUE, CL_MAP_READ | CL_MAP_WRITE, Ptr,
+                          Entry.Size, Markers.size(),
+                          Markers.empty() ? nullptr : Markers.data(), nullptr);
+    if (Err != CL_SUCCESS)
+      break;
+    Entry.Mapped = true;
+    logTrace("Mapped managed allocation {} for the host", Ptr);
+  }
+  for (cl_event Marker : Markers)
+    clReleaseEvent(Marker);
+  if (Err != CL_SUCCESS)
+    CHIPERR_LOG_AND_THROW("clEnqueueSVMMap failed for a managed allocation: " +
+                              std::to_string(Err),
+                          hipErrorRuntimeMemory);
 }
 
 // CHIPQueueOpenCL
@@ -1644,6 +1783,7 @@ void CHIPQueueOpenCL::MemUnmap(const chipstar::AllocationInfo *AllocInfo) {
       SyncQueuesEventHandles.data(),
       std::static_pointer_cast<CHIPEventOpenCL>(MemMapEvent)->getNativePtr());
   assert(clStatus == CL_SUCCESS);
+  noteWorkEnqueued();
 }
 
 cl::CommandQueue *CHIPQueueOpenCL::get() {
@@ -1735,8 +1875,7 @@ void CHIPQueueOpenCL::addCallback(hipStreamCallback_t Callback,
 }
 
 std::shared_ptr<chipstar::Event> CHIPQueueOpenCL::enqueueMarkerImpl() {
-  // Mark queue as having work submitted
-  IsEmptyQueue_.store(false);
+  noteWorkEnqueued();
   
   std::shared_ptr<chipstar::Event> MarkerEvent =
       static_cast<CHIPBackendOpenCL *>(Backend)->createEventShared(
@@ -1758,8 +1897,7 @@ std::shared_ptr<chipstar::Event>
 CHIPQueueOpenCL::launchImpl(chipstar::ExecItem *ExecItem) {
   logTrace("CHIPQueueOpenCL->launch()");
   
-  // Mark queue as having work submitted
-  IsEmptyQueue_.store(false);
+  noteWorkEnqueued();
   
   auto *OclContext = static_cast<CHIPContextOpenCL *>(ChipContext_);
   std::shared_ptr<chipstar::Event>(LaunchEvent) =
@@ -1786,6 +1924,8 @@ CHIPQueueOpenCL::launchImpl(chipstar::ExecItem *ExecItem) {
   logTrace("Launch LOCAL: {} {} {}", Local[0], Local[1], Local[2]);
   auto AllocationsToKeepAlive = annotateIndirectPointers(
       *OclContext, Kernel->getModule()->getInfo(), KernelHandle);
+
+  OclContext->unmapManagedForDevice(get()->get());
 
   auto [SyncQueuesEventHandles, EventLocks] =
       addDependenciesQueueSync(LaunchEvent);
@@ -1870,6 +2010,7 @@ CHIPQueueOpenCL::CHIPQueueOpenCL(chipstar::Device *ChipDevice, int Priority,
       QueueMode_ = Regular;
     }
     UsedInInterOp = true;
+    noteNativeHandleEscaped();
   } else {
     cl::Context &ClContext =
         *static_cast<CHIPContextOpenCL *>(ChipContext_)->get();
@@ -1899,27 +2040,111 @@ CHIPQueueOpenCL::CHIPQueueOpenCL(chipstar::Device *ChipDevice, int Priority,
 
 CHIPQueueOpenCL::~CHIPQueueOpenCL() {
   logTrace("~CHIPQueueOpenCL() {}", (void *)this);
+  dropQueryMarker();
+}
+
+void CHIPQueueOpenCL::noteWorkEnqueued() {
+  IsEmptyQueue_.store(false);
+  dropQueryMarker();
+}
+
+void CHIPQueueOpenCL::noteNativeHandleEscaped() {
+  if (NativeHandleEscaped_.exchange(true))
+    return;
+  logWarn("Stream {} native queue handle handed out: hipStreamQuery now polls "
+          "a marker enqueued in the same call, which an implementation that "
+          "submits lazily can report not ready indefinitely.",
+          (void *)this);
+}
+
+void CHIPQueueOpenCL::dropQueryMarker() {
+  std::lock_guard<std::mutex> Lock(QueryMarkerMtx_);
+  if (QueryMarker_) {
+    clReleaseEvent(QueryMarker_);
+    QueryMarker_ = nullptr;
+  }
 }
 
 bool CHIPQueueOpenCL::query() {
-  // If queue is empty (never had work submitted), return true immediately
-  // This matches the original LastEvent_ behavior and avoids pocl timing issues
-  if (IsEmptyQueue_.load()) {
+  // Neither the empty-queue shortcut nor a marker kept across calls can see a
+  // command the application enqueued on an escaped native queue handle.
+  const bool Escaped = NativeHandleEscaped_.load();
+
+  // A stream nothing has been submitted to, or one a previous poll or a
+  // finish() saw drained, is ready without asking the driver.
+  if (!Escaped && IsEmptyQueue_.load()) {
     return true;
   }
 
-  cl_event MarkerEvent;
-  clStatus =
-      clEnqueueMarkerWithWaitList(get()->get(), 0, nullptr, &MarkerEvent);
-  if (clStatus != CL_SUCCESS)
-    return false;
+  std::lock_guard<std::mutex> Lock(QueryMarkerMtx_);
+
+  if (Escaped && QueryMarker_) {
+    clReleaseEvent(QueryMarker_);
+    QueryMarker_ = nullptr;
+  }
+
+  // The marker is kept across calls: it completes once everything enqueued
+  // before it has, and every path that enqueues work behind it drops it, so
+  // its completion means the queue is drained. Reading a marker in the same
+  // call that enqueued it only works on implementations that complete an idle
+  // queue's marker at enqueue time (Intel, pocl); one that processes commands
+  // asynchronously (Mali) reports it CL_QUEUED and would do so on every poll.
+  //
+  // The paths that leave it alone are the ones whose command carries no work
+  // of its own, an ordering marker or a barrier that only waits on this
+  // queue, because such a command completes under the same condition the kept
+  // marker does. Neither does a blocking map, which has completed by the time
+  // the enqueueing call returns. A HIP marker or barrier is not one of these:
+  // it can wait on another queue, and it does drop the marker.
+  //
+  // false means only "not drained yet": a driver failure is raised instead,
+  // because hipStreamQuery turns false into hipErrorNotReady and a caller
+  // polling on that would never learn of the failure and never stop.
+  if (!QueryMarker_) {
+    cl_event MarkerEvent;
+    clStatus =
+        clEnqueueMarkerWithWaitList(get()->get(), 0, nullptr, &MarkerEvent);
+    CHIPERR_CHECK_LOG_AND_THROW_TABLE(clEnqueueMarkerWithWaitList);
+
+    // clGetEventInfo does not flush, so submit the marker and the work
+    // ahead of it. Both queues: after a mode switch the active queue holds
+    // a barrier that waits on a marker of the other queue.
+    for (cl::CommandQueue *Q : {&ClRegularQueue_, &ClProfilingQueue_}) {
+      if (!Q->get())
+        continue;
+      clStatus = clFlush(Q->get());
+      if (clStatus != CL_SUCCESS) {
+        clReleaseEvent(MarkerEvent);
+        CHIPERR_CHECK_LOG_AND_THROW_TABLE(clFlush);
+      }
+    }
+    QueryMarker_ = MarkerEvent;
+  }
 
   cl_int EventStatus;
-  clStatus = clGetEventInfo(MarkerEvent, CL_EVENT_COMMAND_EXECUTION_STATUS,
+  clStatus = clGetEventInfo(QueryMarker_, CL_EVENT_COMMAND_EXECUTION_STATUS,
                             sizeof(cl_int), &EventStatus, nullptr);
-  clReleaseEvent(MarkerEvent);
+  CHIPERR_CHECK_LOG_AND_THROW_TABLE(clGetEventInfo);
+  if (EventStatus > CL_COMPLETE)
+    return false; // Still queued, submitted or running.
 
-  return (clStatus == CL_SUCCESS && EventStatus == CL_COMPLETE);
+  // Complete, or terminated abnormally: either way this marker is spent.
+  clReleaseEvent(QueryMarker_);
+  QueryMarker_ = nullptr;
+  if (EventStatus != CL_COMPLETE)
+    CHIPERR_LOG_AND_THROW("A command of the queried stream terminated "
+                          "abnormally: " +
+                              std::string(resultToString(EventStatus)),
+                          hipErrorLaunchFailure);
+
+  // The marker completing is the same proof of an idle queue that finish()
+  // records, so record it: without this the next call finds no marker, asks
+  // a fresh one and reads it in the same call, which an implementation that
+  // submits lazily answers CL_QUEUED. hipStreamQuery would then alternate
+  // between reporting a drained stream ready and not ready.
+  if (!Escaped)
+    IsEmptyQueue_.store(true);
+  return true;
 }
 
 std::pair<std::vector<cl_event>, chipstar::LockGuardVector>
@@ -1940,6 +2165,11 @@ CHIPQueueOpenCL::addDependenciesQueueSync(
     clStatus = clEnqueueMarkerWithWaitList(OtherQueue->get()->get(), 0, nullptr,
                                            &MarkerEvent);
     CHIPERR_CHECK_LOG_AND_THROW_TABLE(clEnqueueMarkerWithWaitList);
+
+    // The marker carries no work of its own, so a marker query() is already
+    // polling on this queue still covers everything the queue holds and is
+    // left alone. Dropping it here would let a stream that keeps enqueueing
+    // starve a hipStreamQuery poll loop on every other stream.
 
     // Flush both queues: CHIPQueueOpenCL has ClRegularQueue_ and ClProfilingQueue_.
     // get() returns only the active one; Mali needs both flushed for cross-queue
@@ -1977,8 +2207,7 @@ CHIPQueueOpenCL::addDependenciesQueueSync(
 std::shared_ptr<chipstar::Event>
 CHIPQueueOpenCL::memCopyAsyncImpl(void *Dst, const void *Src, size_t Size,
                                   hipMemcpyKind Kind) {
-  // Mark queue as having work submitted
-  IsEmptyQueue_.store(false);
+  noteWorkEnqueued();
   
   std::shared_ptr<chipstar::Event> Event =
       static_cast<CHIPBackendOpenCL *>(Backend)->createEventShared(
@@ -2001,6 +2230,7 @@ CHIPQueueOpenCL::memCopyAsyncImpl(void *Dst, const void *Src, size_t Size,
   } else {
     auto [SyncQueuesEventHandles, EventLocks] = addDependenciesQueueSync(Event);
     auto *Ctx = getContext();
+    Ctx->unmapManagedForDevice(get()->get());
 
     switch (Ctx->getAllocStrategy()) {
     default:
@@ -2162,13 +2392,30 @@ void CHIPQueueOpenCL::finish() {
   
   // After finish() completes, queue is empty again
   IsEmptyQueue_.store(true);
+  dropQueryMarker();
+
+  // Control returns to the host, which may now dereference managed memory.
+  static_cast<CHIPContextOpenCL *>(ChipContext_)->mapManagedForHost();
+}
+
+void CHIPQueueOpenCL::enqueueIdleMarkers(std::vector<cl_event> &Markers) {
+  for (cl::CommandQueue *Q : {&ClRegularQueue_, &ClProfilingQueue_}) {
+    if (!Q->get())
+      continue;
+    cl_event Marker = nullptr;
+    clStatus = clEnqueueMarkerWithWaitList(Q->get(), 0, nullptr, &Marker);
+    CHIPERR_CHECK_LOG_AND_THROW_TABLE(clEnqueueMarkerWithWaitList);
+    Markers.push_back(Marker);
+    // Mali deadlocks when a wait targets an unflushed queue.
+    clStatus = clFlush(Q->get());
+    CHIPERR_CHECK_LOG_AND_THROW_TABLE(clFlush);
+  }
 }
 
 std::shared_ptr<chipstar::Event>
 CHIPQueueOpenCL::memFillAsyncImpl(void *Dst, size_t Size, const void *Pattern,
                                   size_t PatternSize) {
-  // Mark queue as having work submitted
-  IsEmptyQueue_.store(false);
+  noteWorkEnqueued();
   
   std::shared_ptr<chipstar::Event> Event =
       static_cast<CHIPBackendOpenCL *>(Backend)->createEventShared(
@@ -2200,6 +2447,7 @@ CHIPQueueOpenCL::memFillAsyncImpl(void *Dst, size_t Size, const void *Pattern,
     }
   } else {
     logTrace("clSVMmemfill {} / {} B\n", Dst, Size);
+    Ctx->unmapManagedForDevice(get()->get());
     int Retval = ::clEnqueueSVMMemFill(
         get()->get(), Dst, Pattern, PatternSize, Size,
         SyncQueuesEventHandles.size(), SyncQueuesEventHandles.data(),
@@ -2251,6 +2499,7 @@ hipError_t CHIPQueueOpenCL::getBackendHandles(uintptr_t *NativeInfo,
   switchModeTo(Profiling);
 
   // Get queue handler
+  noteNativeHandleEscaped();
   NativeInfo[4] = (uintptr_t)get()->get();
 
   // Get context handler
@@ -2276,7 +2525,11 @@ hipError_t CHIPQueueOpenCL::getBackendHandles(uintptr_t *NativeInfo,
 std::shared_ptr<chipstar::Event>
 CHIPQueueOpenCL::memPrefetchImpl(const void *Ptr, size_t Count, int DstDevId) {
   logTrace("CHIPQueueOpenCL::memPrefetchImpl");
-  
+
+  // The migrate paths below enqueue real commands that later default-stream
+  // launches must synchronize against, so isEmptyQueue() must see them.
+  noteWorkEnqueued();
+
   std::shared_ptr<chipstar::Event> PrefetchEvent =
       static_cast<CHIPBackendOpenCL *>(Backend)->createEventShared(
           ChipContext_, chipstar::EventFlags(), "memPrefetch");
@@ -2368,6 +2621,7 @@ CHIPQueueOpenCL::memPrefetchImpl(const void *Ptr, size_t Count, int DstDevId) {
   case AllocationStrategy::CoarseGrainSVM:
   case AllocationStrategy::FineGrainSVM: {
     logTrace("clEnqueueSVMMigrateMem {} / {} B, flags: {}\n", Ptr, Count, MigrationFlags);
+    Ctx->unmapManagedForDevice(get()->get());
     const void *SvmPtrs[] = {Ptr};
     const size_t Sizes[] = {Count};
     {
@@ -2388,8 +2642,7 @@ CHIPQueueOpenCL::memPrefetchImpl(const void *Ptr, size_t Count, int DstDevId) {
 
 std::shared_ptr<chipstar::Event> CHIPQueueOpenCL::enqueueBarrierImpl(
     const std::vector<std::shared_ptr<chipstar::Event>> &EventsToWaitFor) {
-  // Mark queue as having work submitted
-  IsEmptyQueue_.store(false);
+  noteWorkEnqueued();
   
   std::shared_ptr<chipstar::Event> Event =
       static_cast<CHIPBackendOpenCL *>(Backend)->createEventShared(
@@ -2470,14 +2723,23 @@ void CHIPQueueOpenCL::switchModeTo(QueueMode ToMode) {
   clStatus = clEnqueueBarrierWithWaitList(ToQ.get(), 1, &SwitchEv, &BarrierEv);
   CHIPERR_CHECK_LOG_AND_THROW_TABLE(clEnqueueBarrierWithWaitList);
 
-  // Use the barrier event from the TO queue, not the marker from FROM queue
-  auto *ChipEv = new CHIPEventOpenCL(
-      static_cast<CHIPContextOpenCL *>(ChipContext_), BarrierEv);
-  
-  // Release the marker event since we're tracking the barrier instead
+  // The barrier on ToQ waits on an event of FromQ. OpenCL requires the
+  // application to flush the queue owning an event before a command of
+  // another queue may wait on it. Without this an implementation that
+  // submits lazily (Mali) never issues the marker, and everything behind the
+  // barrier blocks forever, including a clWaitForEvents on an event of ToQ,
+  // which flushes only ToQ.
+  clStatus = clFlush(FromQ.get());
+  CHIPERR_CHECK_LOG_AND_THROW_TABLE(clFlush);
+
+  // Neither event is waited on later: the barrier keeps the switched-to
+  // queue ordered after the marker on its own, so both references go back
+  // to the runtime here.
+  clReleaseEvent(BarrierEv);
   clReleaseEvent(SwitchEv);
-  
- QueueMode_ = ToMode;
+
+  QueueMode_ = ToMode;
+  dropQueryMarker();
 }
 
 // CHIPExecItemOpenCL
@@ -2663,6 +2925,17 @@ void CHIPExecItemOpenCL::setupAllArgs() {
       auto *SpillSlot = ArgSpillBuffer_->allocate(Arg);
       assert(SpillSlot);
       Err = ::clSetKernelArgSVMPointer(KernelHandle, Arg.Index, SpillSlot);
+      CHIPERR_CHECK_LOG_AND_THROW_TABLE(clSetKernelArgSVMPointer);
+      break;
+    }
+    case SPVTypeKind::DeviceGlobal: {
+      // Implicit arg carrying the device address of a __device__/__constant__
+      // global (rusticl globals-as-kernel-args lowering). Bind it to the
+      // global's allocated storage.
+      void *DevPtr = chipstar::getDeviceGlobalArgAddr(Kernel, Arg);
+      logTrace("clSetKernelArgSVMPointer {} for device global '{}' -> {}",
+               Arg.Index, Arg.DevGlobalName, DevPtr);
+      Err = ::clSetKernelArgSVMPointer(KernelHandle, Arg.Index, DevPtr);
       CHIPERR_CHECK_LOG_AND_THROW_TABLE(clSetKernelArgSVMPointer);
       break;
     }

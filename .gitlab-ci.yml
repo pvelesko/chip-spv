@@ -1,4 +1,4 @@
-# this include allows us to reference defaults in anl/ci-resource/defaults
+# this include allows us to reference defaults in anl/ci-resource/defaults 
 
 include:
   - project: 'anl/ci-resources/defaults'
@@ -7,43 +7,57 @@ include:
       - '/runners.yml'
 
 workflow:
+    # The name is how the GitHub Action finds this PR's earlier pipelines to cancel.
+    # It must be set here: the trigger endpoint silently drops a "name" form field,
+    # and reading GITHUB_PR_NUMBER back needs a Maintainer token.
+    name: 'PR-$GITHUB_PR_NUMBER'
     rules:
       - if: $CI_PIPELINE_SOURCE == "trigger"   # triggered from GitHub via /run-aurora-ci
 
 variables:
   PROJ: "chipStar_test"
-  QUEUE: "debug"
-  TIME: "1:00:00"
+  QUEUE: "capacity"
+  TIME: "0:30:00"
   WRK_DIR: "/lus/flare/projects/${PROJ}/chipStar/pipeline_${CI_PIPELINE_ID}"
-  ANL_AURORA_SCHEDULER_PARAMETERS: "-q ${QUEUE} -l select=1,walltime=${TIME},filesystems=home -A ${PROJ}"
+  ANL_AURORA_SCHEDULER_PARAMETERS: "-q ${QUEUE} -l select=1,walltime=${TIME},filesystems=flare:home -A ${PROJ}"
   GENESIS_CI_PROJECT_DIR: "/home/bertoni/projects/p01.chipStar/GENESIS-Share-CI/"
+  CHIP_MODULE_CACHE_DIR: ""
+  BUILD_JOBS: "20"
+  # app driver
+  RUN_APPS: "${WRK_DIR}/chipStar/tests/apps/run_apps.sh
+             -w ${WRK_DIR} -M ${WRK_DIR}/modulefiles -m chipStar/llvm21 -j ${BUILD_JOBS}"
+  # same driver, llvm23 module, own work dir so the clones do not collide
+  RUN_APPS_LLVM23: "${WRK_DIR}/chipStar/tests/apps/run_apps.sh
+                    -w ${WRK_DIR}/apps_llvm23 -M ${WRK_DIR}/modulefiles -m chipStar/llvm23 -j ${BUILD_JOBS}"
 
 stages:
     - .pre
-    - build_chipstar
-    - builds_chipstar_install_script_llvm19
-    - runs_tests_chipstar_install_script_llvm19
-    - builds_chipstar_install_script_llvm22
-    - runs_tests_chipstar_install_script_llvm22
-    - builds_chipstar_aurora_script_llvm19
-    - runs_chipstar_aurora_script_llvm19
-    - builds_chipstar_aurora_script_llvm22
-    - runs_chipstar_aurora_script_llvm22
-    - builds_hoMusic
-    - runs_hoMusic
-    - performance_hoMusic
-    - builds_zeroRK
-    - runs_zeroRK
-    - perforamce_zeroRK
+    - build
+    - test
+    - app_build
+    - app_run
+    - app_report
+    - report
     - cleanup
+
+default:
+  after_script:
+    # One file per job
+    - if test "${CI_JOB_STATUS}" = success; then
+        rm -f ${WRK_DIR}/failed_${CI_JOB_NAME};
+      else
+        mkdir -p ${WRK_DIR};
+        echo "${CI_JOB_NAME}$(cat ${WRK_DIR}/reason_${CI_JOB_NAME} 2>/dev/null)" > ${WRK_DIR}/failed_${CI_JOB_NAME};
+      fi
 
 setup:
   stage: .pre
   extends: .aurora-shell-runner
-  resource_group: aurora_pipeline  
   script:
-    # Remove pipeline directories older than 7 days
-    - find /lus/flare/projects/${PROJ}/chipStar -maxdepth 1 -name "pipeline_*" -mtime +7 -exec rm -rf {} \;
+    # Remove pipeline directories older than 7 days. -prune keeps find out of the trees
+    # it is deleting, and the || true absorbs a directory another pipeline's cleanup
+    # removes between the listing and the visit.
+    - find /lus/flare/projects/${PROJ}/chipStar -maxdepth 1 -name "pipeline_*" -mtime +7 -prune -exec rm -rf {} + || true
     - mkdir -p ${WRK_DIR}
     - cd ${WRK_DIR}
       # setup chipStar
@@ -57,276 +71,326 @@ setup:
          git checkout ${GITHUB_SHA}
       fi
     - git submodule update --init --recursive
+    - git fetch origin main
+    - git checkout origin/main -- tests/apps/run_apps.sh install_chipstar.py scripts/check.py
     - module list
 
-# testing with hand script
-aurora_build_test:
-  stage: build_chipstar
-  resource_group: aurora_pipeline  
-  extends: .aurora-shell-runner
-  script:
-    - hostname
-    - echo "Running on $(hostname) with setuid shell runner"
-    - cd ${WRK_DIR}/chipStar
-    # first test with already installed clang. will update to patch and build
-    - module use /soft/modulefiles
-    - module load cmake chipStar/.llvm19/20251107-19/release
-    - rm -rf build
-    - mkdir build
-    - cd build
-    - cmake -DCMAKE_BUILD_TYPE=Release -DCHIP_BUILD_SAMPLES=ON -DCMAKE_INSTALL_PREFIX=${WRK_DIR}/install_aurora ..
-    - gitcommit=$(git rev-parse HEAD)
-    - make -j48
-    - make install
-    - cd ..
-    - rm -rf build
-
-# testing with install script
-chipStar_script_install:
-  stage: builds_chipstar_install_script_llvm19
-  resource_group: aurora_pipeline  
-  extends: .aurora-shell-runner
-  script:
-    - hostname
-    - echo "Running on $(hostname) with setuid shell runner"
-    - cp -r ${WRK_DIR}/chipStar ${WRK_DIR}/chipStar_llvm19
-    - cd ${WRK_DIR}/chipStar_llvm19
-    - module use /soft/modulefiles
-    - module load cmake chipStar/.llvm19/20251107-19/release
-    - ./install_chipstar.py --all --install-dir ${WRK_DIR}/install/ --staging-dir $PWD/stage
-  allow_failure: true
-  
-chipStar_script_test:
-  stage: runs_tests_chipstar_install_script_llvm19
-  resource_group: aurora_pipeline  
-  extends: .aurora-batch-runner
-  script:
-    - cd ${WRK_DIR}/chipStar_llvm19/build
-    - module use /soft/modulefiles
-    - module load cmake chipStar/.llvm19/20251107-19/release
-    - rm -rf $HOME/.cache/chipStar
-    - CHIP_BE=level0 make build_tests -j
-    - CHIP_MODULE_CACHE_DIR="" ZE_AFFINITY_MASK=0.0 ../scripts/check.py ./ dgpu level0 --timeout 60 --num-tries=1 --num-threads=1
-  allow_failure: true
+#
+# Toolchain builds
+#
 
 chipStar_script_install_llvm22:
-  stage: builds_chipstar_install_script_llvm22
-  resource_group: aurora_pipeline  
+  stage: build
   extends: .aurora-shell-runner
+  # wave 1
   script:
     - hostname
     - echo "Running on $(hostname) with setuid shell runner"
     - cp -r ${WRK_DIR}/chipStar  ${WRK_DIR}/chipStar_llvm22
     - cd ${WRK_DIR}/chipStar_llvm22
     - module use /soft/modulefiles
-    - module load cmake chipStar/.llvm22/20260311-22/release
-    - ./install_chipstar.py --all --install-dir ${WRK_DIR}/install/ --staging-dir $PWD/stage
-  allow_failure: true
+    - module load cmake chipStar/.llvm22/20260926-22-next-eval/release
+    - sed -i '/name="chipstar",/a\        cmake_flags=["-DCHIP_LZ_API_QUERY_QUEUE_EMPTY=ON"],' ./install_chipstar.py
+    - ./install_chipstar.py --all --jobs ${BUILD_JOBS} --install-dir ${WRK_DIR}/install/ --staging-dir $PWD/stage
 
-chipStar_script_test_llvm22:
-  stage: runs_tests_chipstar_install_script_llvm22
-  resource_group: aurora_pipeline  
-  extends: .aurora-batch-runner
-  script:
-    - cd ${WRK_DIR}/chipStar_llvm22/build
-    - module use /soft/modulefiles
-    - module load cmake chipStar/.llvm22/20260311-22/release
-    - rm -rf $HOME/.cache/chipStar
-    - CHIP_BE=level0 make build_tests -j
-    - CHIP_MODULE_CACHE_DIR="" ZE_AFFINITY_MASK=0.0 ../scripts/check.py ./ dgpu level0 --timeout 60 --num-tries=1 --num-threads=1
-  allow_failure: true
-
-# testing with install script
+# testing with install script.
 chipStar_aurora_script_test:
-  stage: builds_chipstar_aurora_script_llvm19
-  resource_group: aurora_pipeline  
+  stage: build
   extends: .aurora-shell-runner
+  # wave 1
+  variables:
+    MAKEFLAGS: "-j${BUILD_JOBS}"
   script:
     - hostname
     - echo "Running on $(hostname) with setuid shell runner"
-    - mkdir ${WRK_DIR}/script_llvm19
-    - cp -r ${WRK_DIR}/chipStar ${WRK_DIR}/script_llvm19
-    - NO_FRESH_CHIPSTAR_PULL=true temp=${WRK_DIR}/script_llvm19 MODULE_INSTALL_DIR=${WRK_DIR}/modulefiles CHIPSTAR_INSTALL_DIR=${WRK_DIR}/latest_llvm19/ /lus/flare/projects/Aurora_deployment/bertoni/projects/p02.chipStar/chip-star-patch.sh release chipStar/.llvm19/20251107-19/release
+    - mkdir ${WRK_DIR}/script_llvm21
+    - cp -r ${WRK_DIR}/chipStar ${WRK_DIR}/script_llvm21
+    - NO_FRESH_CHIPSTAR_PULL=true temp=${WRK_DIR}/script_llvm21 MODULE_INSTALL_DIR=${WRK_DIR}/modulefiles CHIPSTAR_INSTALL_DIR=${WRK_DIR}/latest_llvm21/ /lus/flare/projects/Aurora_deployment/bertoni/projects/p02.chipStar/chip-star-patch.sh release chipStar/.llvm21/20260905-21-next-eval/release
     - cd ${WRK_DIR}/modulefiles/chipStar
-    - echo 'module_version("llvm19", "default")' > .modulerc.lua
-  allow_failure: true
-  
-chipStar_aurora_script_test_run:
-  stage: runs_chipstar_aurora_script_llvm19
-  resource_group: aurora_pipeline  
-  extends: .aurora-batch-runner
-  script:
-    - hostname
-    - echo "Running on $(hostname) with setuid shell runner"
-    - cd ${WRK_DIR}/script_llvm19/chipStar/build
-    - rm -rf $HOME/.cache/chipStar
-    - CHIP_BE=level0 make build_tests -j
-    - module load cmake
-    - CHIP_MODULE_CACHE_DIR="" ZE_AFFINITY_MASK=0.0 ../scripts/check.py ./ dgpu level0 --timeout 60 --num-tries=1 --num-threads=1
-  allow_failure: true
+    - echo 'module_version("llvm21", "default")' > .modulerc.lua
 
 chipStar_aurora_script_test_llvm22:
-  stage: builds_chipstar_aurora_script_llvm22
-  resource_group: aurora_pipeline  
+  stage: build
   extends: .aurora-shell-runner
+  # wave 2
+  needs: [chipStar_aurora_script_test, chipStar_script_install_llvm22]
+  variables:
+    MAKEFLAGS: "-j${BUILD_JOBS}"
   script:
     - hostname
     - echo "Running on $(hostname) with setuid shell runner"
     - mkdir ${WRK_DIR}/script_llvm_22
     - cp -r ${WRK_DIR}/chipStar ${WRK_DIR}/script_llvm_22
     - NO_FRESH_CHIPSTAR_PULL=true llvm_version=22 temp=${WRK_DIR}/script_llvm_22/ MODULE_INSTALL_DIR=${WRK_DIR}/modulefiles CHIPSTAR_INSTALL_DIR=${WRK_DIR}/latest_llvm22/ LLVM_INSTALL_DIR=${WRK_DIR}/llvm22 /lus/flare/projects/Aurora_deployment/bertoni/projects/p02.chipStar/chip-star-patch.sh release
-  allow_failure: true
-  
-chipStar_aurora_script_test_llvm22_run:
-  stage: runs_chipstar_aurora_script_llvm22
-  resource_group: aurora_pipeline  
+
+chipStar_aurora_script_test_llvm23:
+  stage: build
+  extends: .aurora-shell-runner
+  # wave 2
+  needs: [chipStar_aurora_script_test, chipStar_script_install_llvm22]
+  variables:
+    MAKEFLAGS: "-j${BUILD_JOBS}"
+  script:
+    - hostname
+    - echo "Running on $(hostname) with setuid shell runner"
+    - mkdir ${WRK_DIR}/script_llvm_23
+    - cp -r ${WRK_DIR}/chipStar ${WRK_DIR}/script_llvm_23
+    - NO_FRESH_CHIPSTAR_PULL=true llvm_version=23 temp=${WRK_DIR}/script_llvm_23/ MODULE_INSTALL_DIR=${WRK_DIR}/modulefiles CHIPSTAR_INSTALL_DIR=${WRK_DIR}/latest_llvm23/ LLVM_INSTALL_DIR=${WRK_DIR}/llvm23 /lus/flare/projects/Aurora_deployment/bertoni/projects/p02.chipStar/chip-star-patch.sh release
+
+#
+# Unit tests
+#
+
+chipStar_script_test_llvm22:
+  stage: test
+  resource_group: aurora_slot_1
   extends: .aurora-batch-runner
+  needs: [chipStar_script_install_llvm22]
+  script:
+    - cd ${WRK_DIR}/chipStar_llvm22/build
+    - module use /soft/modulefiles
+    - module load cmake chipStar/.llvm22/20260311-22/release
+    - CHIP_BE=level0 make build_tests -j
+    - ZE_AFFINITY_MASK=0.0 ../scripts/check.py ./ dgpu level0 --timeout 60 --num-tries=1 --num-threads=1
+
+chipStar_aurora_script_test_run:
+  stage: test
+  resource_group: aurora_slot_2
+  extends: .aurora-batch-runner
+  needs: [chipStar_aurora_script_test]
+  script:
+    - hostname
+    - echo "Running on $(hostname) with setuid shell runner"
+    - cd ${WRK_DIR}/script_llvm21/chipStar/build
+    - module load cmake
+    - CHIP_BE=level0 make build_tests -j
+    - ZE_AFFINITY_MASK=0.0 ../scripts/check.py ./ dgpu level0 --timeout 60 --num-tries=1 --num-threads=1
+
+chipStar_aurora_script_test_llvm22_run:
+  stage: test
+  resource_group: aurora_slot_3
+  extends: .aurora-batch-runner
+  needs: [chipStar_aurora_script_test_llvm22]
   script:
     - hostname
     - echo "Running on $(hostname) with setuid shell runner"
     - cd ${WRK_DIR}/script_llvm_22/chipStar/build
     - module load cmake
-    - rm -rf $HOME/.cache/chipStar
     - CHIP_BE=level0 make build_tests -j
-    - CHIP_MODULE_CACHE_DIR="" ZE_AFFINITY_MASK=0.0 ../scripts/check.py ./ dgpu level0 --timeout 60 --num-tries=1 --num-threads=1
-  allow_failure: true
+    - ZE_AFFINITY_MASK=0.0 ../scripts/check.py ./ dgpu level0 --timeout 60 --num-tries=1 --num-threads=1
 
-# hoMusic application build and run
-hoMusic_build:
-  stage: builds_hoMusic
-  resource_group: aurora_pipeline  
-  extends: .aurora-shell-runner
-  script:
-    - ${GENESIS_CI_PROJECT_DIR}/hoMusic_ci.sh build chipStar/llvm19
-  allow_failure: true
-  
-hoMusic_run:
-  stage: runs_hoMusic
-  resource_group: aurora_pipeline  
+chipStar_aurora_script_test_llvm23_run:
+  stage: test
+  resource_group: aurora_slot_1
   extends: .aurora-batch-runner
+  needs: [chipStar_aurora_script_test_llvm23]
   script:
-    - rm -f ${GENESIS_CI_PROJECT_DIR}/output
-    - ${GENESIS_CI_PROJECT_DIR}/hoMusic_ci.sh run chipStar/llvm19 |& tee -a ${GENESIS_CI_PROJECT_DIR}/output
-  allow_failure: true
+    - hostname
+    - echo "Running on $(hostname) with setuid shell runner"
+    - cd ${WRK_DIR}/script_llvm_23/chipStar/build
+    - module load cmake
+    - CHIP_BE=level0 make build_tests -j
+    - ZE_AFFINITY_MASK=0.0 ../scripts/check.py ./ dgpu level0 --timeout 60 --num-tries=1 --num-threads=1
 
-performance_hoMusic:
-  stage: performance_hoMusic
-  extends: .aurora-shell-runner
-  script:
-    - cd ${GENESIS_CI_PROJECT_DIR}
-    - |
-      TIME_STR=$(grep "real" output | awk '{print $2}')
-      echo "Extracted time: $TIME_STR"
+#
+# Application builds
+#
 
-      # Convert to total seconds using awk (handles 1m50.315s -> 110.315)
-      ACTUAL_TIME=$(echo $TIME_STR | awk -F'[ms]' '{print ($1 * 60) + $2}')
-      
-      # Define baseline (1m50.315s = 110.315s) and 6% threshold
-      BASELINE=110.315
-      THRESHOLD=$(echo "$BASELINE * 0.06" | bc -l)
-      LOWER_BOUND=$(echo "$BASELINE - $THRESHOLD" | bc -l)
-      UPPER_BOUND=$(echo "$BASELINE + $THRESHOLD" | bc -l)
-
-      echo "Actual: $ACTUAL_TIME s | Target: $BASELINE s (+/- $THRESHOLD s)"
-
-      # Compare using bc (returns 1 for true, 0 for false)
-      IS_WITHIN_LIMITS=$(echo "$ACTUAL_TIME >= $LOWER_BOUND && $ACTUAL_TIME <= $UPPER_BOUND" | bc -l)
-
-      if [ "$IS_WITHIN_LIMITS" -eq 1 ]; then
-        echo "Performance check passed: $ACTUAL_TIME is within 5% of $BASELINE"
-        exit 0
-      else
-        echo "Performance check failed: $ACTUAL_TIME is outside the range [$LOWER_BOUND, $UPPER_BOUND]"
-        exit 1
-      fi
-  allow_failure: true
-  
-# ZeroRK application build and run
 zeroRK_build:
-  stage: builds_zeroRK
-  resource_group: aurora_pipeline  
+  stage: app_build
   extends: .aurora-shell-runner
+  # wave 2
+  needs: [chipStar_aurora_script_test, chipStar_script_install_llvm22]
+  variables:
+    MAKEFLAGS: "-j${BUILD_JOBS}"
   script:
-   - cd ${WRK_DIR}
-   - git clone git@github.com:CHIP-SPV/zero-rk.git -b hip-chipStar
-   - cd zero-rk
-   - module use /soft/modulefiles
-   - module use ${WRK_DIR}/modulefiles
-   - module load chipStar/llvm19 cmake
-   - mkdir -p build_aurora
-   - cd build_aurora
-   - sh ../scripts/build_aurora.sh  --no-module-loads
-  allow_failure: true
-  
-zeroRK_run:
-  stage: runs_zeroRK
-  resource_group: aurora_pipeline  
+   - ${RUN_APPS} --phases build zerork
+
+opensn_build:
+  stage: app_build
+  extends: .aurora-shell-runner
+  # wave 2
+  needs: [chipStar_aurora_script_test, chipStar_script_install_llvm22]
+  script:
+   - ${RUN_APPS} --phases build opensn
+
+zeroRK_build_llvm23:
+  stage: app_build
+  extends: .aurora-shell-runner
+  needs: [chipStar_aurora_script_test_llvm23]
+  variables:
+    MAKEFLAGS: "-j${BUILD_JOBS}"
+  script:
+   - ${RUN_APPS_LLVM23} --phases build zerork
+
+opensn_build_llvm23:
+  stage: app_build
+  extends: .aurora-shell-runner
+  needs: [chipStar_aurora_script_test_llvm23]
+  script:
+   - ${RUN_APPS_LLVM23} --phases build opensn
+
+#
+# Application runs
+#
+
+hoMusic:
+  stage: app_run
+  resource_group: aurora_slot_1
   extends: .aurora-batch-runner
+  needs: [chipStar_aurora_script_test, chipStar_aurora_script_test_run]
+  variables:
+    MAKEFLAGS: "-j${BUILD_JOBS}"
   script:
-  - cd ${WRK_DIR}/zero-rk
-  - cd running_test_aurora
-  - mkdir -p logs
-  - chmod a+x ./submit_job.sh
-  - module use /soft/modulefiles
-  - module use ${WRK_DIR}/modulefiles
-  - module load chipStar/llvm19
-  - rm -f output
-  - ./submit_job.sh |& tee -a output
-  allow_failure: true
+    - ${RUN_APPS} --phases build,run homusic
+
+zeroRK_run:
+  stage: app_run
+  resource_group: aurora_slot_2
+  extends: .aurora-batch-runner
+  needs: [zeroRK_build, chipStar_aurora_script_test_run]
+  script:
+  - ${RUN_APPS} --phases run zerork
+
+opensn_run:
+  stage: app_run
+  resource_group: aurora_slot_3
+  extends: .aurora-batch-runner
+  needs: [opensn_build, chipStar_aurora_script_test_run]
+  variables:
+    CHIP_MODULE_CACHE_DIR: "${WRK_DIR}/module_cache"
+  script:
+   - ${RUN_APPS} --phases run opensn
+
+hoMusic_llvm23:
+  stage: app_run
+  resource_group: aurora_slot_1
+  extends: .aurora-batch-runner
+  needs: [chipStar_aurora_script_test_llvm23, chipStar_aurora_script_test_llvm23_run]
+  variables:
+    MAKEFLAGS: "-j${BUILD_JOBS}"
+    # its own build dir, env file and run dirs; the llvm21 job uses the bare id
+    HOMUSIC_RUN_ID: "${CI_PIPELINE_ID}-llvm23"
+  script:
+    - ${RUN_APPS_LLVM23} --phases build,run homusic
+
+zeroRK_run_llvm23:
+  stage: app_run
+  resource_group: aurora_slot_2
+  extends: .aurora-batch-runner
+  needs: [zeroRK_build_llvm23, chipStar_aurora_script_test_llvm23_run]
+  script:
+  - ${RUN_APPS_LLVM23} --phases run zerork
+
+opensn_run_llvm23:
+  stage: app_run
+  resource_group: aurora_slot_3
+  extends: .aurora-batch-runner
+  needs: [opensn_build_llvm23, chipStar_aurora_script_test_llvm23_run]
+  variables:
+    CHIP_MODULE_CACHE_DIR: "${WRK_DIR}/module_cache_llvm23"
+  script:
+   - ${RUN_APPS_LLVM23} --phases run opensn
+
+#
+# Performance analysis
+#
+
+.app_report:
+  stage: app_report
+  extends: .aurora-shell-runner
+  variables:
+    APP_DRIVER: "${RUN_APPS}"
+  script:
+    - set -o pipefail
+    - |
+      # report_github_status reads reason_* for the one-line PR description
+      LOG=${WRK_DIR}/report_${CI_JOB_NAME}.log
+      rc=0
+      ${APP_DRIVER} --phases report ${APP} |& tee ${LOG} || rc=1
+      if [ $rc -ne 0 ]; then
+        sed -n 's/^performance check failed//p' ${LOG} | head -1 > ${WRK_DIR}/reason_${CI_JOB_NAME}
+      fi
+      exit $rc
+
+hoMusic_performance:
+  extends: .app_report
+  needs: [hoMusic]
+  variables:
+    APP: homusic
 
 zeroRK_performance:
-  stage: perforamce_zeroRK
-  resource_group: aurora_pipeline  
-  extends: .aurora-shell-runner
-  script:
-  - cd ${WRK_DIR}/zero-rk/running_test_aurora
-  - |
-    ACTUAL_TIME=$(grep "Job time in seconds" output | awk '{print $5}')
-    echo "Extracted time: $ACTUAL_TIME"
-    
-    # Define baseline and 6% threshold
-    BASELINE=85
-    THRESHOLD=$(echo "$BASELINE * 0.06" | bc -l)
-    LOWER_BOUND=$(echo "$BASELINE - $THRESHOLD" | bc -l)
-    UPPER_BOUND=$(echo "$BASELINE + $THRESHOLD" | bc -l)
+  extends: .app_report
+  needs: [zeroRK_run]
+  variables:
+    APP: zerork
 
-    echo "Actual: $ACTUAL_TIME s | Target: $BASELINE s (+/- $THRESHOLD s)"
+opensn_performance:
+  extends: .app_report
+  needs: [opensn_run]
+  variables:
+    APP: opensn
 
-    # Compare using bc (returns 1 for true, 0 for false)
-    IS_WITHIN_LIMITS=$(echo "$ACTUAL_TIME >= $LOWER_BOUND && $ACTUAL_TIME <= $UPPER_BOUND" | bc -l)
+hoMusic_performance_llvm23:
+  extends: .app_report
+  needs: [hoMusic_llvm23]
+  variables:
+    APP: homusic
+    APP_DRIVER: "${RUN_APPS_LLVM23}"
 
-    if [ "$IS_WITHIN_LIMITS" -eq 1 ]; then
-      echo "Performance check passed: $ACTUAL_TIME is within 5% of $BASELINE"
-      exit 0
-    else
-      echo "Performance check failed: $ACTUAL_TIME is outside the range [$LOWER_BOUND, $UPPER_BOUND]"
-      exit 1
-    fi
-  allow_failure: true  
+zeroRK_performance_llvm23:
+  extends: .app_report
+  needs: [zeroRK_run_llvm23]
+  variables:
+    APP: zerork
+    APP_DRIVER: "${RUN_APPS_LLVM23}"
+
+opensn_performance_llvm23:
+  extends: .app_report
+  needs: [opensn_run_llvm23]
+  variables:
+    APP: opensn
+    APP_DRIVER: "${RUN_APPS_LLVM23}"
 
 cleanup:
   stage: cleanup
   extends: .aurora-shell-runner
-  resource_group: aurora_pipeline
   when: on_success
   script:
     - rm -rf ${WRK_DIR}
 
 .report_github_status:
-  stage: cleanup
+  stage: report
   extends: .aurora-shell-runner
   script:
     - |
+      # No failed_* files on a red pipeline is possible: a cancelled or killed job
+      # never runs after_script. Deriving the text from GITHUB_STATUS keeps the two
+      # agreeing.
+      # || true: with no failed_* files the glob stays literal and cat exits 1,
+      # which under set -e would kill this job on a fully green pipeline.
+      FAILED=$(cat ${WRK_DIR}/failed_* 2>/dev/null | sort -u | sed ':a;N;$!ba;s/\n/; /g' || true)
+      if [ -n "${FAILED}" ]; then
+        DESC="failed: ${FAILED}"
+      elif [ "${GITHUB_STATUS}" = success ]; then
+        DESC="all jobs passed"
+      else
+        DESC="pipeline failed; no job recorded a reason"
+      fi
+      DESC=$(echo "${DESC}" | cut -c1-140)
+      echo "status=${GITHUB_STATUS} description=${DESC}"
+
       if [ -z "${GITHUB_SHA}" ]; then
         echo "No GITHUB_SHA set, skipping GitHub status report"
         exit 0
       fi
+
       curl -X POST \
         --fail \
         -H "Authorization: token ${GITHUB_TOKEN}" \
         -H "Accept: application/vnd.github.v3+json" \
         https://api.github.com/repos/CHIP-SPV/chipStar/statuses/${GITHUB_SHA} \
-        -d "{\"state\":\"${GITHUB_STATUS}\",\"context\":\"aurora-ci\",\"target_url\":\"${CI_PIPELINE_URL}\"}"
+        -d "{\"state\":\"${GITHUB_STATUS}\",\"context\":\"aurora-ci\",\"description\":\"${DESC}\",\"target_url\":\"${CI_PIPELINE_URL}\"}"
 
 report_success:
   extends: .report_github_status

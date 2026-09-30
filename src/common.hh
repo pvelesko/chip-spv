@@ -106,8 +106,9 @@ bool analyzeSPIRV(uint32_t *Stream, size_t NumWords, SPVModuleInfo &ModuleInfo);
 // Processing done after analysis.
 bool postprocessSPIRV(std::vector<uint32_t> &Binary);
 
-/// A prefix given to lowered global scope device variables.
-constexpr char ChipVarPrefix[] = "__chip_var_";
+/// A prefix given to lowered global scope device variables. No shadow kernel
+/// name may start with it.
+constexpr char ChipVarPrefix[] = "__chip_var_addr_";
 /// A prefix used for a shadow kernel used for querying device
 /// variable properties.
 constexpr char ChipVarInfoPrefix[] = "__chip_var_info_";
@@ -117,11 +118,23 @@ constexpr char ChipVarBindPrefix[] = "__chip_var_bind_";
 /// A prefix used for a shadow kernel used for initializing device
 /// variables.
 constexpr char ChipVarInitPrefix[] = "__chip_var_init_";
+/// The name of a single combined shadow kernel that initializes ALL
+/// host-accessible program-scope variables in one launch. Emitted (in the
+/// program-scope-globals lowering) instead of per-variable init kernels to
+/// avoid O(N) single-work-item kernel launches. See issue #582.
+constexpr char ChipVarInitAllName[] = "__chip_var_init_all";
 /// A structure to where properties of a device variable are written.
 /// CHIPVarInfo[0]: Size in bytes.
 /// CHIPVarInfo[1]: Requested alignment.
-/// CHIPVarInfo[2]: Non-zero if variable has initializer. Otherwise zero.
+/// CHIPVarInfo[2]: Zero if variable has no initializer. Otherwise
+/// ChipVarInitGridStride if its init kernel runs on any 1-D launch geometry,
+/// ChipVarInitHostFill if the runtime zeroes it instead of the init kernel, or
+/// another non-zero value if it must run on a single work item.
 using CHIPVarInfo = int64_t[3];
+constexpr int64_t ChipVarInitGridStride = 2;
+constexpr int64_t ChipVarInitHostFill = 3;
+/// Zero initializers at least this large are filled by the runtime.
+constexpr uint64_t ChipVarFillThreshold = 64 * 1024 * 1024;
 
 /// The name of the shadow kernel responsible for resetting host-inaccessible
 /// global device variables (e.g. static local variables in device code).
@@ -134,9 +147,24 @@ constexpr char ChipNonSymbolResetKernelName[] = "__chip_reset_non_symbols";
 /// variables is '<ChipSpilledArgsVarPrefix><kernel-name>'
 constexpr char ChipSpilledArgsVarPrefix[] = "__chip_spilled_args_";
 
+/// The prefix for global-scope annotation variables recording which device
+/// globals feed a kernel's implicit trailing DeviceGlobal arguments
+/// (globals-as-kernel-args lowering, used when program-scope globals are
+/// disabled). The variable '<ChipGVarArgPrefix><kernel-name>' holds the
+/// NUL-separated original global names in trailing-argument order. See
+/// HipGlobalVariables.cpp for details.
+constexpr char ChipGVarArgPrefix[] = "__chip_gvararg_";
+
 /// The name of a global variable which indicates, when non-zero, if
 /// the abort() function was called by a kernel.
 constexpr char ChipDeviceAbortFlagName[] = "__chipspv_abort_called";
+
+/// The name of a global variable which holds the message of a failed
+/// device-side assertion (__chipspv_abort_msg in include/hip/spirv_hip.hh),
+/// and the byte offset of its NUL-terminated text: the bytes before the text
+/// hold the claim word with which the device picks a single writer.
+constexpr char ChipDeviceAbortMsgName[] = "__chipspv_abort_msg";
+constexpr size_t ChipDeviceAbortMsgTextOffset = sizeof(int);
 
 /// The name of a global variable which is the device heap.
 constexpr char ChipDeviceHeapName[] = "__chipspv_device_heap";

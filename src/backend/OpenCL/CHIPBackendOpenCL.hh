@@ -55,6 +55,8 @@
 #pragma GCC diagnostic pop
 
 #include <atomic>
+#include <mutex>
+#include <unordered_map>
 #include "../../CHIPBackend.hh"
 #include "exceptions.hh"
 #include "spirv.hh"
@@ -251,8 +253,30 @@ class CHIPContextOpenCL : public chipstar::Context {
 private:
   cl::Platform Platform_;
   cl::Context ClContext;
+  cl::Device ClDevice_;
   mutable clSetKernelArgDevicePointerEXT_fn clSetKernelArgDevicePointerEXT_ =
       nullptr;
+
+  /// Coarse grained SVM only: HIP lets the host dereference hipMallocManaged
+  /// memory whenever the device is idle, but the OpenCL spec only defines host
+  /// access to a coarse grained SVM buffer between clEnqueueSVMMap and
+  /// clEnqueueSVMUnmap. The runtime therefore keeps every managed allocation
+  /// mapped for the host while no work is in flight: unmapped on the queue
+  /// before a device side command, mapped again (blocking) when a stream, the
+  /// device or an event synchronises with the host.
+  struct ManagedMapEntry {
+    size_t Size;
+    bool Mapped;
+  };
+  /// Managed allocations by base pointer and their current map state.
+  /// Guarded by ManagedMapMtx_.
+  std::unordered_map<void *, ManagedMapEntry> ManagedMaps_;
+  std::mutex ManagedMapMtx_;
+  /// In-order queue that carries the host side map commands so that a new
+  /// allocation or a synchronising stream never waits behind unrelated work
+  /// on a user stream. Created on first use, guarded by ManagedMapMtx_.
+  cl::CommandQueue ManagedMapQueue_;
+  cl::CommandQueue &getManagedMapQueue();
 
 public:
   MemoryManager MemManager_;
@@ -270,6 +294,9 @@ public:
       size_t Size, size_t Alignment, hipMemoryType MemType,
       chipstar::HostAllocFlags Flags = chipstar::HostAllocFlags()) override;
 
+  void importHostMemory(void *HostPtr, size_t SizeBytes) override { return; }
+  void releaseHostMemory(void *HostPtr) override { return; }
+  
   bool isAllocatedPtrMappedToVM(void *Ptr) override { return false; } // TODO
   virtual void freeImpl(void *Ptr) override;
   cl::Context *get();
@@ -309,6 +336,23 @@ public:
   }
 
   const cl::Platform &getPlatform() const { return Platform_; }
+
+  /// True when managed allocations need explicit SVM map/unmap for host
+  /// access (AllocationStrategy::CoarseGrainSVM).
+  bool keepsManagedMapped() const noexcept {
+    return getAllocStrategy() == AllocationStrategy::CoarseGrainSVM;
+  }
+  /// Record a new managed allocation and map it for the host so the
+  /// application can initialise it right after hipMallocManaged.
+  void trackManagedAllocation(void *Ptr, size_t Size);
+  /// Unmap (if mapped) and forget a managed allocation before it is freed.
+  void untrackManagedAllocation(void *Ptr);
+  /// Enqueue an unmap on Queue for every managed allocation that is mapped;
+  /// call before any command on Queue that may touch managed memory.
+  void unmapManagedForDevice(cl_command_queue Queue);
+  /// Map every unmapped managed allocation for the host (blocking), after
+  /// waiting for the work in flight on all of the device's queues.
+  void mapManagedForHost();
 };
 
 class CHIPDeviceOpenCL : public chipstar::Device {
@@ -415,6 +459,42 @@ class CHIPQueueOpenCL : public chipstar::Queue {
   /// False when any work is enqueued
   std::atomic<bool> IsEmptyQueue_{true};
 
+  /// Marker query() polls until it completes. Kept across calls because an
+  /// implementation that processes commands asynchronously (Mali) never
+  /// reports a marker complete in the call that enqueued it. Null when no
+  /// poll is in flight; dropped by every path that enqueues work behind it.
+  /// The paths that do not are the ones whose command carries no work of its
+  /// own: the ordering markers of addDependenciesQueueSync and
+  /// enqueueIdleMarkers, the cleanup marker of enqueueDeleteHostArray, and
+  /// MemMap's blocking map, which has completed when it returns. A HIP marker
+  /// or barrier is not among them: enqueueMarkerImpl and enqueueBarrierImpl
+  /// carry cross queue wait lists and do drop it. switchModeTo drops it too,
+  /// not because it adds work but because the marker sits on the command
+  /// queue it is switching away from.
+  cl_event QueryMarker_ = nullptr;
+  std::mutex QueryMarkerMtx_;
+
+  /// Set once the stream's cl_command_queue has been handed to the
+  /// application by getBackendHandles(). Commands the application enqueues on
+  /// it never reach noteWorkEnqueued(), so a marker held across calls could
+  /// report the queue drained with one of them still pending. query() answers
+  /// such a stream from a marker enqueued in the same call instead, which can
+  /// under report completion on an implementation that submits lazily, the
+  /// answer every stream got before the marker was kept, but never over
+  /// reports it.
+  std::atomic<bool> NativeHandleEscaped_{false};
+
+  /// Record that the application has been given, or has supplied, this
+  /// stream's cl_command_queue.
+  void noteNativeHandleEscaped();
+  /// Record that work was enqueued: the queue is no longer empty and the
+  /// marker query() was polling no longer covers all of its work.
+  void noteWorkEnqueued();
+  /// Release the marker query() was polling, if any, so the next poll asks a
+  /// new one. Used on its own where the queue's contents change without work
+  /// being added to it, as when the active command queue changes.
+  void dropQueryMarker();
+
 protected:
   /**
    * @brief Map memory to device.
@@ -446,7 +526,14 @@ public:
                   cl_command_queue Queue = nullptr);
   virtual ~CHIPQueueOpenCL() override;
   virtual void recordEvent(chipstar::Event *ChipEvent) override;
-  bool isEmptyQueue() override {return false;}
+  /// A stream the application can enqueue on directly is never known to be
+  /// empty: its commands do not go through noteWorkEnqueued().
+  bool isEmptyQueue() override {
+    return !NativeHandleEscaped_.load() && IsEmptyQueue_.load();
+  }
+  /// Enqueue and flush a marker on each of this stream's OpenCL queues and
+  /// append the marker events to Markers; the caller releases them.
+  void enqueueIdleMarkers(std::vector<cl_event> &Markers);
   virtual std::shared_ptr<chipstar::Event>
   launchImpl(chipstar::ExecItem *ExecItem) override;
   virtual void addCallback(hipStreamCallback_t Callback,
@@ -632,11 +719,17 @@ public:
                     cl_sampler TheSampler)
       : chipstar::Texture(ResDesc), Image(TheImage), Sampler(TheSampler) {}
 
+  // Destructors are implicitly noexcept; guard against null handles so a
+  // partially-constructed texture unwinds cleanly. See #1256.
   virtual ~CHIPTextureOpenCL() {
-    clStatus = clReleaseMemObject(Image);
-    assert(clStatus == CL_SUCCESS && "Invalid image handler?");
-    clStatus = clReleaseSampler(Sampler);
-    assert(clStatus == CL_SUCCESS && "Invalid sampler handler?");
+    if (Image) {
+      clStatus = clReleaseMemObject(Image);
+      assert(clStatus == CL_SUCCESS && "Invalid image handler?");
+    }
+    if (Sampler) {
+      clStatus = clReleaseSampler(Sampler);
+      assert(clStatus == CL_SUCCESS && "Invalid sampler handler?");
+    }
     (void)clStatus;
   }
 
