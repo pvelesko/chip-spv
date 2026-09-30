@@ -1314,7 +1314,9 @@ void *CHIPContextVulkan::allocateImpl(size_t Size, size_t Alignment,
   // Honor caller-supplied minimum alignment. VMA already consults the buffer's
   // memory requirements, so this only widens the constraint when the caller
   // asks for tighter alignment than Vulkan would have demanded.
-  AllocInfo.minAlignment = static_cast<VkDeviceSize>(Alignment);
+  // HIP guarantees 256-byte aligned device allocations.
+  AllocInfo.minAlignment =
+      std::max<VkDeviceSize>(static_cast<VkDeviceSize>(Alignment), 256);
   AllocInfo.pUserData = nullptr;
 
   // HostAllocFlags differentiates write-combined / portable / non-coherent
@@ -1349,6 +1351,14 @@ void *CHIPContextVulkan::allocateImpl(size_t Size, size_t Alignment,
       CHIPERR_LOG_AND_THROW("vmaCreateBuffer (device) failed",
                             hipErrorOutOfMemory);
     RetPtr = static_cast<void *>(Allocation);
+    // Use the real GPU address so pointers stored in device memory work.
+    if (Dev->hasBufferDeviceAddress()) {
+      VkBufferDeviceAddressInfo Bdai{};
+      Bdai.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+      Bdai.buffer = Buffer;
+      RetPtr = reinterpret_cast<void *>(
+          vkGetBufferDeviceAddress(Dev->getLogicalDevice(), &Bdai));
+    }
     break;
   }
   case hipMemoryTypeHost: {
