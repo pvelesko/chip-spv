@@ -2344,6 +2344,10 @@ void CHIPQueueVulkan::recordEvent(chipstar::Event *Event) {
 
   IsEmptyQueue_.store(false);
   EvVk->setRecording();
+  // hipStreamWaitEvent waits on an event's dependencies; the marker signals
+  // once everything submitted before the record has completed.
+  CmdLock.unlock();
+  Event->addDependency(enqueueMarkerImpl());
 }
 
 // ===== I8 helpers =====
