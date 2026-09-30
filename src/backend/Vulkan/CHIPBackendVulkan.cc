@@ -1306,6 +1306,17 @@ void CHIPExecItemVulkan::setupAllArgs() {
     if (HipPtr == nullptr)
       HipPtr = Ctx->getNullArgPlaceholder();
     const auto *Entry = Ctx->getDevPtrEntryContaining(HipPtr, Offset);
+    // Pointers chipStar did not allocate (plain host memory) are not
+    // accessible from the device; bind the placeholder, so a kernel that only
+    // passes the pointer along (e.g. to a stateless functor) still runs.
+    if (Entry == nullptr) {
+      logWarn("kernel pointer argument {} is not a device allocation; the "
+              "kernel must not dereference it",
+              HipPtr);
+      Offset = 0;
+      Entry = Ctx->getDevPtrEntryContaining(Ctx->getNullArgPlaceholder(),
+                                            Offset);
+    }
     if (Entry == nullptr) {
       std::string Msg = "ExecItem::setupAllArgs: unregistered device pointer "
                         "for kernel arg at ordinal " +
