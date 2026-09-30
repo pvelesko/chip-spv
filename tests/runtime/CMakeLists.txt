@@ -119,6 +119,11 @@ file(GLOB RUNTIME_TEST_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/Test*.hip
   ${CMAKE_CURRENT_SOURCE_DIR}/Test*.cpp)
 list(REMOVE_ITEM RUNTIME_TEST_SOURCES ${RUNTIME_TESTS_MANUAL})
+# Vulkan compute has no function pointers and no numeric __shared__ addresses.
+if(CHIP_USE_NATIVE_VULKAN_SPIRV)
+  list(REMOVE_ITEM RUNTIME_TEST_SOURCES TestIndirectCall.hip
+    TestDeviceVirtualDispatch.hip TestFix1691SharedAddrLocalInit.hip)
+endif()
 list(SORT RUNTIME_TEST_SOURCES)
 # Registered per mode below, not by the glob.
 list(REMOVE_ITEM RUNTIME_TEST_SOURCES TestFix1508VolatileGlobalStaleness.hip)
