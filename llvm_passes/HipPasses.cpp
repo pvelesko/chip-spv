@@ -2132,8 +2132,10 @@ class HipVulkanRetypeArraysPass
         I->setOperand(pointerIndex(I), Elt(0));
         continue;
       }
-      // A wider access: one per element, through an integer of its width
-      // (the backend cannot legalize a bitcast between a scalar and a vector).
+      // A wider access: one per element, through an integer of its width.
+      // WORKAROUND(CHIP-SPV/chipStar#1742, no upstream report): GlobalISel
+      // asserts on a scalar to vector bitcast wider than a shader vector.
+      // Remove the integer detour when CanaryVulkanBitcastFewerElements fires.
       unsigned N = DL.getTypeAllocSize(A) / Size;
       Type *WideTy = B.getIntNTy(N * Size * 8), *EltTy = B.getIntNTy(Size * 8);
       if (auto *St = dyn_cast<StoreInst>(I)) {
@@ -3110,9 +3112,10 @@ static void addVulkanLinkTimePasses(ModulePassManager &MPM) {
   MPM.addPass(GlobalDCEPass());
   MPM.addPass(HipDropUnusedGlobalsPass());
   MPM.addPass(HipVulkanDropDeadHiddenArgsPass());
-  // WORKAROUND(SPIR-V backend structurizer): a branch and a switch sharing a
-  // target get a merge block their selection header does not dominate
-  // (libclc's lgamma); pre-structured regions avoid it.
+  // WORKAROUND(CHIP-SPV/chipStar#1738, no upstream report): the SPIR-V
+  // structurizer gives a branch and a switch sharing a target a merge block
+  // their selection header does not dominate. Remove when
+  // CanaryVulkanStructurizerMergeDominance fires.
   MPM.addPass(createModuleToFunctionPassAdaptor(LowerSwitchPass()));
   MPM.addPass(createModuleToFunctionPassAdaptor(StructurizeCFGPass()));
 }
