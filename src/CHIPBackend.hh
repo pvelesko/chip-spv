@@ -1004,6 +1004,7 @@ protected:
   Module() = default;
 
 public:
+  bool deviceVariablesInitialized() const { return DeviceVariablesInitialized_; }
   /**
    * @brief Destroy the Module object
    *
@@ -1106,6 +1107,8 @@ public:
   }
 
   std::vector<chipstar::DeviceVar *> &getDeviceVariables() { return ChipVars_; }
+  /// True if the module carries OpenCL-path variable-info shadow kernels.
+  bool hasVarInfoShadowKernels() const;
 
   /// Record a device variable for every __chip_var_info_<X> shadow kernel of
   /// this module whose X has no device variable yet. Caller must hold
@@ -1530,6 +1533,12 @@ public:
 
   /// Return the number of currently compiled modules on this device.
   size_t getNumCompiledModules() const { return SrcModToCompiledMod_.size(); }
+  std::vector<chipstar::Module *> getCompiledModules() const {
+    std::vector<chipstar::Module *> Mods;
+    for (auto &Kv : SrcModToCompiledMod_)
+      Mods.push_back(Kv.second);
+    return Mods;
+  }
 
   /**
    * @brief Get the Kernels object

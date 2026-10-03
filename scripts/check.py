@@ -13,7 +13,7 @@ parser = argparse.ArgumentParser(
 
 parser.add_argument('work_dir', type=str, help='Path to build directory')
 parser.add_argument('device_type', type=str, choices=['cpu', 'igpu', 'dgpu', 'pocl'], help='Device type')
-parser.add_argument('backend', type=str, choices=['opencl', 'level0'], help='Backend to use')
+parser.add_argument('backend', type=str, choices=['opencl', 'level0', 'vulkan'], help='Backend to use')
 parser.add_argument('--num-threads', type=int, nargs='?', default=os.cpu_count(), help='Number of threads to use (default: number of cores on the system)')
 parser.add_argument('--timeout', type=int, nargs='?', default=200, help='Timeout in seconds (default: 200)')
 parser.add_argument('-m', '--modules', type=str, choices=['on', 'off'], default="off", help='load modulefiles automatically (default: off)')
@@ -91,6 +91,10 @@ if args.modules == "on":
       modules += "level-zero/dgpu | cat"
   elif args.backend == "opencl" and args.device_type == "pocl":
       modules += "opencl/pocl | cat"
+  elif args.backend == "vulkan" and args.device_type == "igpu":
+      modules += "vulkan/igpu | cat"
+  elif args.backend == "vulkan" and args.device_type == "dgpu":
+      modules += "vulkan/dgpu | cat"
   modules += " &&  module list | cat;"
 
 os.chdir(args.work_dir)

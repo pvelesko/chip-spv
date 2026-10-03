@@ -176,8 +176,18 @@ endif()
 message(STATUS "OpenCL_LIBRARY: ${OpenCL_LIBRARY}")
 message(STATUS "LevelZero_LIBRARY: ${LevelZero_LIBRARY}")
 
-if(NOT OpenCL_LIBRARY AND NOT LevelZero_LIBRARY)
-  message(FATAL_ERROR "At least one of OpenCL,Level0 libraries must be available")
+# Native Vulkan backend (optional). The Vulkan backend consumes the same
+# SPIR-V the LLVM HIPSPV pipeline emits and replaces the OpenCL->clvk->Vulkan
+# detour with a direct VkInstance/VkDevice/VkComputePipeline path.
+find_package(Vulkan 1.2)
+if(Vulkan_FOUND)
+  message(STATUS "Vulkan_LIBRARY: ${Vulkan_LIBRARY}")
+else()
+  message(STATUS "Vulkan not found")
+endif()
+
+if(NOT OpenCL_LIBRARY AND NOT LevelZero_LIBRARY AND NOT Vulkan_FOUND)
+  message(FATAL_ERROR "At least one of OpenCL,Level0,Vulkan libraries must be available")
 endif()
 
 set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
@@ -203,6 +213,7 @@ endif()
 # chipStar CMAKE VARIABLBLES/OPTIONS
 set(CHIP_SRC
   src/spirv.cc
+  src/SPVReflection.cc
   src/spirv_hiprtc.cc
   src/CHIPDriver.cc
   src/CHIPBackend.cc
@@ -224,6 +235,11 @@ endif()
 if(LevelZero_LIBRARY)
   list(APPEND CHIP_SRC
     src/backend/Level0/CHIPBackendLevel0.cc)
+endif()
+
+if(Vulkan_FOUND)
+  list(APPEND CHIP_SRC
+    src/backend/Vulkan/CHIPBackendVulkan.cc)
 endif()
 
 set(CHIP_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR} CACHE INTERNAL "chipStar source directory")
@@ -287,6 +303,8 @@ option(CHIP_BUILD_TESTS "Enable build_tests target" ON)
 option(CHIP_BUILD_SAMPLES "Build samples" ON)
 option(CHIP_USE_EXTERNAL_HIP_TESTS "Use Catch2 tests from the hip-tests submodule" ON)
 option(CHIP_USE_INTEL_USM "When enabled, cl_intel_unified_shared_memory extension, when available, will be used for HIP allocations in the OpenCL backend" ON)
+option(CHIP_USE_VMA "Use Vulkan Memory Allocator in the native Vulkan backend" ON)
+option(CHIP_VK_VALIDATION "Enable Vulkan validation layers at runtime when the Vulkan backend is active" OFF)
 option(CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS "Enable device-side features that emit program-scope \
 CrossWorkgroup globals: dynamic memory allocation (malloc/free, via __chipspv_device_heap) and \
 clock()/clock64()/wall_clock() (via __chip_clk_counter). Some OpenCL drivers (e.g. rusticl/radeonsi) \
@@ -454,13 +472,29 @@ if(LevelZero_LIBRARY)
   list(PREPEND CHIP_INTERFACE_LIBS ${LevelZero_LIBRARY})
 endif()
 
+if(Vulkan_FOUND)
+  set(HAVE_VULKAN 1)
+  list(PREPEND CHIP_INTERFACE_LIBS ${Vulkan_LIBRARIES})
+endif()
+
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
   set(CMAKE_INSTALL_PREFIX "${CHIP_SPV_DEFAULT_INSTALL_DIR}" CACHE PATH "Install path prefix")
 endif()
 
 message(STATUS "chipStar will be installed to: ${CMAKE_INSTALL_PREFIX}")
 
-if(LLVM_VERSION_MAJOR GREATER_EQUAL 23)
+option(CHIP_USE_NATIVE_VULKAN_SPIRV
+  "Compile HIP kernels directly to Vulkan-flavored SPIR-V via clang's HIPSPV \
+chipstar-vulkan environment, skipping the runtime openclToVulkanSpirv \
+post-processor. Requires LLVM 23 with the HIPSPVLowerToHLSLShape pass."
+  OFF)
+
+if(CHIP_USE_NATIVE_VULKAN_SPIRV)
+  if(LLVM_VERSION_MAJOR LESS 24)
+    message(FATAL_ERROR "CHIP_USE_NATIVE_VULKAN_SPIRV requires LLVM 24+")
+  endif()
+  set(OFFLOAD_TRIPLE spirv64-unknown-chipstar-shadervulkan)
+elseif(LLVM_VERSION_MAJOR GREATER_EQUAL 23)
   # On LLVM-23+ the emitted SPIR-V version can be controlled with the
   # subarch string (v#.#). The "chipstar" OS component sets allowed
   # SPIR-V extensions tailored for chipStar; both variants use it, since
@@ -491,7 +525,8 @@ endif()
 # clang reports it as an unused argument.
 set(RDC_EMITTER_SUPPLEMENT "")
 set(NONRDC_EMITTER_OPTS "")
-if(LLVM_VERSION_MAJOR GREATER_EQUAL 23 AND NOT CHIP_LLVM_USE_INTERGRATED_SPIRV)
+if(LLVM_VERSION_MAJOR GREATER_EQUAL 23 AND NOT CHIP_LLVM_USE_INTERGRATED_SPIRV
+   AND NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
   # Select the llvm-spirv translator in the HIPSPV toolchain. The flag must
   # travel via -Xoffload-compiler: passed plainly in -xhip offload mode the
   # driver validates it against the host toolchain, which rejects it, and
@@ -541,7 +576,10 @@ if(_cc_cmds MATCHES "spirv-ext=[^ \"]*(\\+all|\\+SPV_INTEL_cache_controls)")
 else()
   set(_cc_supported OFF)
 endif()
-if(NOT _cc_cmds MATCHES "spirv-ext=")
+if(CHIP_USE_NATIVE_VULKAN_SPIRV)
+  # Vulkan SPIR-V has no extension list and no cache controls.
+  set(_cc_supported OFF)
+elseif(NOT _cc_cmds MATCHES "spirv-ext=")
   # No extension list at all means the probe did not reach a device
   # compilation, so its answer says nothing about the toolchain.
   message(WARNING "Could not read an extension list from ${CMAKE_CXX_COMPILER} "
@@ -709,6 +747,15 @@ target_include_directories(CHIP
   "${CMAKE_BINARY_DIR}/bitcode"
 )
 
+# Vulkan Memory Allocator (header-only) is consumed only by the Vulkan
+# backend translation unit. Adding it PRIVATE here keeps it off the public
+# include surface so non-Vulkan consumers don't accidentally pick up its
+# Vulkan-typed declarations.
+if(Vulkan_FOUND)
+  target_include_directories(CHIP PRIVATE
+    "${CMAKE_SOURCE_DIR}/thirdparty/vma")
+endif()
+
 # For cucc tool which uses HIP_PATH for locating headers.
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/include")
 if(NOT EXISTS "${CMAKE_BINARY_DIR}/include/cuspv")
@@ -725,6 +772,11 @@ set(HIP_OFFLOAD_COMPILE_ONLY_OPTIONS_
   # errors when compiling HIP sources for SPIR-V target.  This flag
   # excludes the wrappers.
   -nohipwrapperinc)
+if(CHIP_USE_NATIVE_VULKAN_SPIRV)
+  # Vulkan has no double transcendentals: keep libm calls, which the device
+  # library implements, instead of LLVM math intrinsics.
+  list(APPEND HIP_OFFLOAD_COMPILE_ONLY_OPTIONS_ -fmath-errno)
+endif()
 
 if(LLVM_VERSION_MAJOR GREATER_EQUAL 23 AND NOT USE_NEW_OFFLOAD_DRIVER)
   list(APPEND HIP_OFFLOAD_COMPILE_ONLY_OPTIONS_ --no-offload-new-driver)
@@ -936,6 +988,7 @@ set(CHIP_DEBUG_BUILD 0)
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   set(CHIP_DEBUG_BUILD 1)
 endif()
+
 # Toolchain version for the hipRTC compilation cache key (see spirv_hiprtc.cc).
 set(CHIP_LLVM_VERSION_STRING "${LLVM_VERSION}")
 configure_file(chipStarConfig.hh.in include/chipStarConfig.hh @ONLY)

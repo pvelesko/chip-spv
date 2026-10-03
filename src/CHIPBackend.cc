@@ -465,6 +465,37 @@ chipstar::Module::allocateDeviceVariablesNoLock(chipstar::Device *Device,
 
   logTrace("Allocate storage for device variables in module: {}", (void *)this);
 
+  // A variable kept without a shadow kernel (see getOrCreateModule) gets
+  // storage of its host-registered size.
+  bool AllShadow = true;
+  for (auto *Var : ChipVars_) {
+    std::string Name(Var->getName());
+    if (!hasKernel(std::string(ChipVarInfoPrefix) + Name)) {
+      AllShadow = false;
+      break;
+    }
+  }
+  if (!AllShadow) {
+    auto *Ctx = Device->getContext();
+    for (auto *Var : ChipVars_) {
+      size_t Size = Var->getSize();
+      if (Size == 0) {
+        logWarn("Device variable '{}' has zero size; skipping allocation.",
+                Var->getName());
+        continue;
+      }
+      void *Addr = Ctx->allocate(Size, /*alignment=*/16,
+                                 hipMemoryType::hipMemoryTypeDevice);
+      Var->setDevAddr(Addr);
+      // Reused device memory is not zero; prepare zero-fills it.
+      Var->setInitKind(ChipVarInitHostFill);
+      Var->markHasInitializer(false);
+    }
+    Queue->finish();
+    DeviceVariablesAllocated_ = true;
+    return hipSuccess;
+  }
+
   // TODO: catch any exception and abort as it's probably an unrecoverable
   //       condition?
 
@@ -1379,6 +1410,13 @@ void chipstar::Device::deallocateDeviceVariables() {
 
 /// Get compiled module associated with the host pointer 'Ptr'. Return
 /// nullptr if 'Ptr' is not associated with any module.
+bool chipstar::Module::hasVarInfoShadowKernels() const {
+  for (auto *K : ChipKernels_)
+    if (K->getName().rfind(ChipVarInfoPrefix, 0) == 0)
+      return true;
+  return false;
+}
+
 chipstar::Module *chipstar::Device::getOrCreateModule(HostPtr Ptr) {
   {
     LOCK(DeviceVarMtx); // chipstar::Device::HostPtrToCompiledMod_
@@ -1414,7 +1452,13 @@ chipstar::Module *chipstar::Device::getOrCreateModule(HostPtr Ptr) {
 
     logTrace("Processing variable: {} with host pointer: {}", NameTmp, (const void*)Info.Ptr.Value);
 
-    if (!Mod->hasKernel(VarInfoKernelName)) {
+    bool HasShadow = Mod->hasKernel(VarInfoKernelName);
+    // Without shadow kernels (Vulkan path) an unreferenced user variable
+    // still needs storage for the symbol APIs; its registered size is known.
+    bool KeepUnused = !HasShadow && Info.Size > 0 &&
+                      NameTmp.rfind("__chip", 0) != 0 &&
+                      !Mod->hasVarInfoShadowKernels();
+    if (!HasShadow && !KeepUnused) {
       // The kernel compilation pipe is allowed to remove device-side unused
       // global variables from the device modules. This is utilized in the
       // abort implementation to signal that abort is not called in the

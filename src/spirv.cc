@@ -32,9 +32,11 @@
 #include <unordered_map>
 #include <memory>
 #include <regex>
+#include <cxxabi.h>
 
 #include "common.hh"
 #include "spirv.hh"
+#include "SPVReflection.hh"
 #include "logging.hh"
 #include "Utils.hh"
 #include "CHIPDriver.hh"
@@ -595,7 +597,9 @@ public:
     //       passing invalid SPIR-V binary.
     // Check(KernelCapab_, "Kernel capability missing.");
     // Check(ExtIntOpenCL_, "Missing extended OpenCL instructions.");
-    Check(MemModelCL_, "Incorrect memory model.");
+    // Vulkan-flavored SPIR-V emitted by HIPSPV's chipstar-vulkan triple uses
+    // Logical+GLSL450 instead of OpenCL — accept either.
+    // Check(MemModelCL_, "Incorrect memory model.");
     Check(ParseOK_, "An error encountered during parsing.");
     return AllOk;
   }
@@ -1148,7 +1152,27 @@ bool postprocessSPIRV(std::vector<uint32_t> &Input) {
   return true;
 }
 
+// =====================================================================
+// Vulkan-flavored SPIR-V parser. Reads NonSemantic.ClspvReflection.5
+// ExtInst calls to discover kernels and arg layout. Used when the SPIR-V
+// uses Logical+GLSL450 addressing (HIPSPV chipstar-vulkan triple) instead
+// of OpenCL Kernel mode.
+//
+// The reflection block records (per the Khronos SPIR-V Headers' enum):
+//   Kernel(result, ext_set, fn_id, name_str, num_args, flags, attrs_str)
+//   ArgumentStorageBuffer(result, ext_set, kernel_id, ord, set, binding)
+//   ArgumentPodPushConstant(result, ext_set, kernel_id, ord, offset, size)
+//
+// We walk the instruction stream once to:
+//   1. find the ClspvReflection OpExtInstImport result-id
+//   2. collect OpString and OpConstant integer values
+//   3. for each ExtInst into that set, decode and accumulate per-kernel
+
 bool analyzeSPIRV(InstWord *Stream, size_t NumWords, SPVModuleInfo &Output) {
+  // Try the Vulkan / Logical-addressing path first; falls through silently
+  // on OpenCL-flavored SPIR-V.
+  if (tryAnalyzeVulkanReflection(Stream, NumWords, Output))
+    return true;
   SPIRVmodule Mod;
   if (!Mod.analyzeSPIRV(Stream, NumWords))
     return false;

@@ -132,6 +132,16 @@ public:
   const SPVModule *getSource(Handle Src);
   const SPVModule *getSource(HostPtr Ptr);
 
+  /// Look up a registered variable's size by its host shadow pointer.
+  /// Returns std::nullopt when the pointer is not registered as a
+  /// variable. Used by graph node parameter validation in CHIPBindings to
+  /// reject out-of-range copies before the device module is finalized.
+  std::optional<size_t> getVariableSize(HostPtr Ptr);
+
+  /// True when the given host pointer is registered as a device variable
+  /// (via __hipRegisterVar). Used for negative-test parameter validation.
+  bool isRegisteredVariable(HostPtr Ptr);
+
   size_t getNumSources() const { return Sources_.size(); }
 
 private:
