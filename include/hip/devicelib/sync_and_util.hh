@@ -143,12 +143,21 @@ extern "C++" inline __device__ void __threadfence() {
 
 extern "C" __device__  void *__chip_memset(void *ptr, int value, size_t size);
 extern "C++" inline __device__ void *memset(void *ptr, int value, size_t size) {
+#ifdef CHIP_USE_NATIVE_VULKAN_SPIRV
+  // Vulkan has no pointer arithmetic for the library loop's address checks.
+  return __builtin_memset(ptr, value, size);
+#else
   return __chip_memset(ptr, value, size);
+#endif
 }
 
 extern "C" __device__  void *__chip_memcpy(void *dest, const void *src, size_t n);
 extern "C++" inline __device__ void *memcpy(void *dest, const void *src, size_t n) {
+#ifdef CHIP_USE_NATIVE_VULKAN_SPIRV
+  return __builtin_memcpy(dest, src, n);
+#else
   return __chip_memcpy(dest, src, n);
+#endif
 }
 
 // Expose the device-side memset/memcpy overloads (declared at global scope

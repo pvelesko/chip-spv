@@ -154,36 +154,25 @@ EXPORT unsigned int __chip_usad(unsigned int x, unsigned int y,
   return result + z;
 }
 
-// optimization tries to use llvm intrinsics here, but we don't want that
-EXPORT NOOPT unsigned int __chip_brev(unsigned int a) {
-  unsigned int m;
-  a = (a >> 16) | (a << 16); // swap halfwords
-  m = 0x00FF00FFU;
-  a = ((a >> 8) & m) | ((a << 8) & ~m); // swap bytes
-  m = m ^ (m << 4);
-  a = ((a >> 4) & m) | ((a << 4) & ~m); // swap nibbles
-  m = m ^ (m << 2);
-  a = ((a >> 2) & m) | ((a << 2) & ~m);
-  m = m ^ (m << 1);
-  a = ((a >> 1) & m) | ((a << 1) & ~m);
-  return a;
+// Portable 5-stage bit reversal. Both the OpenCL/clvk and Vulkan SPIR-V
+// backends translate llvm.bitreverse to OpBitReverse, so we no longer
+// suppress optimization here.
+EXPORT unsigned int __chip_brev(unsigned int a) {
+  a = ((a >> 1) & 0x55555555u) | ((a & 0x55555555u) << 1);
+  a = ((a >> 2) & 0x33333333u) | ((a & 0x33333333u) << 2);
+  a = ((a >> 4) & 0x0F0F0F0Fu) | ((a & 0x0F0F0F0Fu) << 4);
+  a = ((a >> 8) & 0x00FF00FFu) | ((a & 0x00FF00FFu) << 8);
+  return (a >> 16) | (a << 16);
 }
 
-EXPORT NOOPT unsigned /* long */ long int
+EXPORT unsigned /* long */ long int
 __chip_brevll(unsigned /* long */ long int a) {
-  unsigned /* long */ long int m;
-  a = (a >> 32) | (a << 32); // swap words
-  m = 0x0000FFFF0000FFFFUL;
-  a = ((a >> 16) & m) | ((a << 16) & ~m); // swap halfwords
-  m = m ^ (m << 8);
-  a = ((a >> 8) & m) | ((a << 8) & ~m); // swap bytes
-  m = m ^ (m << 4);
-  a = ((a >> 4) & m) | ((a << 4) & ~m); // swap nibbles
-  m = m ^ (m << 2);
-  a = ((a >> 2) & m) | ((a << 2) & ~m);
-  m = m ^ (m << 1);
-  a = ((a >> 1) & m) | ((a << 1) & ~m);
-  return a;
+  a = ((a >> 1) & 0x5555555555555555UL) | ((a & 0x5555555555555555UL) << 1);
+  a = ((a >> 2) & 0x3333333333333333UL) | ((a & 0x3333333333333333UL) << 2);
+  a = ((a >> 4) & 0x0F0F0F0F0F0F0F0FUL) | ((a & 0x0F0F0F0F0F0F0F0FUL) << 4);
+  a = ((a >> 8) & 0x00FF00FF00FF00FFUL) | ((a & 0x00FF00FF00FF00FFUL) << 8);
+  a = ((a >> 16) & 0x0000FFFF0000FFFFUL) | ((a & 0x0000FFFF0000FFFFUL) << 16);
+  return (a >> 32) | (a << 32);
 }
 
 struct ucharHolder {
@@ -219,23 +208,23 @@ EXPORT unsigned int __chip_byte_perm(unsigned int x, unsigned int y,
 }
 
 EXPORT unsigned int __chip_ffs(unsigned int input) {
-  return (input == 0 ? -1 : ctz(input)) + 1;
+  // __ffs in CUDA/HIP: returns position of the first set bit (1-based),
+  // or 0 if input is 0. clang lowers __builtin_ctz to llvm.cttz which both
+  // backends lower correctly (Vulkan via spv_firstbitlow, clvk natively).
+  return input == 0 ? 0 : (unsigned int)__builtin_ctz(input) + 1u;
 }
 
 EXPORT int __chip_ctzll(/* long */ long int x) {
   if (x == 0) {
     return sizeof(/* long */ long int) * 8;
   }
-  int count = 0;
-  while ((x & 1LL) == 0) {
-    x >>= 1;
-    count++;
-  }
-  return count;
+  return __builtin_ctzll((unsigned long long)x);
 }
 
 EXPORT unsigned int __chip_ffsll(/* long */ long int input) {
-  return (input == 0 ? -1 : __chip_ctzll(input)) + 1;
+  return input == 0 ? 0
+                    : (unsigned int)__builtin_ctzll((unsigned long long)input) +
+                          1u;
 }
 
 EXPORT unsigned int __lastbit_u32_u64(unsigned /* long */ long input) {
@@ -276,31 +265,31 @@ EXPORT ulong __chip_bitinsert_u64(ulong src0, ulong src1, ulong raw_offset,
 EXPORT unsigned int __chip_funnelshift_l(unsigned int lo, unsigned int hi,
                                          unsigned int shift) {
   unsigned /* long */ long concat = ((unsigned /* long */ long)hi << 32) | lo;
-  unsigned int shifted = concat << (shift & 31);
-  return shifted >> 32;
+  unsigned /* long */ long shifted = concat << (shift & 31);
+  return (unsigned int)(shifted >> 32);
 }
 
 EXPORT unsigned int __chip_funnelshift_lc(unsigned int lo, unsigned int hi,
                                           unsigned int shift) {
-  unsigned /* long */ long concat = ((unsigned /* long */ long)hi << 32) | lo;
-  unsigned int shifted = concat << (shift & 31);
   unsigned int clamped_shift = shift < 32 ? shift : 32;
-  return shifted >> (32 - clamped_shift);
+  unsigned /* long */ long concat = ((unsigned /* long */ long)hi << 32) | lo;
+  unsigned /* long */ long shifted = concat << clamped_shift;
+  return (unsigned int)(shifted >> 32);
 }
 
 EXPORT unsigned int __chip_funnelshift_r(unsigned int lo, unsigned int hi,
                                          unsigned int shift) {
   unsigned /* long */ long concat = ((unsigned /* long */ long)hi << 32) | lo;
-  unsigned int shifted = concat >> (shift & 31);
-  return shifted;
+  unsigned /* long */ long shifted = concat >> (shift & 31);
+  return (unsigned int)shifted;
 }
 
 EXPORT unsigned int __chip_funnelshift_rc(unsigned int lo, unsigned int hi,
                                           unsigned int shift) {
-  unsigned /* long */ long concat = ((unsigned /* long */ long)hi << 32) | lo;
-  unsigned int shifted = concat >> (shift & 31);
   unsigned int clamped_shift = shift < 32 ? shift : 32;
-  return shifted << (32 - clamped_shift);
+  unsigned /* long */ long concat = ((unsigned /* long */ long)hi << 32) | lo;
+  unsigned /* long */ long shifted = concat >> clamped_shift;
+  return (unsigned int)shifted;
 }
 
 EXPORT float __chip_saturate_f32(float x) {
@@ -1055,6 +1044,11 @@ __SHFL_XOR_SYNC(double);
 // The definition is linked at runtime from one of the ballot*.cl files.
 EXPORT OVLD ulong __chip_ballot(int predicate);
 
+#ifdef CHIP_USE_NATIVE_VULKAN_SPIRV
+// Sub-group votes the Vulkan compiler lowers; sub-groups need not be 32 wide.
+EXPORT OVLD int __chip_all(int predicate);
+EXPORT OVLD int __chip_any(int predicate);
+#else
 EXPORT OVLD int __chip_all(int predicate) {
   return __chip_ballot(predicate) == ((ulong)1 << DEFAULT_WARP_SIZE) - 1;
 }
@@ -1062,6 +1056,7 @@ EXPORT OVLD int __chip_all(int predicate) {
 EXPORT OVLD int __chip_any(int predicate) {
   return __chip_ballot(predicate) != 0;
 }
+#endif
 
 EXPORT OVLD ulong __chip_ballot_sync(unsigned mask, int predicate) {
   if (mask == 0) {
@@ -1101,11 +1096,15 @@ EXPORT OVLD int __chip_all_sync(unsigned mask, int predicate) {
 
 EXPORT OVLD unsigned __chip_lane_id() { return get_sub_group_local_id(); }
 
+#ifdef CHIP_USE_NATIVE_VULKAN_SPIRV
+EXPORT OVLD void __chip_syncwarp();
+#else
 EXPORT OVLD void __chip_syncwarp() {
   // CUDA docs speaks only about "memory". It's not specifying that it would
   // only flush local memory.
   return sub_group_barrier(CLK_GLOBAL_MEM_FENCE);
 }
+#endif
 
 // Targets of the c_to_opencl.def entries whose OpenCL counterpart is not a
 // plain builtin.
@@ -1601,6 +1600,31 @@ EXPORT NOINLINE ulong __chip_float2ull_rz(float x) {
     return (ulong)max(0.0f, trunc(x));
 }
 
+#ifdef CHIP_USE_NATIVE_VULKAN_SPIRV
+// libclc's Vulkan build has no generic-pointer vstore_half_rt*: round to
+// nearest, then step one half ulp toward the requested direction if needed.
+static ushort __chip_half_up(ushort h) {
+  return (ushort)(h == 0x8000 ? 0x0001 : (h & 0x8000) ? h - 1 : h + 1);
+}
+static ushort __chip_half_down(ushort h) {
+  return (ushort)(h == 0x0000 ? 0x8001 : (h & 0x8000) ? h + 1 : h - 1);
+}
+EXPORT _Float16 __ocml_cvtrtn_f16_f32(float x) {
+  half h = (half)x;
+  return (float)h > x ? as_half(__chip_half_down(as_ushort(h))) : h;
+}
+EXPORT _Float16 __ocml_cvtrtp_f16_f32(float x) {
+  half h = (half)x;
+  return (float)h < x ? as_half(__chip_half_up(as_ushort(h))) : h;
+}
+EXPORT _Float16 __ocml_cvtrtz_f16_f32(float x) {
+  half h = (half)x;
+  if (!(fabs((float)h) > fabs(x)))
+    return h;
+  ushort b = as_ushort(h);
+  return as_half((ushort)(x < 0 ? __chip_half_up(b) : __chip_half_down(b)));
+}
+#else
 // Convert float to half with round-to-nearest mode
 EXPORT _Float16 __ocml_cvtrtn_f16_f32(float x) {
     _Float16 result;
@@ -1621,6 +1645,8 @@ EXPORT _Float16 __ocml_cvtrtz_f16_f32(float x) {
     vstore_half_rtz(x, 0, (void*)&result);
     return result;
 }
+
+#endif
 
 // Device memory allocation functions
 extern void* __chip_malloc(unsigned int size);
