@@ -56,9 +56,11 @@ int main() {
   printf("INFO: backend name from NativeHandles[0] = \"%s\"\n", backendName);
   free(handles);
   
-  if (strcmp(backendName, "opencl") != 0 && strcmp(backendName, "level0") != 0) {
-    printf("FAIL: NativeHandles[0] is \"%s\", expected \"opencl\" or "
-           "\"level0\" (never \"default\")\n",
+  if (strcmp(backendName, "opencl") != 0 &&
+      strcmp(backendName, "level0") != 0 &&
+      strcmp(backendName, "vulkan") != 0) {
+    printf("FAIL: NativeHandles[0] is \"%s\", expected \"opencl\", "
+           "\"level0\", or \"vulkan\" (never \"default\")\n",
            backendName);
     return 1;
   }

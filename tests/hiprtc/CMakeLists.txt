@@ -23,7 +23,13 @@
 #
 #=============================================================================
 
-add_hip_test(TestHiprtcCPPKernels.cc)
+# TestHiprtcCPPKernels exercises C++ kernels through hiprtc; the resulting
+# IR hits SPIRVLegalizePointerCast asserts in the in-tree LLVM SPIR-V backend
+# (legacy llvm-spirv handled these patterns).
+# Skip under CHIP_USE_NATIVE_VULKAN_SPIRV.
+if(NOT CHIP_USE_NATIVE_VULKAN_SPIRV)
+  add_hip_test(TestHiprtcCPPKernels.cc)
+endif()
 add_hip_test(TestHiprtcOptions.cc)
 add_hip_test(TestShellMetacharacters.cc)
 add_hip_test(TestConstantMemory.cc)

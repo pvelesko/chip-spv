@@ -19,14 +19,15 @@ __device__ char LargeZero[LargeZeroSize] = {};
 __device__ char OddBytes[7] = {1, 2, 3, 4, 5, 6, 7};
 __device__ char HugeZero[HugeZeroSize] = {};
 
-#ifdef CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS
-// Without program-scope globals the pointee could not become a kernel arg.
+#if defined(CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS) && !defined(CHIP_USE_NATIVE_VULKAN_SPIRV)
+// Without program-scope globals (or on Vulkan, which keeps no pointers in
+// memory) the pointee could not become a kernel arg.
 __device__ int *PtrToScalar = &Scalar;
 #endif
 
 __global__ void readAll(int *Out) {
   Out[0] = Scalar;
-#ifdef CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS
+#if defined(CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS) && !defined(CHIP_USE_NATIVE_VULKAN_SPIRV)
   Out[1] = *PtrToScalar;
 #endif
   Out[2] = static_cast<int>(Array[3]);
@@ -61,7 +62,7 @@ int main() {
   (void)hipMemcpy(&OutH, OutD, sizeof(int) * NumElts, hipMemcpyDeviceToHost);
 
   assert(OutH[0] == 42 && "non-zero scalar initializer");
-#ifdef CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS
+#if defined(CHIP_ENABLE_DEVICE_PROGRAM_SCOPE_GLOBALS) && !defined(CHIP_USE_NATIVE_VULKAN_SPIRV)
   assert(OutH[1] == 42 && "initializer referencing another lowered variable");
 #endif
   assert(OutH[2] == 4 && "non-zero array initializer");
